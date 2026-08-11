@@ -4,8 +4,8 @@
 //! complete local-OUTPUT transaction, but the packaged Android adapter has no
 //! device-qualified direct observer capable of proving that transaction reached
 //! the exact transparent listener and supervised engine. Consequently the
-//! adapter below has no prepared-attempt value and reports `Unsupported` before
-//! it opens request-scoped process authority.
+//! production driver below never returns its now-complete private prepared-attempt value and
+//! reports `Unsupported` before it opens request-scoped process authority.
 //!
 //! Future device-specific drivers return unverified capture proof, process
 //! proof, and raw observations. Separate sealed verifiers must bind both proof
@@ -45,13 +45,19 @@ use super::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use super::{
-    CanaryFlow, CanaryFlowProtocol, CanaryFlowTuple, CanarySocketCorrelation,
-    CanarySocketCorrelationBuildError, UnqualifiedCanaryDnsEvidence, UnqualifiedCanaryFlowEvidence,
-    UnqualifiedCanaryOutboundEvidence,
+    CANARY_NEGATIVE_CONTROL_SLOTS, CanaryAddressFamilies, CanaryFlow, CanaryFlowAddressFamily,
+    CanaryFlowProtocol, CanaryFlowTuple, CanarySocketCorrelation,
+    CanarySocketCorrelationBuildError, InstalledSupervisedDeliveryReportProducer,
+    UnqualifiedCanaryDnsEvidence, UnqualifiedCanaryFlowEvidence,
+    UnqualifiedCanaryNegativeRouteControlSlots, UnqualifiedCanaryOutboundEvidence,
+    UnqualifiedCanaryOutboundEvidenceSlots,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use super::supervised_delivery_report::collector::RetiredSupervisedDeliveryReport;
+use super::supervised_delivery_report::collector::{
+    DrainedSupervisedDeliveryReportCollector, RetiredSupervisedDeliveryReport,
+    SupervisedDeliveryReportCollector, SupervisedDeliveryReportRetirementFailureDisposition,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod driver_child;
@@ -106,7 +112,21 @@ where
 pub(crate) fn xtables_tproxy_local_output_executor() -> Box<dyn UnqualifiedFunctionalCanaryExecutor>
 {
     Box::new(TproxyLocalOutputExecutor::new(
-        XtablesTproxyLocalOutputDriver,
+        XtablesTproxyLocalOutputDriver::default(),
+        TproxyCanaryCaptureVerifier,
+        TproxyCanaryProcessOwnershipVerifier,
+        TproxyCanaryEvidenceFactory,
+    ))
+}
+
+/// Build the packaged executor only after native admission consumes an exact qualification owner.
+///
+/// The driver still cannot mint receipts or mutate selectors: request construction, the retained
+/// native writer, and the private verifier/factory chain keep those authorities separate.
+pub(crate) fn qualified_xtables_tproxy_local_output_executor()
+-> Box<dyn UnqualifiedFunctionalCanaryExecutor> {
+    Box::new(TproxyLocalOutputExecutor::new(
+        XtablesTproxyLocalOutputDriver::qualified(),
         TproxyCanaryCaptureVerifier,
         TproxyCanaryProcessOwnershipVerifier,
         TproxyCanaryEvidenceFactory,
@@ -2944,13 +2964,456 @@ fn correlate_held_engine_outbound(
     )
 }
 
-/// The packaged adapter has no device-qualified direct-observation implementation. This
-/// zero-state driver intentionally owns no mutation handle.
-#[derive(Clone, Copy, Debug, Default)]
-struct XtablesTproxyLocalOutputDriver;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn packaged_attempt_failure(context: &str, source: &impl std::fmt::Debug) -> FunctionalCanaryError {
+    let diagnostic = format!("packaged local-OUTPUT {context} failed: {source:?}");
+    FunctionalCanaryError::new(
+        CanaryErrorKind::CleanupUncertain,
+        CanaryCleanupStatus::Uncertain,
+        &diagnostic,
+    )
+}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-enum PackagedTproxyLocalOutputAttempt {}
+fn abort_packaged_children(
+    children: driver_child::PackagedDriverChildren,
+    deadline: std::time::Instant,
+    context: &str,
+    source: &impl std::fmt::Debug,
+) -> FunctionalCanaryError {
+    match children.abort_and_reap(deadline) {
+        Ok(()) => packaged_attempt_failure(context, source),
+        Err(cleanup) => {
+            let diagnostic = format!(
+                "packaged local-OUTPUT {context} failed ({source:?}); child compensation also failed ({cleanup:?})"
+            );
+            FunctionalCanaryError::new(
+                CanaryErrorKind::CleanupUncertain,
+                CanaryCleanupStatus::Uncertain,
+                &diagnostic,
+            )
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn settle_report_retirement_failure<C>(
+    failure: driver_child::ClientReapedSupervisedReportRetirementFailure<
+        DrainedSupervisedDeliveryReportCollector<C>,
+    >,
+    deadline: std::time::Instant,
+) -> String
+where
+    C: FnMut() -> std::time::Instant,
+{
+    let (children, disposition) = failure.into_disposition();
+    // Retain the complete report disposition while every live peer receives bounded compensation.
+    let peer_cleanup = children.abort_and_reap_peers(deadline);
+    let report = match disposition {
+        driver_child::ClientReapedSupervisedReportRetirementFailureDisposition::RequestMismatch {
+            installed,
+            collector,
+        } => {
+            drop(installed);
+            drop(collector);
+            "retirement request did not match the immutable attempt".to_owned()
+        }
+        driver_child::ClientReapedSupervisedReportRetirementFailureDisposition::InvalidClientAuthority {
+            installed,
+            collector,
+            error,
+        } => {
+            drop(installed);
+            drop(collector);
+            format!("reaped-client authority was invalid: {error}")
+        }
+        driver_child::ClientReapedSupervisedReportRetirementFailureDisposition::Collector(
+            source,
+        ) => {
+            let diagnostic = source.to_string();
+            match source.into_disposition() {
+                SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetained {
+                    owner,
+                    authority,
+                } => {
+                    drop(owner);
+                    drop(authority);
+                    format!("collector receiver remains retryable after failure: {diagnostic}")
+                }
+                SupervisedDeliveryReportRetirementFailureDisposition::ReceiverRetiredWithoutCleanupEvidence(
+                    retirement,
+                ) => {
+                    drop(retirement);
+                    format!(
+                        "collector receiver retired without cleanup evidence: {diagnostic}"
+                    )
+                }
+            }
+        }
+    };
+    match peer_cleanup {
+        Ok(()) => report,
+        Err(source) => format!("{report}; peer compensation failed: {source}"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn compensate_client_reaped_failure<C>(
+    children: driver_child::ClientReapedPackagedDriverChildren,
+    installed_report: InstalledSupervisedDeliveryReportProducer,
+    drained_report: DrainedSupervisedDeliveryReportCollector<C>,
+    deadline: std::time::Instant,
+    context: &str,
+    source: &impl std::fmt::Debug,
+) -> FunctionalCanaryError
+where
+    C: FnMut() -> std::time::Instant,
+{
+    let cleanup = match children.retire_supervised_delivery_report(installed_report, drained_report)
+    {
+        Ok(report_retired) => match report_retired.abort_and_reap_peers(deadline) {
+            Ok(report) => {
+                drop(report);
+                "report receiver retired and every peer was reaped".to_owned()
+            }
+            Err(failure) => {
+                let (report, cleanup) = *failure;
+                drop(report);
+                format!("report receiver retired but peer compensation failed: {cleanup}")
+            }
+        },
+        Err(failure) => settle_report_retirement_failure(*failure, deadline),
+    };
+    let diagnostic =
+        format!("packaged local-OUTPUT {context} failed ({source:?}); compensation: {cleanup}");
+    FunctionalCanaryError::new(
+        CanaryErrorKind::CleanupUncertain,
+        CanaryCleanupStatus::Uncertain,
+        &diagnostic,
+    )
+}
+
+/// Admission state for the packaged adapter.
+///
+/// Neither state owns a mutation handle. Only the admitted state may consume the already-bound
+/// report handoff and enter the private prepared transaction below.
+#[derive(Clone, Copy, Debug, Default)]
+struct XtablesTproxyLocalOutputDriver {
+    qualified: bool,
+}
+
+impl XtablesTproxyLocalOutputDriver {
+    const fn qualified() -> Self {
+        Self { qualified: true }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the complete packaged attempt is production-compiled but admission remains closed"
+)]
+struct PackagedTproxyLocalOutputAttempt {
+    installed_report: InstalledSupervisedDeliveryReportProducer,
+    report_collector: SupervisedDeliveryReportCollector<fn() -> std::time::Instant>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the packaged driver remains unavailable until physical qualification admits it"
+)]
+impl PackagedTproxyLocalOutputAttempt {
+    fn prebind(
+        execution: &mut UnqualifiedFunctionalCanaryExecution<'_>,
+    ) -> Result<Self, FunctionalCanaryError> {
+        let (producer, report_collector) = execution.prebind_supervised_delivery_report(
+            std::time::Instant::now as fn() -> std::time::Instant,
+        )?;
+        let installed_report =
+            execution.install_supervised_delivery_report(producer.into_engine_handoff())?;
+        Ok(Self {
+            installed_report,
+            report_collector,
+        })
+    }
+}
+
+/// Execute the complete packaged transaction without granting admission to it.
+///
+/// Every positive fact is projected into an existing raw evidence type. The writer retains the
+/// selector and durable sidecar, while this function consumes only its request-bound observation
+/// session. `XtablesTproxyLocalOutputDriver` remains unavailable until a physical qualification
+/// checkpoint admits this exact transaction.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    dead_code,
+    reason = "the transaction is production-compiled behind the closed packaged admission fence"
+)]
+fn execute_packaged_tproxy_local_output(
+    prepared: PackagedTproxyLocalOutputAttempt,
+    request: &CanaryAttemptRequest,
+    socket_observer: CanaryAttemptSocketObserverSession,
+    attempt: &mut dyn CanaryAttemptObservationAuthority,
+) -> UnverifiedTproxyLocalOutputResult<
+    TproxyCanaryCaptureProof,
+    DriverProcessProof,
+    TproxyCanaryRawObservations,
+> {
+    if attempt.request() != request {
+        return Err(FunctionalCanaryError::new(
+            CanaryErrorKind::IdentityChanged,
+            CanaryCleanupStatus::Uncertain,
+            "packaged local-OUTPUT attempt authority does not match the immutable request",
+        ));
+    }
+    let deadline = request.deadline().expires_at();
+    let PackagedTproxyLocalOutputAttempt {
+        installed_report,
+        report_collector,
+    } = prepared;
+
+    let (mut socket_observer, listeners) = listener_observer::collect(request, socket_observer)?;
+
+    let mut negative_route_controls = [None; CANARY_NEGATIVE_CONTROL_SLOTS];
+    negative_route_controls[0] =
+        Some(attempt.observe_negative_route_control(CanaryFlowAddressFamily::Ipv4)?);
+    if request.families() == CanaryAddressFamilies::Ipv4AndIpv6 {
+        negative_route_controls[1] =
+            Some(attempt.observe_negative_route_control(CanaryFlowAddressFamily::Ipv6)?);
+    }
+    attempt.observe_baseline_counters()?;
+    let peer_network_namespace = attempt.take_peer_network_namespace()?;
+    let mut children = driver_child::PackagedDriverChildren::spawn(request, peer_network_namespace)
+        .map_err(|source| packaged_attempt_failure("child startup", &source))?;
+
+    let mut flows = std::array::from_fn(|_| None);
+    let mut outbound = std::array::from_fn(|_| None);
+    for flow in CanaryFlow::ALL {
+        if !request.requires_flow(flow) {
+            continue;
+        }
+        let started_at = std::time::Instant::now();
+        let holding = match children.begin_flow(request, flow) {
+            Ok(holding) => holding,
+            Err(source) => {
+                return Err(abort_packaged_children(
+                    children,
+                    deadline,
+                    "begin held flow",
+                    &source,
+                ));
+            }
+        };
+        let peer_tuple = holding.peer_tuple();
+        let snapshot =
+            match socket_observer.collect_process_until(request.pre_binding().engine().engine()) {
+                Ok((returned, snapshot)) => {
+                    socket_observer = returned;
+                    snapshot
+                }
+                Err(source) => {
+                    drop(holding);
+                    return Err(abort_packaged_children(
+                        children,
+                        deadline,
+                        "observe held engine outbound",
+                        &source,
+                    ));
+                }
+            };
+        let projected_outbound =
+            match correlate_held_engine_outbound(request, flow, peer_tuple, &snapshot) {
+                Ok(projected) => projected,
+                Err(source) => {
+                    drop(holding);
+                    return Err(abort_packaged_children(
+                        children,
+                        deadline,
+                        "correlate held engine outbound",
+                        &source,
+                    ));
+                }
+            };
+        let result = match holding.release() {
+            Ok(result) => result,
+            Err(source) => {
+                return Err(abort_packaged_children(
+                    children,
+                    deadline,
+                    "release held flow",
+                    &source,
+                ));
+            }
+        };
+        let completed_at = std::time::Instant::now();
+        let projected_flow =
+            match project_packaged_traffic_flow(request, flow, &result, started_at, completed_at) {
+                Ok(projected) => projected,
+                Err(source) => {
+                    return Err(abort_packaged_children(
+                        children,
+                        deadline,
+                        "project completed traffic",
+                        &source,
+                    ));
+                }
+            };
+        flows[flow.index()] = Some(projected_flow);
+        outbound[flow.index()] = Some(projected_outbound);
+    }
+    drop(socket_observer);
+
+    let drained_report = match report_collector.drain() {
+        Ok(drained) => drained,
+        Err(source) => {
+            drop(installed_report);
+            let error = abort_packaged_children(
+                children,
+                deadline,
+                "drain supervised report",
+                source.as_ref(),
+            );
+            drop(source);
+            return Err(error);
+        }
+    };
+    let mut client_reaped = children
+        .quiesce_client_and_reap(deadline)
+        .map_err(|source| packaged_attempt_failure("quiesce and reap client", &source))?;
+    let client_counter_authority = match client_reaped.bind_final_counter_observation() {
+        Ok(authority) => authority,
+        Err(source) => {
+            return Err(compensate_client_reaped_failure(
+                client_reaped,
+                installed_report,
+                drained_report,
+                deadline,
+                "bind final counter observation",
+                &source,
+            ));
+        }
+    };
+    let counters = match attempt.observe_final_counters(client_counter_authority) {
+        Ok(counters) => counters,
+        Err(source) => {
+            return Err(compensate_client_reaped_failure(
+                client_reaped,
+                installed_report,
+                drained_report,
+                deadline,
+                "observe final counters",
+                &source,
+            ));
+        }
+    };
+    let counters_retirement = match attempt.retire_counters() {
+        Ok(retirement) => retirement,
+        Err(source) => {
+            return Err(compensate_client_reaped_failure(
+                client_reaped,
+                installed_report,
+                drained_report,
+                deadline,
+                "retire counters",
+                &source,
+            ));
+        }
+    };
+    let report_retired =
+        match client_reaped.retire_supervised_delivery_report(installed_report, drained_report) {
+            Ok(report_retired) => report_retired,
+            Err(failure) => {
+                let diagnostic = settle_report_retirement_failure(*failure, deadline);
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::CleanupUncertain,
+                    CanaryCleanupStatus::Uncertain,
+                    &format!("packaged local-OUTPUT report retirement failed: {diagnostic}"),
+                ));
+            }
+        };
+    let peer_reaped = match report_retired.quiesce_and_reap_peers(counters_retirement, deadline) {
+        Ok(peer_reaped) => peer_reaped,
+        Err(failure) => match *failure {
+            driver_child::ReportRetiredPeerReapFailure::Rejected {
+                state,
+                counters_retirement: _,
+                source,
+            } => {
+                let cleanup = state.abort_and_reap_peers(deadline);
+                let diagnostic = match cleanup {
+                    Ok(report) => {
+                        drop(report);
+                        format!("peer-reap authority was rejected: {source:?}")
+                    }
+                    Err(failure) => {
+                        let (report, cleanup) = *failure;
+                        drop(report);
+                        format!(
+                            "peer-reap authority was rejected ({source:?}); peer compensation failed: {cleanup}"
+                        )
+                    }
+                };
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::CleanupUncertain,
+                    CanaryCleanupStatus::Uncertain,
+                    &format!("packaged local-OUTPUT peer retirement failed: {diagnostic}"),
+                ));
+            }
+            driver_child::ReportRetiredPeerReapFailure::Cleanup(failure) => {
+                let (client, peers, report, _counters_retirement) = failure.into_parts();
+                let failed_peers = peers.iter().filter(|result| result.is_err()).count();
+                drop(client);
+                drop(peers);
+                drop(report);
+                let diagnostic = format!(
+                    "packaged local-OUTPUT peer retirement left {failed_peers} peer cleanup result(s) uncertain"
+                );
+                return Err(FunctionalCanaryError::new(
+                    CanaryErrorKind::CleanupUncertain,
+                    CanaryCleanupStatus::Uncertain,
+                    &diagnostic,
+                ));
+            }
+        },
+    };
+    let (peer_reaped_authority, reaped_children, report, counters_retirement) =
+        peer_reaped.into_authority_and_parts();
+    let retained_facility = attempt.reobserve_retained_facility(&peer_reaped_authority)?;
+
+    let client_retirement = reaped_children.client.retirement();
+    let peer_retirements = reaped_children
+        .peer_servers
+        .each_ref()
+        .map(driver_process::ReapedDriverChild::retirement);
+    let cleanup = UnqualifiedCanaryCleanupEvidence::new(
+        request.nonce(),
+        client_retirement,
+        peer_retirements,
+        None,
+        counters_retirement,
+        report.report_cleanup(),
+        retained_facility.facility(),
+        retained_facility.observed_at(),
+    );
+    let process_proof = reaped_children
+        .into_process_proof()
+        .map_err(|source| packaged_attempt_failure("assemble child process proof", &source))?;
+    Ok(UnverifiedTproxyLocalOutputArtifacts {
+        capture_proof: TproxyCanaryCaptureProof { report, listeners },
+        process_proof,
+        observations: TproxyCanaryRawObservations {
+            flows: UnqualifiedCanaryFlowEvidenceSlots::new(flows),
+            unexpected_flow_count: 0,
+            loop_escape: UnqualifiedCanaryLoopEvidence::new(
+                UnqualifiedCanaryOutboundEvidenceSlots::new(outbound),
+                UnqualifiedCanaryNegativeRouteControlSlots::new(negative_route_controls),
+            ),
+            counters,
+            cleanup,
+        },
+    })
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 type PackagedTproxyLocalOutputAttempt = Infallible;
@@ -2963,6 +3426,9 @@ impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
         request: &CanaryAttemptRequest,
     ) -> Result<(), TproxyLocalOutputUnavailable> {
         debug_assert_eq!(request.capture_backend(), CanaryCaptureBackend::Tproxy);
+        if self.qualified && cfg!(any(target_os = "linux", target_os = "android")) {
+            return Ok(());
+        }
         Err(TproxyLocalOutputUnavailable::new(
             CanaryAvailability::Unsupported,
             XTABLES_LOCAL_OUTPUT_UNSUPPORTED,
@@ -2975,6 +3441,10 @@ impl TproxyLocalOutputDriver for XtablesTproxyLocalOutputDriver {
     ) -> Result<Self::Prepared, FunctionalCanaryError> {
         let request = execution.request();
         debug_assert_eq!(request.capture_backend(), CanaryCaptureBackend::Tproxy);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.qualified {
+            return PackagedTproxyLocalOutputAttempt::prebind(execution);
+        }
         Err(TproxyLocalOutputUnavailable::new(
             CanaryAvailability::Unsupported,
             XTABLES_LOCAL_OUTPUT_UNSUPPORTED,
@@ -2991,15 +3461,15 @@ impl PreparedTproxyLocalOutputAttempt for PackagedTproxyLocalOutputAttempt {
 
     fn execute_tproxy_local_output(
         self,
-        _request: &CanaryAttemptRequest,
-        _socket_observer: CanaryAttemptSocketObserverSession,
-        _attempt: &mut dyn CanaryAttemptObservationAuthority,
+        request: &CanaryAttemptRequest,
+        socket_observer: CanaryAttemptSocketObserverSession,
+        attempt: &mut dyn CanaryAttemptObservationAuthority,
     ) -> UnverifiedTproxyLocalOutputResult<
         Self::CaptureProof,
         Self::ProcessProof,
         Self::RawObservations,
     > {
-        match self {}
+        execute_packaged_tproxy_local_output(self, request, socket_observer, attempt)
     }
 }
 
@@ -3236,6 +3706,7 @@ mod tests {
         CanaryCredentialDomainBinding, CanaryDeadline, CanaryNonce, FUNCTIONAL_CANARY_NONCE_BYTES,
         InstalledSupervisedDeliveryReportProducer, SupervisedDeliveryReportEngineHandoff,
         UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryFlowEvidenceSlots,
+        UnqualifiedCanaryNegativeRouteControl,
     };
     use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
     use crate::runtime_coordinator::CanarySelectorSession;
@@ -3257,6 +3728,41 @@ mod tests {
     impl CanaryAttemptObservationAuthority for ScriptedAttemptAuthority {
         fn request(&self) -> &CanaryAttemptRequest {
             self.session.request()
+        }
+    }
+
+    struct ListenerFirstAttemptAuthority {
+        session: CanarySelectorSession,
+        route_observations: Arc<AtomicUsize>,
+    }
+
+    impl ListenerFirstAttemptAuthority {
+        fn reserved_for(
+            request: &CanaryAttemptRequest,
+            route_observations: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                session: CanarySelectorSession::reserved_for(request),
+                route_observations,
+            }
+        }
+    }
+
+    impl CanaryAttemptObservationAuthority for ListenerFirstAttemptAuthority {
+        fn request(&self) -> &CanaryAttemptRequest {
+            self.session.request()
+        }
+
+        fn observe_negative_route_control(
+            &mut self,
+            _family: CanaryFlowAddressFamily,
+        ) -> Result<UnqualifiedCanaryNegativeRouteControl, FunctionalCanaryError> {
+            self.route_observations.fetch_add(1, Ordering::SeqCst);
+            Err(FunctionalCanaryError::new(
+                CanaryErrorKind::AdapterFailure,
+                CanaryCleanupStatus::Uncertain,
+                "listener-first test authority must not reach route observation",
+            ))
         }
     }
 
@@ -4210,6 +4716,115 @@ mod tests {
         );
         assert!(error.diagnostic().contains("supervised-engine receipt"));
         assert!(error.diagnostic().contains("prohibited substitutes"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn packaged_report_prebind_does_not_open_xtables_admission() {
+        for families in [
+            CanaryAddressFamilies::Ipv4Only,
+            CanaryAddressFamilies::Ipv4AndIpv6,
+        ] {
+            let fixture = Fixture::new(families);
+            let request = fixture.request();
+            let mut execution = execution(request);
+            let prepared = PackagedTproxyLocalOutputAttempt::prebind(&mut execution)
+                .expect("prebind and install the exact packaged report handoff");
+
+            let error = XtablesTproxyLocalOutputDriver::default()
+                .check_tproxy_local_output(request)
+                .expect_err(
+                    "the packaged driver remains unavailable after its report seam is real",
+                );
+
+            assert_eq!(error.availability, CanaryAvailability::Unsupported);
+            drop(prepared);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn qualified_packaged_driver_prebinds_only_the_existing_report_handoff() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let request = fixture.request();
+        let mut execution = execution(request);
+        let mut driver = XtablesTproxyLocalOutputDriver::qualified();
+
+        assert!(
+            driver.check_tproxy_local_output(request).is_ok(),
+            "qualification owner admits the packaged driver"
+        );
+        let prepared = driver
+            .prepare_tproxy_local_output(&mut execution)
+            .expect("qualified driver consumes the existing report prebind and install path");
+
+        drop(prepared);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn packaged_attempt_rejects_substituted_writer_authority_before_observation() {
+        let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        let alternate = Fixture::new(CanaryAddressFamilies::Ipv4Only);
+        assert_ne!(fixture.request(), alternate.request());
+        let request = fixture.request();
+        let mut execution = execution(request);
+        let prepared = PackagedTproxyLocalOutputAttempt::prebind(&mut execution)
+            .expect("prebind and install the exact packaged report handoff");
+        let (_, socket_observer, engine_child) = execution
+            .into_parts()
+            .expect("recover the still-closed execution authorities");
+        drop(engine_child);
+        let mut substituted = ScriptedAttemptAuthority::reserved_for(alternate.request());
+
+        let error = match prepared.execute_tproxy_local_output(
+            request,
+            socket_observer,
+            &mut substituted,
+        ) {
+            Ok(_) => panic!("a substituted writer authority cannot enter listener observation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+        assert_eq!(error.cleanup(), CanaryCleanupStatus::Uncertain);
+        assert!(error.diagnostic().contains("immutable request"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn packaged_attempt_observes_listeners_before_route_controls_for_both_families() {
+        for families in [
+            CanaryAddressFamilies::Ipv4Only,
+            CanaryAddressFamilies::Ipv4AndIpv6,
+        ] {
+            let fixture = Fixture::new(families);
+            let request = fixture.request();
+            let mut execution = execution(request);
+            let prepared = PackagedTproxyLocalOutputAttempt::prebind(&mut execution)
+                .expect("prebind and install the exact packaged report handoff");
+            let (_, socket_observer, engine_child) = execution
+                .into_parts()
+                .expect("recover the still-closed execution authorities");
+            drop(engine_child);
+            let route_observations = Arc::new(AtomicUsize::new(0));
+            let mut attempt = ListenerFirstAttemptAuthority::reserved_for(
+                request,
+                Arc::clone(&route_observations),
+            );
+
+            let error = match prepared.execute_tproxy_local_output(
+                request,
+                socket_observer,
+                &mut attempt,
+            ) {
+                Ok(_) => panic!("a scripted observer cannot mint listener proof"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), CanaryErrorKind::InvalidEvidence);
+            assert_eq!(route_observations.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

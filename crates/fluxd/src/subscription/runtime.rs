@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use flux_core::{FluxConfig, GenerationId};
+use flux_core::{FluxConfig, GenerationId, ReviewedCanaryRoleCredentials};
 use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 use url::Url;
 
@@ -379,16 +379,51 @@ struct ProductionRefreshOperation<A> {
     adapter: A,
     validator: RefreshSnapshotValidator,
     store: SubscriptionSnapshotStore<RefreshSnapshotValidator>,
+    reviewed_engine_credentials: Option<ReviewedEngineCredentials>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedEngineCredentials {
+    uid: u32,
+    gid: u32,
+}
+
+impl From<ReviewedCanaryRoleCredentials> for ReviewedEngineCredentials {
+    fn from(credentials: ReviewedCanaryRoleCredentials) -> Self {
+        Self {
+            uid: credentials.engine_uid().get(),
+            gid: credentials.engine_gid().get(),
+        }
+    }
 }
 
 impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
-    fn new(paths: SubscriptionRuntimePaths, adapter: A) -> Result<Self, SubscriptionRefreshError> {
-        Self::with_engine_validator(paths, adapter, Arc::new(ProcessRefreshEngineValidator))
+    fn new_with_reviewed_credentials(
+        paths: SubscriptionRuntimePaths,
+        adapter: A,
+        reviewed_credentials: Option<ReviewedCanaryRoleCredentials>,
+    ) -> Result<Self, SubscriptionRefreshError> {
+        Self::with_engine_validator_and_credentials(
+            paths,
+            adapter,
+            reviewed_credentials.map(ReviewedEngineCredentials::from),
+            Arc::new(ProcessRefreshEngineValidator),
+        )
     }
 
+    #[cfg(test)]
     fn with_engine_validator(
         paths: SubscriptionRuntimePaths,
         adapter: A,
+        engine_validator: Arc<dyn RefreshEngineValidator>,
+    ) -> Result<Self, SubscriptionRefreshError> {
+        Self::with_engine_validator_and_credentials(paths, adapter, None, engine_validator)
+    }
+
+    fn with_engine_validator_and_credentials(
+        paths: SubscriptionRuntimePaths,
+        adapter: A,
+        reviewed_engine_credentials: Option<ReviewedEngineCredentials>,
         engine_validator: Arc<dyn RefreshEngineValidator>,
     ) -> Result<Self, SubscriptionRefreshError> {
         let validator = RefreshSnapshotValidator::new(engine_validator);
@@ -399,6 +434,7 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
             adapter,
             validator,
             store,
+            reviewed_engine_credentials,
         })
     }
 
@@ -427,13 +463,14 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
         &mut self,
         config: &FluxConfig,
     ) -> Result<RefreshPayload, SubscriptionRefreshError> {
-        require_supported_identity(config)?;
+        require_supported_identity(config, self.reviewed_engine_credentials)?;
         let template = read_required_file(
             config.engine().template(),
             usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX),
             "engine template",
         )?;
-        let validation_spec = validation_engine(config, &self.paths)?;
+        let validation_spec =
+            validation_engine(config, &self.paths, self.reviewed_engine_credentials)?;
         self.validator.install(validation_spec.clone());
         let subscription_url = read_subscription_url(config.subscription().url_file())?;
         let expected_subscription_source = redacted_source_id(&subscription_url);
@@ -467,7 +504,11 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
                 usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX),
                 "engine template",
             )?;
-            let current_engine = validation_engine(&current_config, &self.paths)?;
+            let current_engine = validation_engine(
+                &current_config,
+                &self.paths,
+                self.reviewed_engine_credentials,
+            )?;
             let current_subscription_source = subscription_source(&current_config)?;
             Ok::<bool, SubscriptionRefreshError>(
                 &current_config == config
@@ -545,12 +586,21 @@ impl<A: FetchAdapter + Send + 'static> RefreshOperation for ProductionRefreshOpe
     }
 }
 
-fn require_supported_identity(config: &FluxConfig) -> Result<(), SubscriptionRefreshError> {
+fn require_supported_identity(
+    config: &FluxConfig,
+    reviewed_engine_credentials: Option<ReviewedEngineCredentials>,
+) -> Result<(), SubscriptionRefreshError> {
     let credentials = config.engine().credentials();
-    if credentials.uid().get() != 0 || credentials.gid().get() != 0 {
+    let supported = match reviewed_engine_credentials {
+        Some(reviewed) => {
+            credentials.uid().get() == reviewed.uid && credentials.gid().get() == reviewed.gid
+        }
+        None => credentials.uid().get() == 0 && credentials.gid().get() == 0,
+    };
+    if !supported {
         return Err(SubscriptionRefreshError::new(
             SubscriptionRefreshErrorKind::UnsupportedIdentity,
-            "subscription assets currently require the root-owned Proxy Engine configured as UID/GID 0",
+            "subscription assets require the exact reviewed Proxy Engine credential authority",
         ));
     }
     Ok(())
@@ -559,8 +609,9 @@ fn require_supported_identity(config: &FluxConfig) -> Result<(), SubscriptionRef
 fn validation_engine(
     config: &FluxConfig,
     paths: &SubscriptionRuntimePaths,
+    reviewed_engine_credentials: Option<ReviewedEngineCredentials>,
 ) -> Result<EngineSpec, SubscriptionRefreshError> {
-    require_supported_identity(config)?;
+    require_supported_identity(config, reviewed_engine_credentials)?;
     let restart = config.engine().restart();
     let restart = RestartPolicy::new(
         restart.max_attempts(),
@@ -914,12 +965,20 @@ pub(crate) struct SubscriptionRuntimeBootstrap {
 impl SubscriptionRefreshRuntime {
     pub(crate) fn start(
         paths: SubscriptionRuntimePaths,
+        reviewed_engine_credentials: Option<ReviewedCanaryRoleCredentials>,
     ) -> Result<SubscriptionRuntimeBootstrap, SubscriptionRefreshError> {
-        let mut operation = ProductionRefreshOperation::new(paths.clone(), UreqFetchAdapter)?;
+        let mut operation = ProductionRefreshOperation::new_with_reviewed_credentials(
+            paths.clone(),
+            UreqFetchAdapter,
+            reviewed_engine_credentials,
+        )?;
         let initial_config = FluxConfig::load(&paths.desired_state)
             .map_err(|source| configuration_error(&paths.desired_state, source))?;
         if initial_config.subscription().enabled() {
-            require_supported_identity(&initial_config)?;
+            require_supported_identity(
+                &initial_config,
+                reviewed_engine_credentials.map(ReviewedEngineCredentials::from),
+            )?;
         }
         let (mut active, cleanup_pending) = operation.recover(&initial_config)?;
         if cleanup_pending {

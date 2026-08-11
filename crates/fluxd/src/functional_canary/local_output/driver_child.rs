@@ -1267,6 +1267,19 @@ pub(super) fn try_run_internal_child(args: &[String]) -> Option<i32> {
 }
 
 fn run_internal_child(args: &[String]) -> Result<(), PackagedDriverChildError> {
+    run_internal_child_with_binder(args, BoundChildResources::bind)
+}
+
+fn run_internal_child_with_binder<F>(
+    args: &[String],
+    bind_resources: F,
+) -> Result<(), PackagedDriverChildError>
+where
+    F: FnOnce(
+        PackagedDriverChildRole,
+        Option<ChildBindPlan>,
+    ) -> Result<BoundChildResources, PackagedDriverChildError>,
+{
     if args.len() != 7 {
         return Err(PackagedDriverChildError::InvalidArguments(
             "internal driver child requires exactly five arguments",
@@ -1305,7 +1318,7 @@ fn run_internal_child(args: &[String]) -> Result<(), PackagedDriverChildError> {
                 source,
             }
         })?;
-    let mut resources = BoundChildResources::bind(role, binding)?;
+    let mut resources = bind_resources(role, binding)?;
     send_frame(&control, role, ControlMessage::Ready, deadline)?;
     run_child_session(
         &control,
@@ -1452,6 +1465,7 @@ mod tests {
     use std::env;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use std::num::{NonZeroU32, NonZeroU64};
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
     use std::sync::{Mutex, MutexGuard};
@@ -1479,6 +1493,7 @@ mod tests {
     const TEST_DEADLINE_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_DEADLINE_NS";
     const TEST_IPV4_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_IPV4";
     const TEST_IPV6_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_IPV6";
+    const TEST_RESOURCE_DESCRIPTORS_ENV: &str = "FLUX_TEST_PACKAGED_DRIVER_RESOURCE_FDS";
     static SELF_EXEC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -1573,52 +1588,21 @@ mod tests {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
-        let tcp_address =
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_tcp_port()));
-        let udp_address =
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_udp_port()));
-        let dns_address =
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_dns_port()));
-
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(ChildBindPlan {
-                ipv4: tcp_address,
-                ipv6: None,
-            }),
-            deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(ChildBindPlan {
-                ipv4: udp_address,
-                ipv6: None,
-            }),
-            deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(ChildBindPlan {
-                ipv4: dns_address,
-                ipv6: None,
-            }),
-            deadline,
-        );
+        let (children, bindings) = spawn_test_children(request, false, deadline);
+        let TestPeerBindings {
+            tcp: tcp_address,
+            udp: udp_address,
+            dns: dns_address,
+        } = bindings;
 
         assert!(TcpListener::bind(tcp_address).is_err());
         assert!(UdpSocket::bind(udp_address).is_err());
         assert!(TcpListener::bind(dns_address).is_err());
         assert!(UdpSocket::bind(dns_address).is_err());
 
-        let mut client_reaped = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        }
-        .quiesce_client_and_reap(deadline)
-        .expect("quiesce and parent-reap the exact client first");
+        let mut client_reaped = children
+            .quiesce_client_and_reap(deadline)
+            .expect("quiesce and parent-reap the exact client first");
 
         assert!(TcpListener::bind(tcp_address).is_err());
         assert!(UdpSocket::bind(udp_address).is_err());
@@ -1752,6 +1736,47 @@ mod tests {
         children
             .into_process_proof()
             .expect("assemble peer-reaped process proof");
+    }
+
+    #[test]
+    fn composition_failure_after_client_reap_retires_report_and_every_peer() {
+        let _self_exec_guard = serialize_self_exec_test();
+        let fixture = report_sender_fixture();
+        let request = fixture.request();
+        let evidence = fixture.successful_evidence();
+        let deadline = request.deadline().expires_at();
+        let (installed, drained) =
+            completed_report_fixture(request, &evidence, Instant::now as fn() -> Instant);
+        let (children, bindings) = spawn_client_reaped_fixture(request, deadline);
+        let source = crate::functional_canary::FunctionalCanaryError::new(
+            crate::functional_canary::CanaryErrorKind::AdapterFailure,
+            crate::functional_canary::CanaryCleanupStatus::Uncertain,
+            "synthetic final-counter failure",
+        );
+
+        let error = super::super::compensate_client_reaped_failure(
+            children,
+            installed,
+            drained,
+            deadline,
+            "observe final counters",
+            &source,
+        );
+
+        assert_eq!(
+            error.kind(),
+            crate::functional_canary::CanaryErrorKind::CleanupUncertain
+        );
+        assert_eq!(
+            error.cleanup(),
+            crate::functional_canary::CanaryCleanupStatus::Uncertain
+        );
+        assert!(
+            error
+                .diagnostic()
+                .contains("report receiver retired and every peer was reaped")
+        );
+        assert_peer_bindings_retired(bindings);
     }
 
     #[test]
@@ -2137,32 +2162,10 @@ mod tests {
         let fixture = Fixture::new(families);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let tcp_port = available_tcp_port_for_families(ipv6);
-        let udp_port = available_udp_port_for_families(ipv6);
-        let dns_port = available_dns_port_for_families(ipv6);
-
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(loopback_bind_plan(tcp_port, ipv6)),
-            deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(loopback_bind_plan(udp_port, ipv6)),
-            deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(loopback_bind_plan(dns_port, ipv6)),
-            deadline,
-        );
-        let mut children = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        };
+        let (mut children, bindings) = spawn_test_children(request, ipv6, deadline);
+        let tcp_port = bindings.tcp.port();
+        let udp_port = bindings.udp.port();
+        let dns_port = bindings.dns.port();
 
         for flow in CanaryFlow::ALL {
             if !request.requires_flow(flow) {
@@ -2265,33 +2268,10 @@ mod tests {
     fn packaged_parent_rejects_reordered_flow_without_losing_cleanup_authority() {
         let _self_exec_guard = serialize_self_exec_test();
         let deadline = Instant::now() + Duration::from_secs(20);
-        let tcp_port = available_tcp_port();
-        let udp_port = available_udp_port();
-        let dns_port = available_dns_port();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(loopback_bind_plan(tcp_port, false)),
-            deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(loopback_bind_plan(udp_port, false)),
-            deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(loopback_bind_plan(dns_port, false)),
-            deadline,
-        );
-        let mut children = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        };
+        let (mut children, bindings) = spawn_test_children(request, false, deadline);
+        let udp_port = bindings.udp.port();
         let reordered = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4UdpEcho)
             .expect("derive reordered test flow")
             .with_test_endpoints(
@@ -2312,33 +2292,11 @@ mod tests {
     fn dropped_flow_holding_poisoned_orderly_continuation_and_preserved_abort() {
         let _self_exec_guard = serialize_self_exec_test();
         let deadline = Instant::now() + Duration::from_secs(20);
-        let tcp_port = available_tcp_port();
-        let udp_port = available_udp_port();
-        let dns_port = available_dns_port();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(loopback_bind_plan(tcp_port, false)),
-            deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(loopback_bind_plan(udp_port, false)),
-            deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(loopback_bind_plan(dns_port, false)),
-            deadline,
-        );
-        let mut children = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        };
+        let (mut children, bindings) = spawn_test_children(request, false, deadline);
+        let tcp_port = bindings.tcp.port();
+        let udp_port = bindings.udp.port();
         let tcp_plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4TcpEcho)
             .expect("derive first canonical test flow")
             .with_test_endpoints(
@@ -2373,31 +2331,7 @@ mod tests {
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
         let deadline = Instant::now() + Duration::from_secs(20);
-        let tcp_port = available_tcp_port();
-        let udp_port = available_udp_port();
-        let dns_port = available_dns_port();
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(loopback_bind_plan(tcp_port, false)),
-            deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(loopback_bind_plan(udp_port, false)),
-            deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(loopback_bind_plan(dns_port, false)),
-            deadline,
-        );
-        let children = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        };
+        let (children, _) = spawn_test_children(request, false, deadline);
         parent_send_signal(
             &children.client.control,
             PackagedDriverChildRole::Client,
@@ -2428,33 +2362,10 @@ mod tests {
     fn expired_parent_transaction_keeps_all_children_abortable() {
         let _self_exec_guard = serialize_self_exec_test();
         let cleanup_deadline = Instant::now() + Duration::from_secs(20);
-        let tcp_port = available_tcp_port();
-        let udp_port = available_udp_port();
-        let dns_port = available_dns_port();
         let fixture = Fixture::new(CanaryAddressFamilies::Ipv4Only);
         let request = fixture.request();
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, cleanup_deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(loopback_bind_plan(tcp_port, false)),
-            cleanup_deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(loopback_bind_plan(udp_port, false)),
-            cleanup_deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(loopback_bind_plan(dns_port, false)),
-            cleanup_deadline,
-        );
-        let mut children = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        };
+        let (mut children, bindings) = spawn_test_children(request, false, cleanup_deadline);
+        let tcp_port = bindings.tcp.port();
         let plan = TrafficFlowPlan::for_request(request, CanaryFlow::Ipv4TcpEcho)
             .expect("derive first canonical test flow")
             .with_test_endpoints(
@@ -2486,7 +2397,11 @@ mod tests {
             required_test_env(TEST_IPV4_ENV),
             required_test_env(TEST_IPV6_ENV),
         ];
-        run_internal_child(&args).expect("run self-exec child reentry");
+        let resource_descriptors = required_test_env(TEST_RESOURCE_DESCRIPTORS_ENV);
+        run_internal_child_with_binder(&args, |role, binding| {
+            claim_test_child_resources(role, binding, &resource_descriptors)
+        })
+        .expect("run self-exec child reentry");
     }
 
     fn serialize_self_exec_test() -> MutexGuard<'static, ()> {
@@ -2497,7 +2412,7 @@ mod tests {
 
     fn spawn_test_child(
         role: PackagedDriverChildRole,
-        binding: Option<ChildBindPlan>,
+        binding: Option<TestChildBinding>,
         exclusive_deadline: Instant,
     ) -> PackagedDriverChild {
         // SAFETY: the identity getters have no arguments or failure modes.
@@ -2517,10 +2432,18 @@ mod tests {
         let inherited_descriptor = seqpacket_inherited_descriptor(&inherited);
         let deadline_nanos =
             child_monotonic_deadline(exclusive_deadline).expect("bounded test child deadline");
-        let (ipv4, ipv6) = binding.map_or_else(
+        let (ipv4, ipv6) = binding.as_ref().map_or_else(
             || ("-".to_owned(), "-".to_owned()),
-            ChildBindPlan::arguments,
+            |binding| binding.plan.arguments(),
         );
+        let resource_descriptors = binding
+            .as_ref()
+            .map_or_else(Vec::new, |binding| binding.resource_descriptors());
+        let resource_descriptor_argument = resource_descriptors
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         // SAFETY: getpid has no arguments or failure mode.
         let expected_parent = unsafe { libc::getpid() };
         let mut command = Command::new(env::current_exe().expect("resolve test executable"));
@@ -2539,6 +2462,7 @@ mod tests {
             .env(TEST_DEADLINE_ENV, deadline_nanos.to_string())
             .env(TEST_IPV4_ENV, ipv4)
             .env(TEST_IPV6_ENV, ipv6)
+            .env(TEST_RESOURCE_DESCRIPTORS_ENV, resource_descriptor_argument)
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2560,6 +2484,14 @@ mod tests {
                     || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
                 {
                     return Err(std::io::Error::last_os_error());
+                }
+                for descriptor in &resource_descriptors {
+                    let flags = libc::fcntl(*descriptor, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(*descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 if libc::getppid() != expected_parent {
                     let _ = libc::kill(libc::getpid(), libc::SIGKILL);
@@ -2677,48 +2609,80 @@ mod tests {
         dns: SocketAddr,
     }
 
+    struct TestChildBinding {
+        plan: ChildBindPlan,
+        resources: BoundChildResources,
+    }
+
+    impl TestChildBinding {
+        fn resource_descriptors(&self) -> Vec<RawFd> {
+            match &self.resources {
+                BoundChildResources::Client => Vec::new(),
+                BoundChildResources::Tcp(listeners) => {
+                    listeners.iter().map(AsRawFd::as_raw_fd).collect()
+                }
+                BoundChildResources::Udp(sockets) => {
+                    sockets.iter().map(AsRawFd::as_raw_fd).collect()
+                }
+                BoundChildResources::Dns { tcp, udp } => tcp
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .chain(udp.iter().map(AsRawFd::as_raw_fd))
+                    .collect(),
+            }
+        }
+    }
+
+    fn spawn_test_children(
+        request: &CanaryAttemptRequest,
+        ipv6: bool,
+        exclusive_deadline: Instant,
+    ) -> (PackagedDriverChildren, TestPeerBindings) {
+        let client = spawn_test_child(PackagedDriverChildRole::Client, None, exclusive_deadline);
+        let tcp_binding = reserve_test_child_binding(PackagedDriverChildRole::TcpEcho, ipv6);
+        let tcp_address = tcp_binding.plan.ipv4;
+        let tcp = spawn_test_child(
+            PackagedDriverChildRole::TcpEcho,
+            Some(tcp_binding),
+            exclusive_deadline,
+        );
+        let udp_binding = reserve_test_child_binding(PackagedDriverChildRole::UdpEcho, ipv6);
+        let udp_address = udp_binding.plan.ipv4;
+        let udp = spawn_test_child(
+            PackagedDriverChildRole::UdpEcho,
+            Some(udp_binding),
+            exclusive_deadline,
+        );
+        let dns_binding = reserve_test_child_binding(PackagedDriverChildRole::Dns, ipv6);
+        let dns_address = dns_binding.plan.ipv4;
+        let dns = spawn_test_child(
+            PackagedDriverChildRole::Dns,
+            Some(dns_binding),
+            exclusive_deadline,
+        );
+        (
+            PackagedDriverChildren {
+                request: request.clone(),
+                client,
+                peer_servers: [tcp, udp, dns],
+                traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
+            },
+            TestPeerBindings {
+                tcp: tcp_address,
+                udp: udp_address,
+                dns: dns_address,
+            },
+        )
+    }
+
     fn spawn_client_reaped_fixture(
         request: &CanaryAttemptRequest,
         exclusive_deadline: Instant,
     ) -> (ClientReapedPackagedDriverChildren, TestPeerBindings) {
-        let bindings = TestPeerBindings {
-            tcp: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_tcp_port())),
-            udp: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_udp_port())),
-            dns: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_dns_port())),
-        };
-        let client = spawn_test_child(PackagedDriverChildRole::Client, None, exclusive_deadline);
-        let tcp = spawn_test_child(
-            PackagedDriverChildRole::TcpEcho,
-            Some(ChildBindPlan {
-                ipv4: bindings.tcp,
-                ipv6: None,
-            }),
-            exclusive_deadline,
-        );
-        let udp = spawn_test_child(
-            PackagedDriverChildRole::UdpEcho,
-            Some(ChildBindPlan {
-                ipv4: bindings.udp,
-                ipv6: None,
-            }),
-            exclusive_deadline,
-        );
-        let dns = spawn_test_child(
-            PackagedDriverChildRole::Dns,
-            Some(ChildBindPlan {
-                ipv4: bindings.dns,
-                ipv6: None,
-            }),
-            exclusive_deadline,
-        );
-        let children = PackagedDriverChildren {
-            request: request.clone(),
-            client,
-            peer_servers: [tcp, udp, dns],
-            traffic_state: PackagedDriverTrafficState::Ready { next_flow_index: 0 },
-        }
-        .quiesce_client_and_reap(exclusive_deadline)
-        .expect("quiesce and parent-reap the exact report-retirement client");
+        let (children, bindings) = spawn_test_children(request, false, exclusive_deadline);
+        let children = children
+            .quiesce_client_and_reap(exclusive_deadline)
+            .expect("quiesce and parent-reap the exact report-retirement client");
         (children, bindings)
     }
 
@@ -2830,37 +2794,244 @@ mod tests {
         env::var(name).unwrap_or_else(|_| panic!("{name} is required in test child reentry"))
     }
 
-    fn available_tcp_port() -> u16 {
-        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("reserve TCP test port")
-            .local_addr()
-            .expect("read TCP test port")
-            .port()
-    }
+    fn claim_test_child_resources(
+        role: PackagedDriverChildRole,
+        binding: Option<ChildBindPlan>,
+        descriptor_argument: &str,
+    ) -> Result<BoundChildResources, PackagedDriverChildError> {
+        let descriptors = parse_test_resource_descriptors(descriptor_argument)?;
+        if role == PackagedDriverChildRole::Client {
+            if binding.is_some() || !descriptors.is_empty() {
+                return Err(PackagedDriverChildError::InvalidArguments(
+                    "test client must not inherit peer resources",
+                ));
+            }
+            return Ok(BoundChildResources::Client);
+        }
+        let binding = binding.ok_or(PackagedDriverChildError::InvalidArguments(
+            "test peer omitted its bind plan",
+        ))?;
+        let family_count = usize::from(binding.ipv6.is_some()) + 1;
+        let expected_count = if role == PackagedDriverChildRole::Dns {
+            family_count * 2
+        } else {
+            family_count
+        };
+        if descriptors.len() != expected_count {
+            return Err(PackagedDriverChildError::InvalidArguments(
+                "test peer inherited the wrong number of bound resources",
+            ));
+        }
 
-    fn available_udp_port() -> u16 {
-        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("reserve UDP test port")
-            .local_addr()
-            .expect("read UDP test port")
-            .port()
-    }
-
-    fn available_dns_port() -> u16 {
-        for _ in 0..32 {
-            let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .expect("reserve candidate DNS/TCP port");
-            let port = tcp.local_addr().expect("read DNS/TCP port").port();
-            if let Ok(udp) = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
-                drop(udp);
-                drop(tcp);
-                return port;
+        match role {
+            PackagedDriverChildRole::Client => unreachable!("handled above"),
+            PackagedDriverChildRole::TcpEcho => {
+                let listeners = claim_test_tcp_listeners(&descriptors);
+                validate_test_tcp_bindings(&listeners, binding)?;
+                Ok(BoundChildResources::Tcp(listeners))
+            }
+            PackagedDriverChildRole::UdpEcho => {
+                let sockets = claim_test_udp_sockets(&descriptors);
+                validate_test_udp_bindings(&sockets, binding)?;
+                Ok(BoundChildResources::Udp(sockets))
+            }
+            PackagedDriverChildRole::Dns => {
+                let (tcp, udp) = descriptors.split_at(family_count);
+                let listeners = claim_test_tcp_listeners(tcp);
+                let sockets = claim_test_udp_sockets(udp);
+                validate_test_tcp_bindings(&listeners, binding)?;
+                validate_test_udp_bindings(&sockets, binding)?;
+                Ok(BoundChildResources::Dns {
+                    tcp: listeners,
+                    udp: sockets,
+                })
             }
         }
-        panic!("could not reserve one shared DNS UDP/TCP test port")
     }
 
-    fn loopback_bind_plan(port: u16, ipv6: bool) -> ChildBindPlan {
+    fn parse_test_resource_descriptors(
+        argument: &str,
+    ) -> Result<Vec<RawFd>, PackagedDriverChildError> {
+        if argument.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut descriptors = Vec::new();
+        for value in argument.split(',') {
+            let descriptor = value
+                .parse::<RawFd>()
+                .ok()
+                .filter(|value| *value >= 3)
+                .ok_or(PackagedDriverChildError::InvalidArguments(
+                    "invalid inherited test peer resource descriptor",
+                ))?;
+            if descriptors.contains(&descriptor) {
+                return Err(PackagedDriverChildError::InvalidArguments(
+                    "duplicate inherited test peer resource descriptor",
+                ));
+            }
+            descriptors.push(descriptor);
+        }
+        Ok(descriptors)
+    }
+
+    fn claim_test_tcp_listeners(descriptors: &[RawFd]) -> Vec<TcpListener> {
+        descriptors
+            .iter()
+            .map(|descriptor| {
+                // SAFETY: the parent cleared CLOEXEC on one unique owned TCP
+                // listener descriptor and no Rust owner exists in this child.
+                unsafe { TcpListener::from_raw_fd(*descriptor) }
+            })
+            .collect()
+    }
+
+    fn claim_test_udp_sockets(descriptors: &[RawFd]) -> Vec<UdpSocket> {
+        descriptors
+            .iter()
+            .map(|descriptor| {
+                // SAFETY: the parent cleared CLOEXEC on one unique owned UDP
+                // socket descriptor and no Rust owner exists in this child.
+                unsafe { UdpSocket::from_raw_fd(*descriptor) }
+            })
+            .collect()
+    }
+
+    fn test_binding_addresses(binding: ChildBindPlan) -> Vec<SocketAddr> {
+        binding
+            .ipv6
+            .into_iter()
+            .chain(std::iter::once(binding.ipv4))
+            .collect()
+    }
+
+    fn validate_test_tcp_bindings(
+        listeners: &[TcpListener],
+        binding: ChildBindPlan,
+    ) -> Result<(), PackagedDriverChildError> {
+        for (listener, expected) in listeners.iter().zip(test_binding_addresses(binding)) {
+            let observed =
+                listener
+                    .local_addr()
+                    .map_err(|source| PackagedDriverChildError::Io {
+                        operation: "observe inherited test TCP listener",
+                        source,
+                    })?;
+            if observed != expected {
+                return Err(PackagedDriverChildError::Protocol(
+                    "inherited test TCP listener does not match its bind plan",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_test_udp_bindings(
+        sockets: &[UdpSocket],
+        binding: ChildBindPlan,
+    ) -> Result<(), PackagedDriverChildError> {
+        for (socket, expected) in sockets.iter().zip(test_binding_addresses(binding)) {
+            let observed = socket
+                .local_addr()
+                .map_err(|source| PackagedDriverChildError::Io {
+                    operation: "observe inherited test UDP socket",
+                    source,
+                })?;
+            if observed != expected {
+                return Err(PackagedDriverChildError::Protocol(
+                    "inherited test UDP socket does not match its bind plan",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reserve_test_child_binding(role: PackagedDriverChildRole, ipv6: bool) -> TestChildBinding {
+        for _ in 0..32 {
+            let reserved = match role {
+                PackagedDriverChildRole::Client => {
+                    panic!("test clients do not reserve peer sockets")
+                }
+                PackagedDriverChildRole::TcpEcho => reserve_test_tcp_binding(ipv6),
+                PackagedDriverChildRole::UdpEcho => reserve_test_udp_binding(ipv6),
+                PackagedDriverChildRole::Dns => reserve_test_dns_binding(ipv6),
+            };
+            if let Some(binding) = reserved {
+                return binding;
+            }
+        }
+        panic!("could not reserve one complete inherited test peer binding")
+    }
+
+    fn reserve_test_tcp_binding(ipv6: bool) -> Option<TestChildBinding> {
+        let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve inherited IPv4 TCP test listener");
+        let port = ipv4.local_addr().expect("read IPv4 TCP test port").port();
+        let ipv6_listener = if ipv6 {
+            Some(TcpListener::bind((Ipv6Addr::LOCALHOST, port)).ok()?)
+        } else {
+            None
+        };
+        let mut listeners = Vec::with_capacity(usize::from(ipv6_listener.is_some()) + 1);
+        if let Some(ipv6_listener) = ipv6_listener {
+            listeners.push(ipv6_listener);
+        }
+        listeners.push(ipv4);
+        Some(TestChildBinding {
+            plan: loopback_test_bind_plan(port, ipv6),
+            resources: BoundChildResources::Tcp(listeners),
+        })
+    }
+
+    fn reserve_test_udp_binding(ipv6: bool) -> Option<TestChildBinding> {
+        let ipv4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve inherited IPv4 UDP test socket");
+        let port = ipv4.local_addr().expect("read IPv4 UDP test port").port();
+        let ipv6_socket = if ipv6 {
+            Some(UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).ok()?)
+        } else {
+            None
+        };
+        let mut sockets = Vec::with_capacity(usize::from(ipv6_socket.is_some()) + 1);
+        if let Some(ipv6_socket) = ipv6_socket {
+            sockets.push(ipv6_socket);
+        }
+        sockets.push(ipv4);
+        Some(TestChildBinding {
+            plan: loopback_test_bind_plan(port, ipv6),
+            resources: BoundChildResources::Udp(sockets),
+        })
+    }
+
+    fn reserve_test_dns_binding(ipv6: bool) -> Option<TestChildBinding> {
+        let tcp4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve inherited IPv4 DNS/TCP test listener");
+        let port = tcp4.local_addr().expect("read DNS/TCP test port").port();
+        let udp4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+        let (tcp6, udp6) = if ipv6 {
+            (
+                Some(TcpListener::bind((Ipv6Addr::LOCALHOST, port)).ok()?),
+                Some(UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).ok()?),
+            )
+        } else {
+            (None, None)
+        };
+        let mut tcp = Vec::with_capacity(usize::from(tcp6.is_some()) + 1);
+        let mut udp = Vec::with_capacity(usize::from(udp6.is_some()) + 1);
+        if let Some(tcp6) = tcp6 {
+            tcp.push(tcp6);
+        }
+        tcp.push(tcp4);
+        if let Some(udp6) = udp6 {
+            udp.push(udp6);
+        }
+        udp.push(udp4);
+        Some(TestChildBinding {
+            plan: loopback_test_bind_plan(port, ipv6),
+            resources: BoundChildResources::Dns { tcp, udp },
+        })
+    }
+
+    fn loopback_test_bind_plan(port: u16, ipv6: bool) -> ChildBindPlan {
         ChildBindPlan {
             ipv4: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
             ipv6: ipv6.then(|| SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))),
@@ -2870,59 +3041,5 @@ mod tests {
     fn ipv6_loopback_available() -> bool {
         TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
             && UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
-    }
-
-    fn available_tcp_port_for_families(ipv6: bool) -> u16 {
-        if !ipv6 {
-            return available_tcp_port();
-        }
-        for _ in 0..32 {
-            let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .expect("reserve candidate IPv4 TCP port");
-            let port = ipv4.local_addr().expect("read candidate TCP port").port();
-            if TcpListener::bind((Ipv6Addr::LOCALHOST, port)).is_ok() {
-                return port;
-            }
-        }
-        panic!("could not reserve one dual-family TCP test port")
-    }
-
-    fn available_udp_port_for_families(ipv6: bool) -> u16 {
-        if !ipv6 {
-            return available_udp_port();
-        }
-        for _ in 0..32 {
-            let ipv4 =
-                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve candidate IPv4 UDP port");
-            let port = ipv4.local_addr().expect("read candidate UDP port").port();
-            if UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).is_ok() {
-                return port;
-            }
-        }
-        panic!("could not reserve one dual-family UDP test port")
-    }
-
-    fn available_dns_port_for_families(ipv6: bool) -> u16 {
-        if !ipv6 {
-            return available_dns_port();
-        }
-        for _ in 0..32 {
-            let tcp4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .expect("reserve candidate IPv4 DNS/TCP port");
-            let port = tcp4.local_addr().expect("read DNS/TCP port").port();
-            let Ok(udp4) = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) else {
-                continue;
-            };
-            let Ok(tcp6) = TcpListener::bind((Ipv6Addr::LOCALHOST, port)) else {
-                continue;
-            };
-            if UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).is_ok() {
-                drop(tcp6);
-                drop(udp4);
-                drop(tcp4);
-                return port;
-            }
-        }
-        panic!("could not reserve one dual-family DNS UDP/TCP test port")
     }
 }

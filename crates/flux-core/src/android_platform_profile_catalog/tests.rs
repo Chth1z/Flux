@@ -1,25 +1,35 @@
 use super::*;
 use crate::android_mark_authority::{AndroidMarkDeviceGrantKind, FwmarkPlaneSet};
 use crate::android_netd::AndroidNetdSourceProfile;
-use crate::android_rpdb::classify_android_rpdb;
+use crate::android_rpdb::{
+    ReviewedCanaryRpdbClassificationError, ReviewedCanaryRpdbPlacementError, classify_android_rpdb,
+    classify_android_rpdb_with_reviewed_canary_facility,
+    plan_android_rpdb_placement_with_reviewed_canary_facility,
+};
 use crate::android_tproxy_topology::{
     AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
     AndroidTproxyTrafficDomainRequest, assess_android_tproxy_topology_scope,
 };
+use crate::canary_facility_policy::ReviewedCanaryFacilitySelection;
 use crate::capability::{
     BootIdentity, CapabilityProfileRevision, DeviceIdentity, KernelFacts, KernelRelease,
     Observation, SelinuxMode, ToolId, VerifiedBootIdentity, VerifiedBootState,
 };
 use crate::capture_path::{CapturePathId, CapturePathQualificationState};
+use crate::fwmark_audit::audit_fwmark_candidate_partial;
+use crate::fwmark_census::{
+    project_rpdb_fwmark_census_fragment, project_rpdb_fwmark_census_fragment_with_classification,
+};
 use crate::network_inventory::{
     InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
-    NetworkInventoryTracker,
+    NetworkInventory, NetworkInventoryTracker,
 };
 use crate::network_route::NetworkAddressFamily;
 use crate::network_rule::{
-    NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority, RuleProperties,
-    RuleProtocol, RuleTableId,
+    NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RuleIpProtocol, RulePortRange,
+    RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId, RuleUidRange,
 };
+use crate::rpdb_placement::{RpdbFamilyPlacement, RpdbPlacementRequest};
 use sha2::{Digest, Sha256};
 
 const NET_ID_MASK: u32 = 0x0000_ffff;
@@ -51,6 +61,7 @@ const MARK_POLICY: ReviewedAndroidMarkPolicyLiteral = ReviewedAndroidMarkPolicyL
     bypass_value: BYPASS_VALUE,
     planes: FwmarkPlaneSet::ALL.bits(),
     ordered_late_writes: &[],
+    exact_mark_sentinels: &[],
 };
 const CAPTURE_PATH_EVIDENCE: ReviewedCapturePathEvidenceLiteral =
     ReviewedCapturePathEvidenceLiteral {
@@ -62,12 +73,55 @@ const CAPTURE_PATH_EVIDENCE: ReviewedCapturePathEvidenceLiteral =
             CapturePathQualificationState::Unqualified,
         ),
     };
+const CANARY_ADDRESSES: &[ReviewedCanaryFacilityAddressLiteral] =
+    &[ReviewedCanaryFacilityAddressLiteral {
+        daemon_ipv4: std::net::Ipv4Addr::new(8, 8, 8, 7),
+        peer_ipv4: std::net::Ipv4Addr::new(8, 8, 8, 8),
+        daemon_ipv6: Some(std::net::Ipv6Addr::new(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1110,
+        )),
+        peer_ipv6: Some(std::net::Ipv6Addr::new(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
+        )),
+    }];
+const CANARY_PORTS: &[ReviewedCanaryResponderPortsLiteral] =
+    &[ReviewedCanaryResponderPortsLiteral {
+        tcp_echo: 41_001,
+        udp_echo: 41_002,
+        dns: 41_003,
+    }];
+const CANARY_FACILITY_POLICY: ReviewedCanaryFacilityPolicyLiteral =
+    ReviewedCanaryFacilityPolicyLiteral {
+        revision: 1,
+        artifact_digest: [0x51; 32],
+        daemon_veth_name: "fxcan0",
+        peer_veth_name: "fxcanp",
+        probe_uid: 20_001,
+        probe_gid: 20_001,
+        engine_uid: 20_002,
+        engine_gid: 20_002,
+        addresses: CANARY_ADDRESSES,
+        ports: CANARY_PORTS,
+        netd_source_profile: AndroidNetdSourceProfile::AospAndroid13R1,
+        early_uid_lookup_priorities: &[],
+        proxy_rule_priority: 30_997,
+        peer_rule_priority: 30_998,
+        proxy_capture_table: 20_253,
+        peer_table: 20_254,
+        peer_return_table: 254,
+        rule_protocol: 186,
+        route_protocol: 186,
+        route_metric: 1_031,
+        proxy_mark_value: PROXY_VALUE,
+        proxy_mark_mask: CANDIDATE_MASK,
+    };
 const ENTRY: ReviewedAndroidPlatformProfileCatalogEntry =
     ReviewedAndroidPlatformProfileCatalogEntry {
         id: "google-redfin-tq3a-20230805-v1",
         selector: SELECTOR,
         mark_policy: Some(MARK_POLICY),
         capture_path: Some(CAPTURE_PATH_EVIDENCE),
+        canary_facility: Some(CANARY_FACILITY_POLICY),
     };
 
 #[test]
@@ -86,6 +140,7 @@ fn unmatched_production_selector_returns_explicit_zero_grants() {
     let bound = selection
         .bind_topology(&topology)
         .expect("zero grant binds without positive topology authority");
+    assert!(bound.canary_facility_policy().is_none());
     let (policy, capture_path) = bound.into_parts();
     assert_eq!(policy.grant_kind(), AndroidMarkDeviceGrantKind::NoGrant);
     assert_eq!(
@@ -107,6 +162,7 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
 
     assert!(selection.is_match());
     assert!(selection.has_reviewed_capture_path_evidence());
+    assert!(selection.canary_facility_policy().is_some());
     assert_eq!(
         selection.netd_source_profile(),
         Some(AndroidNetdSourceProfile::AospAndroid13R1)
@@ -121,6 +177,12 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
     let bound = selection
         .bind_topology(&topology)
         .expect("selected profile binds matching topology");
+    let canary = bound
+        .canary_facility_policy()
+        .expect("exact entry carries reviewed canary facility policy");
+    assert_eq!(canary.credentials().engine_uid().get(), 20_002);
+    assert_eq!(canary.rpdb().proxy_rule_priority().get(), 30_997);
+    assert_eq!(canary.rpdb().peer_rule_priority().get(), 30_998);
     let (policy, capture_path) = bound.into_parts();
     let grant = policy.positive_grant().expect("matched positive policy");
 
@@ -162,6 +224,338 @@ fn exact_entry_selects_positive_policy_and_retains_catalog_provenance() {
     assert_eq!(reviewed.revision().get(), 7);
     assert_eq!(reviewed.artifact_digest().as_bytes(), &[0x41; 32]);
     assert_eq!(projected_capture_path, capture_path);
+}
+
+#[test]
+fn reviewed_canary_rule_cohort_is_the_only_non_android_classification_exception() {
+    let (policy, selection) = synthetic_reviewed_canary_policy();
+    assert!(
+        policy
+            .bind_live_selection(
+                std::net::Ipv4Addr::new(8, 8, 4, 4),
+                None,
+                std::num::NonZeroU16::new(41_001).expect("TCP port"),
+                std::num::NonZeroU16::new(41_002).expect("UDP port"),
+                std::num::NonZeroU16::new(41_003).expect("DNS port"),
+            )
+            .is_err()
+    );
+
+    let mut rules =
+        android_13_rules_for_families([NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]);
+    rules.extend(reviewed_canary_rules(&policy, selection));
+    rules.sort_by_key(NetworkRuleRecord::priority);
+    let inventory = inventory_with_rules(rules.clone());
+    let classification = classify_android_rpdb_with_reviewed_canary_facility(
+        &inventory,
+        AndroidNetdSourceProfile::AospNetd20250324,
+        &policy,
+        selection,
+    )
+    .expect("complete exact cohort is reviewed");
+    assert_eq!(classification.unknown_rule_count(), 0);
+    let candidate = FwmarkCandidate::new(CANDIDATE_MASK, PROXY_VALUE, BYPASS_VALUE)
+        .expect("reviewed candidate");
+    let generic_partial = audit_fwmark_candidate_partial(&inventory, candidate);
+    assert_eq!(generic_partial.conflicts().len(), 8);
+    let reviewed_partial = crate::fwmark_audit::audit_fwmark_candidate_partial_with_classification(
+        &inventory,
+        &classification,
+        candidate,
+    );
+    assert!(reviewed_partial.conflicts().is_empty());
+    assert_eq!(
+        reviewed_partial
+            .excluded_reviewed_canary_rule_indices()
+            .len(),
+        8
+    );
+    let generic_rpdb =
+        project_rpdb_fwmark_census_fragment(&inventory).expect("generic RPDB mark-use projection");
+    let reviewed_rpdb =
+        project_rpdb_fwmark_census_fragment_with_classification(&inventory, &classification)
+            .expect("reviewed RPDB mark-use projection");
+    assert_eq!(
+        generic_rpdb.raw_mark_uses().len(),
+        reviewed_rpdb.raw_mark_uses().len() + 16
+    );
+    let placement = RpdbFamilyPlacement::proxy_only(
+        policy.rpdb().proxy_rule_priority(),
+        RuleTableId::from_raw(policy.rpdb().proxy_capture_table().get()),
+    )
+    .expect("reviewed proxy placement");
+    plan_android_rpdb_placement_with_reviewed_canary_facility(
+        &inventory,
+        &classification,
+        RpdbPlacementRequest::new(Some(placement), Some(placement)).expect("dual-stack placement"),
+        &policy,
+        selection,
+    )
+    .expect("reviewed proxy and peer slots coexist before Android default network");
+    let topology_request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6),
+        ],
+    )
+    .expect("dual-stack topology request");
+    let topology =
+        assess_android_tproxy_topology_scope(&inventory, &classification, &topology_request)
+            .expect("reviewed peer cohort remains complete topology evidence");
+    assert_eq!(
+        topology.structural_feasibility(),
+        crate::AndroidTproxyTopologyScopeStructuralFeasibility::AllMatchedAnchorsHaveResidualCandidateWindows {
+            anchor_count: 2,
+        }
+    );
+    assert_eq!(
+        topology
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.report().dispositions())
+            .filter(|disposition| {
+                **disposition == crate::AndroidTproxyRuleDisposition::ReviewedCanaryFacility
+            })
+            .count(),
+        8
+    );
+
+    let generic_report =
+        classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospNetd20250324);
+    let generic_topology =
+        assess_android_tproxy_topology_scope(&inventory, &generic_report, &topology_request)
+            .expect("generic classifier still finds both Android anchors");
+    assert_eq!(
+        generic_topology.structural_feasibility(),
+        crate::AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence {
+            incomplete_anchor_count: 2,
+        },
+        "only the exact reviewed classifier may complete the peer-cohort topology"
+    );
+    let generic_partial_via_classification =
+        crate::fwmark_audit::audit_fwmark_candidate_partial_with_classification(
+            &inventory,
+            &generic_report,
+            candidate,
+        );
+    assert_eq!(generic_partial_via_classification, generic_partial);
+    assert_eq!(
+        project_rpdb_fwmark_census_fragment_with_classification(&inventory, &generic_report)
+            .expect("generic classification does not exempt RPDB uses"),
+        generic_rpdb
+    );
+    assert_eq!(
+        plan_android_rpdb_placement_with_reviewed_canary_facility(
+            &inventory,
+            &generic_report,
+            RpdbPlacementRequest::new(Some(placement), Some(placement))
+                .expect("dual-stack placement"),
+            &policy,
+            selection,
+        ),
+        Err(ReviewedCanaryRpdbPlacementError::ClassificationReportMismatch)
+    );
+    let wrong_placement = RpdbFamilyPlacement::proxy_only(
+        RulePriority::from_raw(policy.rpdb().proxy_rule_priority().get() - 1),
+        RuleTableId::from_raw(policy.rpdb().proxy_capture_table().get()),
+    )
+    .expect("structurally valid wrong placement");
+    assert_eq!(
+        plan_android_rpdb_placement_with_reviewed_canary_facility(
+            &inventory,
+            &classification,
+            RpdbPlacementRequest::new(Some(wrong_placement), None).expect("IPv4 placement"),
+            &policy,
+            selection,
+        ),
+        Err(ReviewedCanaryRpdbPlacementError::PlacementRequestMismatch)
+    );
+
+    let missing_peer_index = rules
+        .iter()
+        .position(|rule| rule.priority() == policy.rpdb().peer_rule_priority())
+        .expect("reviewed peer rule is present");
+    rules.remove(missing_peer_index);
+    assert_reviewed_canary_cohort_rejected(&policy, selection, rules);
+
+    let cohort = reviewed_canary_rules(&policy, selection);
+    let mut duplicate =
+        android_13_rules_for_families([NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]);
+    duplicate.extend(cohort.iter().cloned());
+    duplicate.push(cohort[0].clone());
+    assert_reviewed_canary_cohort_rejected(&policy, selection, duplicate);
+
+    for altered in [
+        cohort[0]
+            .clone()
+            .with_uid_range(RuleUidRange::new(20_003, 20_003).expect("altered engine UID range")),
+        cohort[0].clone().with_fwmark(
+            RuleFwMark::new(0x0100_0000, policy.rpdb().proxy_mark_mask().get())
+                .expect("altered proxy mark"),
+        ),
+        cohort[0].clone().with_destination_port_range(
+            RulePortRange::new(41_004, 41_004).expect("altered responder port"),
+        ),
+        rebuild_canary_rule(
+            &cohort[0],
+            RulePriority::from_raw(policy.rpdb().peer_rule_priority().get() - 1),
+            RuleTableId::from_raw(policy.rpdb().peer_table().get()),
+        ),
+        rebuild_canary_rule(
+            &cohort[0],
+            policy.rpdb().peer_rule_priority(),
+            RuleTableId::from_raw(policy.rpdb().peer_table().get() - 1),
+        ),
+    ] {
+        let mut altered_cohort = cohort.clone();
+        altered_cohort[0] = altered;
+        let mut altered_rules =
+            android_13_rules_for_families([NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]);
+        altered_rules.extend(altered_cohort);
+        assert_reviewed_canary_cohort_rejected(&policy, selection, altered_rules);
+    }
+}
+
+#[test]
+fn unrelated_unknown_ipv4_rules_keep_reviewed_dual_stack_topology_incomplete() {
+    let (policy, selection) = synthetic_reviewed_canary_policy();
+    let mut rules =
+        android_13_rules_for_families([NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]);
+    rules.extend(reviewed_canary_rules(&policy, selection));
+    rules.extend(reviewed_vendor_early_uid_lookup_rules());
+    rules.sort_by_key(NetworkRuleRecord::priority);
+    let inventory = inventory_with_rules(rules);
+    let classification = classify_android_rpdb_with_reviewed_canary_facility(
+        &inventory,
+        AndroidNetdSourceProfile::AospNetd20250324,
+        &policy,
+        selection,
+    )
+    .expect("unrelated rules do not substitute the exact reviewed cohort");
+
+    assert_eq!(classification.unknown_rule_count(), 2);
+    let topology_request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6),
+        ],
+    )
+    .expect("dual-stack topology request");
+    let topology =
+        assess_android_tproxy_topology_scope(&inventory, &classification, &topology_request)
+            .expect("both reviewed Android anchors remain present");
+
+    assert_eq!(
+        topology.structural_feasibility(),
+        crate::AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence {
+            incomplete_anchor_count: 1,
+        },
+        "unreviewed IPv4 rules must keep only the IPv4 anchor fail-closed"
+    );
+    let ipv4 = topology
+        .entries()
+        .iter()
+        .find(|entry| entry.domain().family() == NetworkAddressFamily::Ipv4)
+        .expect("IPv4 topology entry");
+    let ipv6 = topology
+        .entries()
+        .iter()
+        .find(|entry| entry.domain().family() == NetworkAddressFamily::Ipv6)
+        .expect("IPv6 topology entry");
+    assert_eq!(ipv4.report().unknown_rule_count(), 2);
+    assert_eq!(ipv6.report().unknown_rule_count(), 0);
+    assert_eq!(
+        topology
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.report().dispositions())
+            .filter(|disposition| {
+                **disposition == crate::AndroidTproxyRuleDisposition::ReviewedCanaryFacility
+            })
+            .count(),
+        8,
+        "unknown vendor rules must not erase or widen the exact reviewed cohort"
+    );
+}
+
+#[test]
+fn reviewed_device_policy_admits_only_its_exact_early_uid_lookup_cohort() {
+    let (policy, selection) = synthetic_reviewed_canary_policy_with_early_lookups([1, 2]);
+    let mut rules =
+        android_13_rules_for_families([NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]);
+    rules.extend(reviewed_canary_rules(&policy, selection));
+    rules.extend(reviewed_vendor_early_uid_lookup_rules());
+    rules.sort_by_key(NetworkRuleRecord::priority);
+    let inventory = inventory_with_rules(rules.clone());
+    let classification = classify_android_rpdb_with_reviewed_canary_facility(
+        &inventory,
+        AndroidNetdSourceProfile::AospNetd20250324,
+        &policy,
+        selection,
+    )
+    .expect("exact reviewed early UID lookup cohort");
+
+    assert_eq!(classification.unknown_rule_count(), 0);
+    assert_eq!(
+        classification
+            .roles()
+            .iter()
+            .filter(|role| **role == Some(crate::AndroidRpdbRuleRole::ReviewedEarlyUidLookup))
+            .count(),
+        2
+    );
+    let topology_request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6),
+        ],
+    )
+    .expect("dual-stack topology request");
+    let topology =
+        assess_android_tproxy_topology_scope(&inventory, &classification, &topology_request)
+            .expect("reviewed vendor cohort retains both Android anchors");
+    assert_eq!(
+        topology.structural_feasibility(),
+        crate::AndroidTproxyTopologyScopeStructuralFeasibility::AllMatchedAnchorsHaveResidualCandidateWindows {
+            anchor_count: 2,
+        }
+    );
+
+    let generic = classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospNetd20250324);
+    assert_eq!(generic.unknown_rule_count(), 10);
+
+    let missing_priority_two = rules
+        .iter()
+        .filter(|rule| rule.priority().get() != 2)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        classify_android_rpdb_with_reviewed_canary_facility(
+            &inventory_with_rules(missing_priority_two),
+            AndroidNetdSourceProfile::AospNetd20250324,
+            &policy,
+            selection,
+        ),
+        Err(ReviewedCanaryRpdbClassificationError::EarlyUidLookupCohortMismatch)
+    );
+
+    let priority_one = rules
+        .iter()
+        .position(|rule| rule.priority().get() == 1)
+        .expect("priority-one vendor rule");
+    rules[priority_one] = RuleSpec::netd(1, 1_001, RuleAction::TO_TABLE).build();
+    assert_eq!(
+        classify_android_rpdb_with_reviewed_canary_facility(
+            &inventory_with_rules(rules),
+            AndroidNetdSourceProfile::AospNetd20250324,
+            &policy,
+            selection,
+        ),
+        Err(ReviewedCanaryRpdbClassificationError::EarlyUidLookupCohortMismatch)
+    );
 }
 
 #[test]
@@ -208,6 +602,115 @@ fn exact_production_samsung_selector_grants_marks_but_not_capture_path_behavior(
     assert!(capture_path.reviewed_identity().is_none());
 }
 
+#[cfg(not(flux_android_qualification))]
+#[test]
+fn qualification_selector_is_absent_from_every_ordinary_catalog_build() {
+    let namespace = namespace(20, 234_674);
+    let profile = capability_profile_for_selector(
+        namespace,
+        0x72,
+        SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR,
+    );
+    let selection = select_reviewed_android_platform_profile(&profile, namespace)
+        .expect("unmatched qualification selector returns zero grants");
+
+    assert!(!selection.is_match());
+    assert!(selection.canary_facility_policy().is_none());
+    assert!(!selection.has_reviewed_capture_path_evidence());
+}
+
+#[cfg(flux_android_qualification)]
+#[test]
+fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
+    let namespace = namespace(20, 234_674);
+    let profile = capability_profile_for_selector(
+        namespace,
+        0x72,
+        SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR,
+    );
+    let selection = select_reviewed_android_platform_profile(&profile, namespace)
+        .expect("exact non-shipping qualification selector");
+
+    assert_eq!(
+        selection
+            .catalog_entry()
+            .map(ReviewedPolicyCatalogEntryId::as_str),
+        Some("samsung-sm-s9180-fzdp-qkernel-20260722-qualification-v1")
+    );
+    assert!(selection.has_reviewed_capture_path_evidence());
+    assert!(selection.canary_facility_policy().is_some());
+    let facility = selection
+        .canary_facility_policy()
+        .expect("qualification facility policy");
+    assert_eq!(facility.revision().get(), 2);
+    assert_eq!(
+        facility.early_uid_lookup_priorities(),
+        [RulePriority::from_raw(1), RulePriority::from_raw(2)]
+    );
+    assert_eq!(
+        selection.mark_candidate(),
+        Some(
+            FwmarkCandidate::new(0x0c00_0000, 0x0400_0000, 0x0800_0000)
+                .expect("qualification candidate"),
+        )
+    );
+    let bound = selection
+        .bind_topology(&topology_scope_for(
+            AndroidNetdSourceProfile::AospNetd20250324,
+        ))
+        .expect("qualification topology binding");
+    let grant = bound
+        .mark_policy()
+        .positive_grant()
+        .expect("qualification mark grant");
+    assert_eq!(grant.ordered_late_writes().len(), 12);
+    assert_eq!(grant.exact_mark_sentinels().len(), 2);
+}
+
+#[cfg(flux_android_qualification)]
+#[test]
+fn qualification_diagnostic_reports_only_drifting_selector_field_names() {
+    let namespace = namespace(20, 234_674);
+    let exact = capability_profile_for_selector(
+        namespace,
+        0x72,
+        SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR,
+    );
+    assert!(qualification_selector_mismatch_fields(&exact).is_empty());
+
+    let changed = capability_profile_for_selector(
+        namespace,
+        0x72,
+        ReviewedPolicySelectorLiteral {
+            kernel_build: "5.15.211-Qkernel changed-build",
+            ..SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR
+        },
+    );
+    assert_eq!(
+        qualification_selector_mismatch_fields(&changed),
+        vec!["kernel_build"]
+    );
+
+    let changed = capability_profile_for_selector(
+        namespace,
+        0x72,
+        ReviewedPolicySelectorLiteral {
+            selinux_policy: ReviewedArtifactLiteral {
+                size: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR
+                    .selinux_policy
+                    .size
+                    + 1,
+                ..SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR.selinux_policy
+            },
+            ..SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR
+        },
+    );
+    assert_eq!(
+        qualification_selector_mismatch_fields(&changed),
+        vec!["selinux_policy_size"]
+    );
+}
+
 #[test]
 fn policy_artifact_digest_is_compiled_from_the_exact_reviewed_document() {
     let bytes = include_bytes!(concat!(
@@ -221,6 +724,18 @@ fn policy_artifact_digest_is_compiled_from_the_exact_reviewed_document() {
             .mark_policy
             .expect("Samsung profile has a mark-policy aspect")
             .artifact_digest
+    );
+}
+
+#[test]
+fn qualification_artifact_digest_is_compiled_from_the_exact_nonshipping_document() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/policy/samsung-sm-s9180-fzdp-qkernel-20260722-qualification-v1.md"
+    ));
+    assert_eq!(
+        Sha256::digest(bytes).as_slice(),
+        SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST
     );
 }
 
@@ -377,10 +892,12 @@ fn optional_aspects_are_independent_and_share_one_exact_selector() {
     let profile = capability_profile(namespace);
     let mark_only = ReviewedAndroidPlatformProfileCatalogEntry {
         capture_path: None,
+        canary_facility: None,
         ..ENTRY
     };
     let capture_only = ReviewedAndroidPlatformProfileCatalogEntry {
         mark_policy: None,
+        canary_facility: None,
         ..ENTRY
     };
 
@@ -573,6 +1090,7 @@ fn empty_or_malformed_capture_aspects_fail_closed() {
     let empty = ReviewedAndroidPlatformProfileCatalogEntry {
         mark_policy: None,
         capture_path: None,
+        canary_facility: None,
         ..ENTRY
     };
     assert_eq!(
@@ -811,37 +1329,257 @@ fn topology_scope_for(profile: AndroidNetdSourceProfile) -> AndroidTproxyTopolog
 }
 
 fn android_13_rules() -> Vec<NetworkRuleRecord> {
-    let mut rules = vec![
-        RuleSpec::netd(0, 255, RuleAction::TO_TABLE)
-            .protocol(2)
-            .build(),
-        RuleSpec::netd(10_000, 99, RuleAction::TO_TABLE)
-            .mark(SYSTEM_PERMISSION, EXPLICIT_NETWORK | SYSTEM_PERMISSION)
-            .build(),
-        RuleSpec::netd(16_000, 97, RuleAction::TO_TABLE)
-            .mark(99 | EXPLICIT_NETWORK, NET_ID_MASK | EXPLICIT_NETWORK)
-            .input(b"lo")
-            .build(),
-        RuleSpec::netd(18_000, 99, RuleAction::TO_TABLE)
-            .mark(0, EXPLICIT_NETWORK)
-            .build(),
-        RuleSpec::netd(19_000, 98, RuleAction::TO_TABLE)
-            .mark(0, EXPLICIT_NETWORK)
-            .build(),
-        RuleSpec::netd(20_000, 97, RuleAction::TO_TABLE)
-            .mark(0, EXPLICIT_NETWORK)
-            .build(),
-        RuleSpec::netd(31_000, 1_003, RuleAction::TO_TABLE)
-            .mark(NETWORK_PERMISSION, NET_ID_MASK | NETWORK_PERMISSION)
-            .input(b"lo")
-            .build(),
-        RuleSpec::netd(32_000, 0, RuleAction::UNREACHABLE).build(),
-    ];
+    android_13_rules_for_families([NetworkAddressFamily::Ipv4])
+}
+
+fn android_13_rules_for_families(
+    families: impl IntoIterator<Item = NetworkAddressFamily>,
+) -> Vec<NetworkRuleRecord> {
+    let mut rules = Vec::new();
+    for family in families {
+        rules.extend([
+            RuleSpec::netd(0, 255, RuleAction::TO_TABLE)
+                .family(family)
+                .protocol(2)
+                .build(),
+            RuleSpec::netd(10_000, 99, RuleAction::TO_TABLE)
+                .family(family)
+                .mark(SYSTEM_PERMISSION, EXPLICIT_NETWORK | SYSTEM_PERMISSION)
+                .build(),
+            RuleSpec::netd(16_000, 97, RuleAction::TO_TABLE)
+                .family(family)
+                .mark(99 | EXPLICIT_NETWORK, NET_ID_MASK | EXPLICIT_NETWORK)
+                .input(b"lo")
+                .build(),
+            RuleSpec::netd(18_000, 99, RuleAction::TO_TABLE)
+                .family(family)
+                .mark(0, EXPLICIT_NETWORK)
+                .build(),
+            RuleSpec::netd(19_000, 98, RuleAction::TO_TABLE)
+                .family(family)
+                .mark(0, EXPLICIT_NETWORK)
+                .build(),
+            RuleSpec::netd(20_000, 97, RuleAction::TO_TABLE)
+                .family(family)
+                .mark(0, EXPLICIT_NETWORK)
+                .build(),
+            RuleSpec::netd(31_000, 1_003, RuleAction::TO_TABLE)
+                .family(family)
+                .mark(NETWORK_PERMISSION, NET_ID_MASK | NETWORK_PERMISSION)
+                .input(b"lo")
+                .build(),
+            RuleSpec::netd(32_000, 0, RuleAction::UNREACHABLE)
+                .family(family)
+                .build(),
+        ]);
+    }
     rules.sort_by_key(NetworkRuleRecord::priority);
     rules
 }
 
+fn reviewed_canary_rules(
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+) -> Vec<NetworkRuleRecord> {
+    let rpdb = policy.rpdb();
+    std::iter::once(std::net::IpAddr::V4(selection.peer_ipv4()))
+        .chain(selection.peer_ipv6().map(std::net::IpAddr::V6))
+        .flat_map(|destination| {
+            [
+                (6, selection.tcp_echo().get()),
+                (17, selection.udp_echo().get()),
+                (6, selection.dns().get()),
+                (17, selection.dns().get()),
+            ]
+            .into_iter()
+            .map(move |(protocol, port)| (destination, protocol, port))
+        })
+        .map(|(destination, protocol, port)| {
+            let (family, prefix_length) = match destination {
+                std::net::IpAddr::V4(_) => (NetworkAddressFamily::Ipv4, 32),
+                std::net::IpAddr::V6(_) => (NetworkAddressFamily::Ipv6, 128),
+            };
+            NetworkRuleRecord::new(
+                RulePrefix::new(destination, prefix_length).expect("peer host prefix"),
+                RulePrefix::unspecified(family),
+                RuleProperties::new(
+                    0,
+                    RuleTableId::from_raw(rpdb.peer_table().get()),
+                    RuleAction::TO_TABLE,
+                    RuleProtocol::from_raw(rpdb.rule_protocol().get()),
+                    RuleFlags::default(),
+                ),
+                rpdb.peer_rule_priority(),
+                None,
+            )
+            .expect("peer rule")
+            .with_fwmark(RuleFwMark::new(0, rpdb.proxy_mark_mask().get()).expect("zero proxy mark"))
+            .with_uid_range(
+                RuleUidRange::new(
+                    policy.credentials().engine_uid().get(),
+                    policy.credentials().engine_uid().get(),
+                )
+                .expect("engine UID range"),
+            )
+            .with_ip_protocol(RuleIpProtocol::new(protocol).expect("IP protocol"))
+            .with_destination_port_range(
+                RulePortRange::new(port, port).expect("destination port range"),
+            )
+        })
+        .collect()
+}
+
+fn synthetic_reviewed_canary_policy() -> (
+    ReviewedCanaryFacilityPolicy,
+    ReviewedCanaryFacilitySelection,
+) {
+    synthetic_reviewed_canary_policy_with_early_lookups([])
+}
+
+fn synthetic_reviewed_canary_policy_with_early_lookups(
+    early_uid_lookup_priorities: impl IntoIterator<Item = u32>,
+) -> (
+    ReviewedCanaryFacilityPolicy,
+    ReviewedCanaryFacilitySelection,
+) {
+    let policy = ReviewedCanaryFacilityPolicy::reviewed(
+        ReviewedPolicyCatalogEntryId::new("synthetic-canary").expect("catalog entry"),
+        1,
+        [0x51; 32],
+        b"fxcan0",
+        b"fxcanp",
+        20_001,
+        20_001,
+        20_002,
+        20_002,
+        [(
+            std::net::Ipv4Addr::new(8, 8, 8, 7),
+            std::net::Ipv4Addr::new(8, 8, 8, 8),
+            Some(std::net::Ipv6Addr::new(
+                0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1110,
+            )),
+            Some(std::net::Ipv6Addr::new(
+                0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
+            )),
+        )],
+        [(41_001, 41_002, 41_003)],
+        AndroidNetdSourceProfile::AospNetd20250324,
+        early_uid_lookup_priorities,
+        30_997,
+        30_998,
+        20_253,
+        20_254,
+        254,
+        186,
+        186,
+        1_031,
+        PROXY_VALUE,
+        CANDIDATE_MASK,
+    )
+    .expect("reviewed canary policy");
+    let selection = policy
+        .bind_live_selection(
+            std::net::Ipv4Addr::new(8, 8, 8, 8),
+            Some(std::net::Ipv6Addr::new(
+                0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
+            )),
+            std::num::NonZeroU16::new(41_001).expect("TCP port"),
+            std::num::NonZeroU16::new(41_002).expect("UDP port"),
+            std::num::NonZeroU16::new(41_003).expect("DNS port"),
+        )
+        .expect("reviewed live selection");
+    (policy, selection)
+}
+
+fn reviewed_vendor_early_uid_lookup_rules() -> [NetworkRuleRecord; 2] {
+    let priority_one = NetworkRuleRecord::new(
+        RulePrefix::new(std::net::Ipv4Addr::new(10, 0, 0, 0).into(), 8)
+            .expect("vendor destination prefix"),
+        RulePrefix::unspecified(NetworkAddressFamily::Ipv4),
+        RuleProperties::new(
+            0,
+            RuleTableId::from_raw(1_001),
+            RuleAction::TO_TABLE,
+            RuleProtocol::from_raw(0),
+            RuleFlags::default(),
+        ),
+        RulePriority::from_raw(1),
+        None,
+    )
+    .expect("priority-one vendor rule")
+    .with_uid_range(RuleUidRange::new(10_001, 10_001).expect("priority-one vendor UID"));
+    let priority_two = RuleSpec::netd(2, 1_002, RuleAction::TO_TABLE)
+        .build()
+        .with_uid_range(RuleUidRange::new(10_002, 10_002).expect("priority-two vendor UID"));
+    [priority_one, priority_two]
+}
+
+fn rebuild_canary_rule(
+    rule: &NetworkRuleRecord,
+    priority: RulePriority,
+    table: RuleTableId,
+) -> NetworkRuleRecord {
+    NetworkRuleRecord::new(
+        rule.destination(),
+        rule.source(),
+        RuleProperties::new(
+            rule.properties().tos(),
+            table,
+            rule.properties().action(),
+            rule.properties().protocol(),
+            rule.properties().flags(),
+        ),
+        priority,
+        rule.goto_target(),
+    )
+    .expect("rebuilt canary rule")
+    .with_fwmark(rule.fwmark().expect("canary fwmark"))
+    .with_uid_range(rule.uid_range().expect("canary UID range"))
+    .with_ip_protocol(rule.ip_protocol().expect("canary IP protocol"))
+    .with_destination_port_range(
+        rule.destination_port_range()
+            .expect("canary destination port"),
+    )
+}
+
+fn assert_reviewed_canary_cohort_rejected(
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+    mut rules: Vec<NetworkRuleRecord>,
+) {
+    rules.sort_by_key(NetworkRuleRecord::priority);
+    let inventory = inventory_with_rules(rules);
+    assert_eq!(
+        classify_android_rpdb_with_reviewed_canary_facility(
+            &inventory,
+            policy.netd_source_profile(),
+            policy,
+            selection,
+        ),
+        Err(ReviewedCanaryRpdbClassificationError::OwnedCohortMismatch)
+    );
+}
+
+fn inventory_with_rules(rules: Vec<NetworkRuleRecord>) -> NetworkInventory {
+    let mut tracker = NetworkInventoryTracker::new();
+    tracker
+        .publish_complete_with_routing(
+            [InterfaceLinkRecord::new(
+                InterfaceIndex::new(1).expect("loopback index"),
+                InterfaceName::new(b"lo").expect("loopback name"),
+                InterfaceHardwareType::from_raw(1),
+                InterfaceLinkFlags::UP | InterfaceLinkFlags::LOOPBACK,
+            )],
+            [],
+            [],
+            rules,
+        )
+        .expect("complete inventory")
+        .clone()
+}
+
 struct RuleSpec {
+    family: NetworkAddressFamily,
     priority: u32,
     table: u32,
     action: RuleAction,
@@ -853,6 +1591,7 @@ struct RuleSpec {
 impl RuleSpec {
     fn netd(priority: u32, table: u32, action: RuleAction) -> Self {
         Self {
+            family: NetworkAddressFamily::Ipv4,
             priority,
             table,
             action,
@@ -860,6 +1599,11 @@ impl RuleSpec {
             fwmark: None,
             input: None,
         }
+    }
+
+    fn family(mut self, family: NetworkAddressFamily) -> Self {
+        self.family = family;
+        self
     }
 
     fn protocol(mut self, protocol: u8) -> Self {
@@ -878,10 +1622,9 @@ impl RuleSpec {
     }
 
     fn build(self) -> NetworkRuleRecord {
-        let family = NetworkAddressFamily::Ipv4;
         let mut record = NetworkRuleRecord::new(
-            RulePrefix::unspecified(family),
-            RulePrefix::unspecified(family),
+            RulePrefix::unspecified(self.family),
+            RulePrefix::unspecified(self.family),
             RuleProperties::new(
                 0,
                 RuleTableId::from_raw(self.table),

@@ -2,12 +2,19 @@ use std::fmt;
 use std::sync::Arc;
 
 use flux_core::{
-    BootIdentity, CapabilityProfile, FluxConfig, KernelMutationStatus, MutationGate,
-    NetworkInventory, NetworkNamespaceIdentity,
+    BootIdentity, CapabilityProfile, FluxConfig, FwmarkCandidate, KernelMutationStatus,
+    MutationGate, NetworkInventory, NetworkNamespaceIdentity, ReviewedCanaryFacilityPolicy,
+    ReviewedCanaryFacilitySelection, select_reviewed_android_platform_profile,
 };
 use flux_platform::NetworkInventorySource;
 
-use crate::runtime_coordinator::RuntimeFunctionalCanary;
+use crate::functional_canary::CanaryFacilityIdentity;
+use crate::functional_canary::local_output::qualified_xtables_tproxy_local_output_executor;
+use crate::native_runtime_writer::RetainedCanaryFacilityAuthority;
+use crate::runtime_coordinator::{
+    QualificationCanaryAttemptContext, QualificationCanaryAttemptEnvironmentOwner,
+    RuntimeFunctionalCanary,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeAdmissionState {
@@ -82,6 +89,8 @@ impl fmt::Display for NativeAdmissionRejection {
 pub(crate) struct NativeAdmissionCandidate {
     boot_identity: BootIdentity,
     network_namespace: NetworkNamespaceIdentity,
+    reviewed_mark_candidate: Option<FwmarkCandidate>,
+    reviewed_canary_facility_policy: Option<ReviewedCanaryFacilityPolicy>,
 }
 
 impl NativeAdmissionCandidate {
@@ -111,9 +120,15 @@ impl NativeAdmissionCandidate {
             .verified()
             .ok_or(NativeAdmissionRejection::UnverifiedDeviceIdentity)?
             .network_namespace();
+        let selected = select_reviewed_android_platform_profile(profile, network_namespace)
+            .map_err(|_| NativeAdmissionRejection::UnverifiedDeviceIdentity)?;
+        let reviewed_mark_candidate = selected.mark_candidate();
+        let reviewed_canary_facility_policy = selected.canary_facility_policy().cloned();
         Ok(Self {
             boot_identity,
             network_namespace,
+            reviewed_mark_candidate,
+            reviewed_canary_facility_policy,
         })
     }
 
@@ -124,12 +139,11 @@ impl NativeAdmissionCandidate {
         if config.safety().respect_android_vpn() {
             return Err(NativeAdmissionRejection::AndroidVpnPolicyUnavailable);
         }
-        if config.safety().require_functional_canary() {
-            return Err(NativeAdmissionRejection::FunctionalCanaryUnavailable);
-        }
         Ok(ConfiguredNativeAdmission {
             boot_identity: self.boot_identity,
             network_namespace: self.network_namespace,
+            reviewed_mark_candidate: self.reviewed_mark_candidate,
+            reviewed_canary_facility_policy: self.reviewed_canary_facility_policy,
             config,
         })
     }
@@ -138,14 +152,61 @@ impl NativeAdmissionCandidate {
 pub(crate) struct ConfiguredNativeAdmission {
     boot_identity: BootIdentity,
     network_namespace: NetworkNamespaceIdentity,
+    reviewed_mark_candidate: Option<FwmarkCandidate>,
+    reviewed_canary_facility_policy: Option<ReviewedCanaryFacilityPolicy>,
     config: FluxConfig,
 }
 
 impl ConfiguredNativeAdmission {
+    #[must_use]
+    pub(crate) const fn requires_functional_canary(&self) -> bool {
+        self.config.safety().require_functional_canary()
+    }
+
+    #[must_use]
+    pub(crate) const fn config(&self) -> &FluxConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub(crate) const fn boot_identity(&self) -> &BootIdentity {
+        &self.boot_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn network_namespace(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+
+    #[must_use]
+    pub(crate) const fn reviewed_canary_facility_policy(
+        &self,
+    ) -> Option<&ReviewedCanaryFacilityPolicy> {
+        self.reviewed_canary_facility_policy.as_ref()
+    }
+
     pub(crate) fn admit(
         self,
         source: Option<NetworkInventorySource>,
     ) -> Result<AdmittedNativeRuntime, NativeAdmissionRejection> {
+        self.admit_with_functional_canary_owner(source, None)
+    }
+
+    pub(crate) fn admit_with_functional_canary_owner(
+        self,
+        source: Option<NetworkInventorySource>,
+        functional_canary_owner: Option<Box<dyn QualificationCanaryAttemptEnvironmentOwner>>,
+    ) -> Result<AdmittedNativeRuntime, NativeAdmissionRejection> {
+        let functional_canary = if self.config.safety().require_functional_canary() {
+            let owner = functional_canary_owner
+                .ok_or(NativeAdmissionRejection::FunctionalCanaryUnavailable)?;
+            RuntimeFunctionalCanary::RequiredUnqualified {
+                context: Box::new(QualificationCanaryAttemptContext::new(owner)),
+                executor: qualified_xtables_tproxy_local_output_executor(),
+            }
+        } else {
+            RuntimeFunctionalCanary::StructuralVerificationOnly
+        };
         let inventory = source.ok_or(NativeAdmissionRejection::NetworkInventoryUnavailable)?;
         let initial_inventory = inventory
             .snapshot()
@@ -153,10 +214,14 @@ impl ConfiguredNativeAdmission {
         Ok(AdmittedNativeRuntime {
             boot_identity: self.boot_identity,
             network_namespace: self.network_namespace,
+            reviewed_mark_candidate: self.reviewed_mark_candidate,
             config: self.config,
             initial_inventory,
             inventory,
-            functional_canary: RuntimeFunctionalCanary::StructuralVerificationOnly,
+            functional_canary,
+            retained_canary_facility: None,
+            reviewed_canary_facility_planning: None,
+            retained_canary_facility_authority: None,
         })
     }
 }
@@ -164,10 +229,17 @@ impl ConfiguredNativeAdmission {
 pub(crate) struct AdmittedNativeRuntime {
     pub(crate) boot_identity: BootIdentity,
     pub(crate) network_namespace: NetworkNamespaceIdentity,
+    pub(crate) reviewed_mark_candidate: Option<FwmarkCandidate>,
     pub(crate) config: FluxConfig,
     pub(crate) initial_inventory: Arc<NetworkInventory>,
     pub(crate) inventory: NetworkInventorySource,
     pub(crate) functional_canary: RuntimeFunctionalCanary,
+    pub(crate) retained_canary_facility: Option<CanaryFacilityIdentity>,
+    pub(crate) reviewed_canary_facility_planning: Option<(
+        ReviewedCanaryFacilityPolicy,
+        ReviewedCanaryFacilitySelection,
+    )>,
+    pub(crate) retained_canary_facility_authority: Option<RetainedCanaryFacilityAuthority>,
 }
 
 #[cfg(test)]
@@ -177,6 +249,30 @@ mod tests {
     use super::*;
 
     const PACKAGED_CONFIG: &str = include_str!("../../../conf/flux.toml");
+
+    struct InertQualifiedCanaryOwner;
+
+    impl QualificationCanaryAttemptEnvironmentOwner for InertQualifiedCanaryOwner {
+        fn prepare_environment(
+            &mut self,
+            _generation: &crate::functional_canary::ActiveCanaryGenerationBinding,
+            _nonce: crate::functional_canary::CanaryNonce,
+            _deadline: crate::functional_canary::CanaryDeadline,
+        ) -> Result<
+            crate::runtime_coordinator::QualificationCanaryAttemptEnvironmentSeed,
+            crate::functional_canary::FunctionalCanaryError,
+        > {
+            unreachable!("admission test does not execute a canary attempt")
+        }
+
+        fn reobserve_environment(
+            &mut self,
+            _request: &crate::functional_canary::CanaryAttemptRequest,
+            _generation: &crate::functional_canary::ActiveCanaryGenerationBinding,
+        ) -> Result<(), crate::functional_canary::FunctionalCanaryError> {
+            unreachable!("admission test does not execute a canary attempt")
+        }
+    }
 
     #[test]
     fn capability_rejections_are_typed_before_configuration_is_needed() {
@@ -188,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn every_requested_unqualified_safety_guarantee_rejects_admission() {
+    fn vpn_policy_remains_unavailable_before_native_admission() {
         let profile = CapabilityProfileFixture::device_qualified();
         let base = PACKAGED_CONFIG
             .replace("respect_android_vpn = true", "respect_android_vpn = false")
@@ -204,16 +300,42 @@ mod tests {
                 .configure(FluxConfig::parse(&vpn).expect("VPN safety config")),
             Err(NativeAdmissionRejection::AndroidVpnPolicyUnavailable)
         ));
+    }
 
-        let canary = base.replace(
-            "require_functional_canary = false",
-            "require_functional_canary = true",
-        );
+    #[test]
+    fn required_canary_configuration_selects_the_fail_closed_runtime_gate() {
+        let profile = CapabilityProfileFixture::device_qualified();
+        let config =
+            PACKAGED_CONFIG.replace("respect_android_vpn = true", "respect_android_vpn = false");
+        let configured = NativeAdmissionCandidate::evaluate(&profile)
+            .expect("supported profile")
+            .configure(FluxConfig::parse(&config).expect("required canary config"))
+            .expect("required mode is deferred to the runtime qualification owner");
+
+        assert!(configured.config.safety().require_functional_canary());
+        assert!(configured.reviewed_canary_facility_policy().is_none());
         assert!(matches!(
-            NativeAdmissionCandidate::evaluate(&profile)
-                .expect("supported profile")
-                .configure(FluxConfig::parse(&canary).expect("canary safety config")),
+            configured.admit(None),
             Err(NativeAdmissionRejection::FunctionalCanaryUnavailable)
+        ));
+    }
+
+    #[test]
+    fn exact_canary_owner_advances_only_to_the_next_native_admission_gate() {
+        let profile = CapabilityProfileFixture::device_qualified();
+        let config =
+            PACKAGED_CONFIG.replace("respect_android_vpn = true", "respect_android_vpn = false");
+        let configured = NativeAdmissionCandidate::evaluate(&profile)
+            .expect("supported profile")
+            .configure(FluxConfig::parse(&config).expect("required canary config"))
+            .expect("required mode is deferred to the runtime qualification owner");
+
+        assert!(matches!(
+            configured.admit_with_functional_canary_owner(
+                None,
+                Some(Box::new(InertQualifiedCanaryOwner)),
+            ),
+            Err(NativeAdmissionRejection::NetworkInventoryUnavailable)
         ));
     }
 

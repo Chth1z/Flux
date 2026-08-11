@@ -371,6 +371,11 @@ pub enum AndroidTproxyRuleDisposition {
     AndroidFirst,
     /// Flux would run before this overlapping Android selection and therefore needs a handoff.
     FluxFirstRequiresHandoff,
+    /// One complete exact peer-rule cohort authenticated by reviewed canary-facility policy.
+    ///
+    /// This is not a generic role or selector-disjointness claim. The RPDB classifier records this
+    /// disposition only after re-deriving the policy-and-selection-bound cohort from live rules.
+    ReviewedCanaryFacility,
     SelectorDisjoint(AndroidTproxySelectorDisjointReason),
     Unknown,
 }
@@ -881,6 +886,7 @@ fn digest_topology_report(
                 });
             }
             AndroidTproxyRuleDisposition::Unknown => digest.tag(4),
+            AndroidTproxyRuleDisposition::ReviewedCanaryFacility => digest.tag(5),
         }
     }
     digest.u32(report.unknown_rule_count);
@@ -1000,6 +1006,7 @@ const fn android_rpdb_role_tag(role: AndroidRpdbRuleRole) -> u8 {
         AndroidRpdbRuleRole::UidDefaultUnreachable => 25,
         AndroidRpdbRuleRole::DefaultNetwork => 26,
         AndroidRpdbRuleRole::FinalUnreachable => 27,
+        AndroidRpdbRuleRole::ReviewedEarlyUidLookup => 28,
     }
 }
 
@@ -1377,8 +1384,20 @@ pub fn assess_android_tproxy_topology(
             AndroidTproxyRuleDisposition::OtherFamily
         } else if classification.audit().classifications()[dump_index]
             == RpdbRuleClassification::Unknown
-            || classification.roles()[dump_index].is_none()
         {
+            unknown_rule_count = unknown_rule_count.saturating_add(1);
+            AndroidTproxyRuleDisposition::Unknown
+        } else if classification
+            .reviewed_canary_rule_indices()
+            .contains(&dump_index)
+        {
+            debug_assert_eq!(
+                classification.audit().classifications()[dump_index],
+                RpdbRuleClassification::DoesNotConstrainFlux
+            );
+            debug_assert!(classification.roles()[dump_index].is_none());
+            AndroidTproxyRuleDisposition::ReviewedCanaryFacility
+        } else if classification.roles()[dump_index].is_none() {
             unknown_rule_count = unknown_rule_count.saturating_add(1);
             AndroidTproxyRuleDisposition::Unknown
         } else if candidate

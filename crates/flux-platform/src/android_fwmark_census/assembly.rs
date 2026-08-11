@@ -5,9 +5,10 @@ use flux_core::{
     AndroidMarkDevicePolicy, AndroidMarkDevicePolicyKind, AndroidMarkPolicyAssuranceClass,
     AndroidNetIdFwmarkCensusFragment, AndroidNetdSourceProfile, CapabilityProfile,
     CapabilityProfileDigest, FwmarkCandidate, FwmarkCensusCoverageRecord,
-    FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkNetfilterBuiltinHook,
-    FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification, FwmarkPlane,
-    FwmarkUseOperation, FwmarkUseRecord, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
+    FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkExactMarkSentinelQualification,
+    FwmarkNetfilterBuiltinHook, FwmarkOrderedLateWritePlacement,
+    FwmarkOrderedLateWriteQualification, FwmarkPlane, FwmarkUseOperation, FwmarkUseRecord,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS,
     MAX_ORDERED_LATE_PACKET_WRITES, NetworkAddressFamily, NetworkInventory,
     NetworkNamespaceIdentity, RpdbFwmarkCensusFragment,
 };
@@ -44,7 +45,7 @@ pub const ANDROID_FWMARK_CENSUS_PROJECTION_CELLS: usize = 27;
 pub const ANDROID_FWMARK_CENSUS_PROJECTION_METRICS: usize = 36;
 
 const PROJECTION_DIGEST_DOMAIN: &[u8] =
-    b"Flux Android fwmark census diagnostic projection\0canonical-schema-v2\0sha256-v1\0";
+    b"Flux Android fwmark census diagnostic projection\0canonical-schema-v3\0sha256-v1\0";
 const ALL_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
     FwmarkEvidenceSource::Rpdb,
@@ -201,6 +202,7 @@ pub struct AndroidFwmarkCensusProjection {
     cells: [FwmarkCensusCoverageRecord; ANDROID_FWMARK_CENSUS_PROJECTION_CELLS],
     mark_uses: Box<[FwmarkUseRecord]>,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
     metrics: [AndroidFwmarkCensusMetric; ANDROID_FWMARK_CENSUS_PROJECTION_METRICS],
     digest: AndroidFwmarkCensusProjectionDigest,
 }
@@ -221,6 +223,11 @@ impl AndroidFwmarkCensusProjection {
     #[must_use]
     pub fn ordered_late_writes(&self) -> &[FwmarkOrderedLateWriteQualification] {
         &self.ordered_late_writes
+    }
+
+    #[must_use]
+    pub fn exact_mark_sentinels(&self) -> &[FwmarkExactMarkSentinelQualification] {
+        &self.exact_mark_sentinels
     }
 
     #[must_use]
@@ -279,6 +286,12 @@ pub enum AndroidFwmarkCensusAssemblyError {
     },
     DuplicateOrderedLateWrite,
     OrderedLateWriteHasNoMarkUse,
+    TooManyExactMarkSentinels {
+        maximum: usize,
+        required_at_least: usize,
+    },
+    DuplicateExactMarkSentinel,
+    ExactMarkSentinelHasNoMarkUse,
     PresentCoverageHasNoMarkUse {
         source: FwmarkEvidenceSource,
         plane: FwmarkPlane,
@@ -354,6 +367,19 @@ impl fmt::Display for AndroidFwmarkCensusAssemblyError {
             }
             Self::OrderedLateWriteHasNoMarkUse => formatter.write_str(
                 "census projection retains an ordered-late write without its canonical mark use",
+            ),
+            Self::TooManyExactMarkSentinels {
+                maximum,
+                required_at_least,
+            } => write!(
+                formatter,
+                "census projection has at least {required_at_least} exact-mark sentinels but its limit is {maximum}"
+            ),
+            Self::DuplicateExactMarkSentinel => {
+                formatter.write_str("census projection repeats an exact-mark sentinel")
+            }
+            Self::ExactMarkSentinelHasNoMarkUse => formatter.write_str(
+                "census projection retains an exact-mark sentinel without its canonical mark use",
             ),
             Self::PresentCoverageHasNoMarkUse { source, plane } => write!(
                 formatter,
@@ -491,6 +517,8 @@ pub fn assemble_android_fwmark_census_projection(
 
     let ordered_late_writes =
         normalize_ordered_late_writes(xtables.ordered_late_writes(), &canonical_mark_uses)?;
+    let exact_mark_sentinels =
+        normalize_exact_mark_sentinels(xtables.exact_mark_sentinels(), &canonical_mark_uses)?;
     let metrics = build_metrics(
         inventory,
         xtables,
@@ -521,6 +549,7 @@ pub fn assemble_android_fwmark_census_projection(
         &cells,
         &canonical_mark_uses,
         &ordered_late_writes,
+        &exact_mark_sentinels,
         &metrics,
     );
 
@@ -528,6 +557,7 @@ pub fn assemble_android_fwmark_census_projection(
         cells,
         mark_uses: canonical_mark_uses.into_boxed_slice(),
         ordered_late_writes,
+        exact_mark_sentinels,
         metrics,
         digest,
     })
@@ -753,6 +783,32 @@ fn normalize_ordered_late_writes(
     Ok(records.into_boxed_slice())
 }
 
+fn normalize_exact_mark_sentinels(
+    records: &[FwmarkExactMarkSentinelQualification],
+    mark_uses: &[FwmarkUseRecord],
+) -> Result<Box<[FwmarkExactMarkSentinelQualification]>, AndroidFwmarkCensusAssemblyError> {
+    if records.len() > MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS {
+        return Err(
+            AndroidFwmarkCensusAssemblyError::TooManyExactMarkSentinels {
+                maximum: MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS,
+                required_at_least: records.len(),
+            },
+        );
+    }
+    let mut records = records.to_vec();
+    records.sort_unstable();
+    if records.windows(2).any(|records| records[0] == records[1]) {
+        return Err(AndroidFwmarkCensusAssemblyError::DuplicateExactMarkSentinel);
+    }
+    if records
+        .iter()
+        .any(|record| !mark_uses.contains(&record.mark_use()))
+    {
+        return Err(AndroidFwmarkCensusAssemblyError::ExactMarkSentinelHasNoMarkUse);
+    }
+    Ok(records.into_boxed_slice())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_metrics(
     inventory: &NetworkInventory,
@@ -886,6 +942,7 @@ fn digest_projection(
     cells: &[FwmarkCensusCoverageRecord; ANDROID_FWMARK_CENSUS_PROJECTION_CELLS],
     mark_uses: &[FwmarkUseRecord],
     ordered_late_writes: &[FwmarkOrderedLateWriteQualification],
+    exact_mark_sentinels: &[FwmarkExactMarkSentinelQualification],
     metrics: &[AndroidFwmarkCensusMetric; ANDROID_FWMARK_CENSUS_PROJECTION_METRICS],
 ) -> AndroidFwmarkCensusProjectionDigest {
     let mut digest = Sha256::new();
@@ -941,6 +998,17 @@ fn digest_projection(
         digest.update(record.selector_digest().as_bytes());
         digest.update([placement_tag(record.placement())]);
     }
+    digest.update((exact_mark_sentinels.len() as u64).to_be_bytes());
+    for record in exact_mark_sentinels {
+        digest_mark_use(&mut digest, record.mark_use());
+        digest.update(record.sentinel().to_be_bytes());
+        digest.update([family_tag(record.family())]);
+        digest.update([hook_tag(record.hook())]);
+        digest_bytes(&mut digest, record.child_chain().as_str().as_bytes());
+        digest.update(record.hook_ordinal().to_be_bytes());
+        digest.update(record.rule_ordinal().to_be_bytes());
+        digest.update(record.selector_digest().as_bytes());
+    }
     digest.update((metrics.len() as u64).to_be_bytes());
     for metric in metrics {
         digest.update([metric.kind as u8]);
@@ -988,6 +1056,17 @@ fn digest_policy(digest: &mut Sha256, policy: &AndroidMarkDevicePolicy) {
             digest.update(record.rule_ordinal().to_be_bytes());
             digest.update(record.selector_digest().as_bytes());
             digest.update([placement_tag(record.placement())]);
+        }
+        digest.update((grant.exact_mark_sentinels().len() as u64).to_be_bytes());
+        for record in grant.exact_mark_sentinels() {
+            digest_mark_use(digest, record.mark_use());
+            digest.update(record.sentinel().to_be_bytes());
+            digest.update([family_tag(record.family())]);
+            digest.update([hook_tag(record.hook())]);
+            digest_bytes(digest, record.child_chain().as_str().as_bytes());
+            digest.update(record.hook_ordinal().to_be_bytes());
+            digest.update(record.rule_ordinal().to_be_bytes());
+            digest.update(record.selector_digest().as_bytes());
         }
     });
 }
@@ -1092,8 +1171,9 @@ const fn family_tag(family: NetworkAddressFamily) -> u8 {
 
 const fn hook_tag(hook: FwmarkNetfilterBuiltinHook) -> u8 {
     match hook {
-        FwmarkNetfilterBuiltinHook::Input => 0,
-        FwmarkNetfilterBuiltinHook::Postrouting => 1,
+        FwmarkNetfilterBuiltinHook::Prerouting => 0,
+        FwmarkNetfilterBuiltinHook::Input => 1,
+        FwmarkNetfilterBuiltinHook::Postrouting => 2,
     }
 }
 

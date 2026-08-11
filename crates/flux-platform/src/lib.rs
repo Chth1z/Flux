@@ -171,6 +171,8 @@ pub mod internal {
         ENGINE_CREDENTIAL_PROBE_STAGE_RECEIPT_NAME, ENGINE_CREDENTIAL_PROBE_STAGE_TEMPORARY_NAME,
         EngineCredentialProbeStage,
     };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub use crate::process::{current_process_id_map_contains, digest_current_process_id_map};
     pub use crate::sing_box::{
         PinnedSingBoxLaunch, ProcessDiagnostics, SING_BOX_LAUNCH_CONTROL_FD_ENV, SingBoxChild,
         SingBoxChildIdentity, SingBoxExecutablePrivilegeAttribute, SingBoxLaunchControl,

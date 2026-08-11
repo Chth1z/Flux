@@ -18,6 +18,7 @@ repository = "https://github.com/Chth1z/Flux"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(flux_android_qualification)"] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

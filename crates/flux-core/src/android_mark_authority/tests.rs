@@ -12,8 +12,9 @@ use crate::{
     DeferredAndroidMarkActivationPrerequisite, DeferredAndroidTproxyPrerequisite, DeviceIdentity,
     FwmarkCandidate, FwmarkCensusCollectorEvidenceDigest, FwmarkCensusCollectorRevision,
     FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkEvidenceSource,
-    FwmarkEvidenceState, FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName,
-    FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
+    FwmarkEvidenceState, FwmarkExactMarkSentinelQualification,
+    FwmarkExactMarkSentinelQualificationError, FwmarkNetfilterBuiltinHook,
+    FwmarkNetfilterChainName, FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
     FwmarkOrderedLateWriteQualificationError, FwmarkOrderedPacketWriteRequirement,
     FwmarkPacketSelectorDigest, FwmarkPartialAuditOutcome, FwmarkPlane, FwmarkPlaneSet,
     FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError, InterfaceHardwareType,
@@ -800,10 +801,23 @@ fn missing_extra_or_changed_ordered_late_write_records_reject() {
     let extra = no_exception
         .census_with_ordered(coverage_for_uses([mark_use]), [mark_use], [expected])
         .expect("structurally valid unreviewed ordering evidence");
+    let error = no_exception
+        .authorize(extra)
+        .expect_err("unreviewed ordered write must reject");
     assert!(matches!(
-        no_exception.authorize(extra),
-        Err(AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. })
+        error,
+        AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. }
     ));
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("expected 0, observed 1"));
+    assert!(
+        diagnostic
+            .contains("observed=AndroidNetId/Packet/MaskedWrite/Ipv4/chain=routectrl_mangle_INPUT")
+    );
+    assert!(
+        diagnostic
+            .contains("selector=6161616161616161616161616161616161616161616161616161616161616161")
+    );
 }
 
 #[test]
@@ -837,6 +851,67 @@ fn definite_conflicts_precede_an_ordered_netid_packet_write() {
     assert_eq!(error.census_conflicts().len(), 1);
     assert_eq!(error.census_conflicts()[0].mark_use(), definite);
     assert!(error.ordered_packet_write_overlaps().is_empty());
+    assert_eq!(
+        error.to_string(),
+        "complete fwmark census found 1 candidate-mask conflicts; Rpdb/Packet/PredicateRead/mask=0x03000000/overlap=0x03000000"
+    );
+}
+
+#[test]
+fn exact_mark_sentinel_requires_role_disjoint_value_and_exact_policy_set() {
+    let candidate = candidate();
+    let sentinel = exact_mark_sentinel(candidate, NetworkAddressFamily::Ipv4, 0x73);
+    let mark_use = sentinel.mark_use();
+    let context = TestContext::with_policy_qualifications(
+        AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        Box::new([]),
+        vec![sentinel.clone()].into_boxed_slice(),
+    );
+    let census = context
+        .census_with_qualifications(
+            coverage_for_uses([mark_use]),
+            [mark_use],
+            [],
+            [sentinel.clone()],
+        )
+        .expect("complete exact-mark sentinel census");
+    context
+        .authorize(census)
+        .expect("identical reviewed and live sentinel set authorizes planning");
+
+    let unreviewed = TestContext::standard();
+    let census = unreviewed
+        .census_with_qualifications(coverage_for_uses([mark_use]), [mark_use], [], [sentinel])
+        .expect("complete unreviewed sentinel census");
+    let error = unreviewed
+        .authorize(census)
+        .expect_err("unreviewed sentinel must remain fail-closed");
+    assert!(matches!(
+        error,
+        AndroidMarkPlanningAuthorizationError::ExactMarkSentinelQualificationMismatch { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("exact-mark sentinel qualification set differs (expected 0, observed 1)")
+    );
+
+    let role_value = FwmarkExactMarkSentinelQualification::new(
+        mark_use,
+        candidate.proxy_value(),
+        candidate,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Prerouting,
+        FwmarkNetfilterChainName::new("bw_raw_PREROUTING").unwrap(),
+        1,
+        1,
+        FwmarkPacketSelectorDigest::new([0x74; 32]).unwrap(),
+        false,
+    );
+    assert_eq!(
+        role_value,
+        Err(FwmarkExactMarkSentinelQualificationError::RoleValueOverlap)
+    );
 }
 
 #[test]
@@ -1958,6 +2033,14 @@ impl TestContext {
         assurance_class: AndroidMarkPolicyAssuranceClass,
         ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
     ) -> Self {
+        Self::with_policy_qualifications(assurance_class, ordered_late_writes, Box::new([]))
+    }
+
+    fn with_policy_qualifications(
+        assurance_class: AndroidMarkPolicyAssuranceClass,
+        ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+        exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
+    ) -> Self {
         let fixture = profile_fixture(false);
         let inventory = make_inventory(fixture.links, fixture.rules);
         let classification =
@@ -1982,6 +2065,7 @@ impl TestContext {
             network_namespace,
             FwmarkPlaneSet::ALL,
             ordered_late_writes,
+            exact_mark_sentinels,
         )
         .expect("valid synthetic cooperative policy");
         Self {
@@ -2012,17 +2096,30 @@ impl TestContext {
         mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
         ordered_late_writes: impl IntoIterator<Item = FwmarkOrderedLateWriteQualification>,
     ) -> Result<CompleteFwmarkCensus, CompleteFwmarkCensusError> {
-        census_with_ordered(
+        self.census_with_qualifications(coverage, mark_uses, ordered_late_writes, [])
+    }
+
+    fn census_with_qualifications(
+        &self,
+        coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
+        mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
+        ordered_late_writes: impl IntoIterator<Item = FwmarkOrderedLateWriteQualification>,
+        exact_mark_sentinels: impl IntoIterator<Item = FwmarkExactMarkSentinelQualification>,
+    ) -> Result<CompleteFwmarkCensus, CompleteFwmarkCensusError> {
+        CompleteFwmarkCensus::from_complete_observation(
             &self.inventory,
             &self.capability_profile,
             self.network_namespace,
-            &self.policy,
+            self.policy.identity(),
+            self.policy.revision(),
             self.collector_revision,
+            test_collector_evidence_digest(),
             self.ownership_journal_identity,
             self.ownership_journal_revision,
             coverage,
             mark_uses,
             ordered_late_writes,
+            exact_mark_sentinels,
         )
     }
 
@@ -2086,6 +2183,33 @@ fn ordered_write(
     .expect("safe ordered-late write fixture")
 }
 
+fn exact_mark_sentinel(
+    candidate: FwmarkCandidate,
+    family: NetworkAddressFamily,
+    selector_digest_byte: u8,
+) -> FwmarkExactMarkSentinelQualification {
+    FwmarkExactMarkSentinelQualification::new(
+        FwmarkUseRecord::new(
+            FwmarkEvidenceSource::Xtables,
+            FwmarkPlane::Packet,
+            FwmarkUseOperation::PredicateRead,
+            u32::MAX,
+        )
+        .expect("full-mask sentinel use"),
+        candidate.mask(),
+        candidate,
+        family,
+        FwmarkNetfilterBuiltinHook::Prerouting,
+        FwmarkNetfilterChainName::new("bw_raw_PREROUTING").expect("sentinel chain"),
+        1,
+        1,
+        FwmarkPacketSelectorDigest::new([selector_digest_byte; 32])
+            .expect("sentinel selector digest"),
+        false,
+    )
+    .expect("role-disjoint exact-mark sentinel")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cooperative_policy(
     name: &str,
@@ -2122,6 +2246,7 @@ fn cooperative_policy_with_assurance(
     network_namespace: NetworkNamespaceIdentity,
     planes: FwmarkPlaneSet,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 ) -> Result<AndroidMarkDevicePolicy, AndroidMarkDevicePolicyError> {
     AndroidMarkDevicePolicy::device_qualified_cooperative(
         assurance_class,
@@ -2137,6 +2262,7 @@ fn cooperative_policy_with_assurance(
         network_namespace,
         planes,
         ordered_late_writes,
+        exact_mark_sentinels,
     )
 }
 
@@ -2164,6 +2290,7 @@ fn cooperative_policy_with_catalog_entry(
         capability_profile,
         network_namespace,
         planes,
+        Box::new([]),
         Box::new([]),
     )
 }
@@ -2220,6 +2347,7 @@ fn census_with_ordered(
         coverage,
         mark_uses,
         ordered_late_writes,
+        [],
     )
 }
 

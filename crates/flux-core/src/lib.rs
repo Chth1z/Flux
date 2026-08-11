@@ -12,6 +12,7 @@ mod android_netd;
 mod android_platform_profile_catalog;
 mod android_rpdb;
 mod android_tproxy_topology;
+mod canary_facility_policy;
 mod canonical_evidence;
 mod capability;
 mod capture_path;
@@ -51,17 +52,21 @@ pub use android_mark_authority::{
     FWMARK_CENSUS_COLLECTOR_EVIDENCE_DIGEST_BYTES, FWMARK_ORDERED_SELECTOR_DIGEST_BYTES,
     FwmarkCensusCollectorEvidenceDigest, FwmarkCensusCollectorRevision, FwmarkCensusConflict,
     FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkCensusOrderedPacketWrite,
+    FwmarkExactMarkSentinelQualification, FwmarkExactMarkSentinelQualificationError,
     FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName, FwmarkNetfilterChainNameError,
     FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
     FwmarkOrderedLateWriteQualificationError, FwmarkOrderedPacketWriteRequirement,
     FwmarkPacketSelectorDigest, FwmarkPacketSelectorDigestError, FwmarkPlane, FwmarkPlaneSet,
     FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
     MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
-    MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES, MAX_ORDERED_LATE_PACKET_WRITES,
-    OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity, OwnershipJournalIdentityError,
-    OwnershipJournalRevision, ReviewedPolicyCatalogEntryId, authorize_android_mark_planning,
+    MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS, MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES,
+    MAX_ORDERED_LATE_PACKET_WRITES, OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity,
+    OwnershipJournalIdentityError, OwnershipJournalRevision, ReviewedPolicyCatalogEntryId,
+    authorize_android_mark_planning,
 };
 pub use android_netd::AndroidNetdSourceProfile;
+#[cfg(flux_android_qualification)]
+pub use android_platform_profile_catalog::qualification_selector_mismatch_fields;
 pub use android_platform_profile_catalog::{
     BoundReviewedAndroidPlatformProfile, MAX_REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG_ENTRIES,
     ReviewedAndroidPlatformProfileCatalogError, ReviewedAndroidPlatformProfileCatalogField,
@@ -71,7 +76,9 @@ pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPriorityBand,
     AndroidRpdbPriorityContract, AndroidRpdbProfileIssue, AndroidRpdbRuleRole,
     AndroidRpdbUnknownReason, AndroidRpdbUnknownRule, MAX_ANDROID_RPDB_UNKNOWN_RULES,
-    classify_android_rpdb, plan_android_rpdb_placement,
+    ReviewedCanaryRpdbClassificationError, ReviewedCanaryRpdbPlacementError, classify_android_rpdb,
+    classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
+    plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 pub use android_tproxy_topology::{
     AndroidTproxyDomainSelector, AndroidTproxyEvidenceCoverage, AndroidTproxyPriorityInterval,
@@ -86,6 +93,12 @@ pub use android_tproxy_topology::{
     MAX_ANDROID_TPROXY_SCOPE_ANCHORS, StaleAndroidTproxyTopologyReport,
     StaleAndroidTproxyTopologyScopeReport, assess_android_tproxy_topology,
     assess_android_tproxy_topology_scope,
+};
+pub use canary_facility_policy::{
+    MAX_REVIEWED_CANARY_FACILITY_ADDRESS_CANDIDATES, MAX_REVIEWED_CANARY_FACILITY_PORT_CANDIDATES,
+    ReviewedCanaryFacilityAddressCandidate, ReviewedCanaryFacilityPolicy,
+    ReviewedCanaryFacilityPolicyError, ReviewedCanaryFacilitySelection,
+    ReviewedCanaryResponderPortCandidate, ReviewedCanaryRoleCredentials, ReviewedCanaryRpdbPolicy,
 };
 pub use capability::{
     AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, ArtifactIdentityError,
@@ -146,7 +159,7 @@ pub use fwmark_audit::{
 pub use fwmark_census::{
     AndroidNetIdFwmarkCensusFragment, RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError,
     StaleRpdbFwmarkCensusFragment, project_android_net_id_fwmark_census_fragment,
-    project_rpdb_fwmark_census_fragment,
+    project_rpdb_fwmark_census_fragment, project_rpdb_fwmark_census_fragment_with_classification,
 };
 pub use generation::GenerationId;
 pub use network_inventory::{

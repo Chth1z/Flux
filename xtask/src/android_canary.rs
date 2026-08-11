@@ -98,6 +98,15 @@ pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
 }
 
 impl Options {
+    pub(super) fn for_shared_target(serial: String, adb: OsString) -> Result<Self, String> {
+        validate_serial(&serial)?;
+        Ok(Self {
+            serial,
+            adb,
+            producer: None,
+        })
+    }
+
     pub(super) fn parse(arguments: &[OsString], command: &str) -> Result<Self, String> {
         let mut serial = None;
         let mut adb = None;
@@ -598,7 +607,7 @@ fn validate_serial(serial: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct DeviceProfile {
+pub(super) struct DeviceProfile {
     target: &'static AndroidTargetSpec,
     model: String,
     sdk: u32,
@@ -611,7 +620,55 @@ struct DeviceProfile {
     shell_gid: u32,
 }
 
-fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
+impl DeviceProfile {
+    pub(super) const fn target_rust_target(&self) -> &'static str {
+        self.target.rust_target
+    }
+
+    pub(super) const fn shell_uid(&self) -> u32 {
+        self.shell_uid
+    }
+
+    pub(super) const fn shell_gid(&self) -> u32 {
+        self.shell_gid
+    }
+
+    pub(super) fn redact_sensitive_diagnostic(&self, text: &str) -> String {
+        [
+            (self.model.as_str(), "<redacted-model>"),
+            (self.abi_list.as_str(), "<redacted-abi-list>"),
+            (self.kernel_arch.as_str(), "<redacted-kernel-arch>"),
+            (self.kernel_release.as_str(), "<redacted-kernel-release>"),
+            (
+                self.build_fingerprint.as_str(),
+                "<redacted-build-fingerprint>",
+            ),
+            (self.boot_id.as_str(), "<redacted-boot-id>"),
+        ]
+        .into_iter()
+        .fold(text.to_owned(), |redacted, (value, replacement)| {
+            redacted.replace(value, replacement)
+        })
+    }
+}
+
+#[cfg(test)]
+pub(super) fn arm64_test_device_profile() -> DeviceProfile {
+    DeviceProfile {
+        target: &ARM64_TARGET,
+        model: "SM-S9180".to_owned(),
+        sdk: 36,
+        abi_list: "arm64-v8a,armeabi-v7a".to_owned(),
+        kernel_arch: "aarch64".to_owned(),
+        kernel_release: "5.15.211-Qkernel".to_owned(),
+        build_fingerprint: "samsung/dm3qzhx/dm3q:16/test/release-keys".to_owned(),
+        boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        shell_uid: 2000,
+        shell_gid: 2000,
+    }
+}
+
+pub(super) fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
     let state = adb_text(options, &["-s", &options.serial, "get-state"])?;
     if state != "device" {
         return Err(format!(
@@ -771,7 +828,7 @@ fn valid_boot_id(value: &str) -> bool {
         })
 }
 
-fn revalidate_device(
+pub(super) fn revalidate_device(
     options: &Options,
     expected: &DeviceProfile,
     boundary: &str,
@@ -1141,7 +1198,7 @@ fn push_and_execute(
     }
 }
 
-fn push_artifact(
+pub(super) fn push_artifact(
     options: &Options,
     artifact: &Path,
     identity: &AndroidArtifactIdentity,
@@ -1564,7 +1621,7 @@ fn remote_absence_script(remote: &OwnedRemoteDirectory, expected_device: &Device
     )
 }
 
-fn device_identity_function(expected_device: &DeviceProfile) -> String {
+pub(super) fn device_identity_function(expected_device: &DeviceProfile) -> String {
     let expected_boot_id = shell_single_quote(&expected_device.boot_id);
     let expected_fingerprint = shell_single_quote(&expected_device.build_fingerprint);
     let expected_arch = shell_single_quote(&expected_device.kernel_arch);

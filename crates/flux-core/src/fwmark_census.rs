@@ -6,6 +6,7 @@ use crate::android_mark_authority::{
     FwmarkUseRecord, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
 };
 use crate::android_netd::AndroidNetdSourceProfile;
+use crate::android_rpdb::AndroidRpdbClassificationReport;
 use crate::fwmark_audit::{ANDROID_NET_ID_FWMARK_MASK, FwmarkEvidenceSource};
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 
@@ -181,6 +182,12 @@ impl RpdbFwmarkCensusFragment {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RpdbFwmarkCensusFragmentError {
+    ClassificationInventoryMismatch {
+        classified_snapshot_id: NetworkInventorySnapshotId,
+        current_snapshot_id: NetworkInventorySnapshotId,
+        classified_epoch: NetworkEpoch,
+        current_epoch: NetworkEpoch,
+    },
     TooManyMarkUseRecords {
         maximum: usize,
         required_at_least: usize,
@@ -190,6 +197,19 @@ pub enum RpdbFwmarkCensusFragmentError {
 impl fmt::Display for RpdbFwmarkCensusFragmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ClassificationInventoryMismatch {
+                classified_snapshot_id,
+                current_snapshot_id,
+                classified_epoch,
+                current_epoch,
+            } => write!(
+                formatter,
+                "RPDB classification snapshot {} at epoch {} does not match census inventory {} at epoch {}",
+                classified_snapshot_id.get(),
+                classified_epoch.get(),
+                current_snapshot_id.get(),
+                current_epoch.get()
+            ),
             Self::TooManyMarkUseRecords {
                 maximum,
                 required_at_least,
@@ -256,12 +276,49 @@ impl Error for StaleRpdbFwmarkCensusFragment {}
 pub fn project_rpdb_fwmark_census_fragment(
     inventory: &NetworkInventory,
 ) -> Result<RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError> {
+    project_rpdb_fwmark_census_fragment_with_exclusions(inventory, &[])
+}
+
+/// Projects RPDB mark uses while excluding only the exact reviewed canary peer-rule cohort
+/// authenticated by the supplied classification report. Generic Android reports carry an empty
+/// cohort and therefore behave identically to [`project_rpdb_fwmark_census_fragment`].
+pub fn project_rpdb_fwmark_census_fragment_with_classification(
+    inventory: &NetworkInventory,
+    classification: &AndroidRpdbClassificationReport,
+) -> Result<RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError> {
+    let audit = classification.audit();
+    if audit.snapshot_id() != inventory.snapshot_id() || audit.epoch() != inventory.epoch() {
+        return Err(
+            RpdbFwmarkCensusFragmentError::ClassificationInventoryMismatch {
+                classified_snapshot_id: audit.snapshot_id(),
+                current_snapshot_id: inventory.snapshot_id(),
+                classified_epoch: audit.epoch(),
+                current_epoch: inventory.epoch(),
+            },
+        );
+    }
+    project_rpdb_fwmark_census_fragment_with_exclusions(
+        inventory,
+        classification.reviewed_canary_rule_indices(),
+    )
+}
+
+fn project_rpdb_fwmark_census_fragment_with_exclusions(
+    inventory: &NetworkInventory,
+    excluded_reviewed_canary_rule_indices: &[usize],
+) -> Result<RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError> {
     let mut raw_mark_uses = Vec::new();
     let mut has_selector = false;
     let mut has_opaque_rule = false;
 
-    for rule in inventory.rules() {
+    for (dump_index, rule) in inventory.rules().iter().enumerate() {
         has_opaque_rule |= !rule.has_complete_attribute_coverage();
+        if excluded_reviewed_canary_rule_indices
+            .binary_search(&dump_index)
+            .is_ok()
+        {
+            continue;
+        }
         let Some(selector) = rule.fwmark() else {
             continue;
         };

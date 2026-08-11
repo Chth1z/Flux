@@ -21,7 +21,7 @@ use flux_platform::{
     CapabilityProfilePaths, DaemonReactor, FileObservationBatch, FileObservationPaths,
     NativeCaptureTargetIdentity, NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
     NativeXtablesCaptureConverger, NativeXtablesCaptureTarget, NetworkInventoryRefreshHandle,
-    ShutdownSignal,
+    ShutdownSignal, collect_network_inventory_once,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{
@@ -34,6 +34,10 @@ use crate::inspection::ProcessInspectionSource;
 use crate::native_admission::{
     AdmittedNativeRuntime, ConfiguredNativeAdmission, NativeAdmissionCandidate,
     NativeAdmissionRejection, NativeAdmissionState,
+};
+use crate::native_canary_facility::{
+    NativeCanaryRuntimeAuthorities, create_native_boot_canary_facility,
+    recover_native_boot_canary_facility,
 };
 use crate::native_generation_source::{
     AssembledNativeGenerationSource, NativeGenerationPlanningSource, NativeGenerationSourcePaths,
@@ -69,6 +73,7 @@ const MAX_ENGINE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 const NATIVE_XTABLES_TOOL_ROOT: &str = "/system/bin";
 const NATIVE_XTABLES_WAIT_SECONDS: u16 = 2;
 const NATIVE_XTABLES_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_BOOT_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonOptions {
@@ -225,6 +230,59 @@ where
                 }
             }
         };
+        let facility_journal_path = runtime_layout.run_path().join("canary-facility.owner");
+        let pending_admission = match pending_admission {
+            PendingNativeAdmission::Configured(configured) => {
+                recover_native_boot_canary_facility(
+                    &facility_journal_path,
+                    configured.boot_identity(),
+                    configured.network_namespace(),
+                )
+                .map_err(|source| {
+                    DaemonError::native("recover native boot canary facility", source)
+                })?;
+                PendingNativeAdmission::Configured(configured)
+            }
+            other => other,
+        };
+        let (pending_admission, boot_canary_facility) = match pending_admission {
+            PendingNativeAdmission::Configured(configured)
+                if configured.requires_functional_canary() =>
+            {
+                match configured.reviewed_canary_facility_policy() {
+                    None => (
+                        PendingNativeAdmission::Rejected(
+                            NativeAdmissionRejection::FunctionalCanaryUnavailable,
+                        ),
+                        None,
+                    ),
+                    Some(policy) => {
+                        let pre_mutation_inventory = collect_network_inventory_once(
+                            NATIVE_BOOT_INVENTORY_TIMEOUT,
+                        )
+                        .map_err(|source| {
+                            DaemonError::native("collect pre-facility network inventory", source)
+                        })?;
+                        let facility = create_native_boot_canary_facility(
+                            policy,
+                            configured.config(),
+                            configured.boot_identity(),
+                            configured.network_namespace(),
+                            &pre_mutation_inventory,
+                            &facility_journal_path,
+                        )
+                        .map_err(|source| {
+                            DaemonError::native("create native boot canary facility", source)
+                        })?;
+                        (
+                            PendingNativeAdmission::Configured(configured),
+                            Some(facility),
+                        )
+                    }
+                }
+            }
+            other => (other, None),
+        };
 
         let network_inventory =
             if matches!(pending_admission, PendingNativeAdmission::Configured(_)) {
@@ -252,7 +310,44 @@ where
                 DaemonComposition::read_only(),
             ),
             PendingNativeAdmission::Configured(configured) => {
-                match configured.admit(network_inventory) {
+                let admitted =
+                    match boot_canary_facility {
+                        Some(facility) => {
+                            let inventory = network_inventory.as_ref().cloned().ok_or(
+                                DaemonError::Invariant(
+                                    "boot canary facility omitted its final reactor inventory",
+                                ),
+                            )?;
+                            let NativeCanaryRuntimeAuthorities {
+                                facility: identity,
+                                reviewed_policy,
+                                reviewed_selection,
+                                environment_owner,
+                                writer,
+                            } = facility
+                                .into_runtime_authorities(inventory)
+                                .map_err(|source| {
+                                    DaemonError::native(
+                                        "split native canary facility authority",
+                                        source,
+                                    )
+                                })?;
+                            configured
+                                .admit_with_functional_canary_owner(
+                                    network_inventory,
+                                    Some(environment_owner),
+                                )
+                                .map(|mut admitted| {
+                                    admitted.retained_canary_facility = Some(identity);
+                                    admitted.reviewed_canary_facility_planning =
+                                        Some((reviewed_policy, reviewed_selection));
+                                    admitted.retained_canary_facility_authority = Some(writer);
+                                    admitted
+                                })
+                        }
+                        None => configured.admit(network_inventory),
+                    };
+                match admitted {
                     Ok(admitted) => {
                         let network_inventory_refresh =
                             network_inventory_refresh.ok_or(DaemonError::Invariant(
@@ -444,8 +539,20 @@ impl NativeDaemonPlatform for AndroidNativeDaemonPlatform {
         options: &DaemonOptions,
         runtime_layout: &RuntimeLayout,
     ) -> Result<NativeDaemonPlatformParts<Self::Planning, Self::Admission>, DaemonError> {
-        let mut planning =
+        let planning =
             SystemAndroidGenerationPlanningSource::for_current_daemon(runtime_layout.run_path());
+        let mut planning = match admitted.reviewed_canary_facility_planning.as_ref() {
+            Some((policy, selection)) => planning.with_reviewed_canary_facility(
+                policy.clone(),
+                *selection,
+                admitted
+                    .reviewed_mark_candidate
+                    .ok_or(DaemonError::Invariant(
+                        "reviewed canary facility omitted its exact mark candidate",
+                    ))?,
+            ),
+            None => planning,
+        };
         let initial_planning = planning
             .plan_initial(&admitted.config, &admitted.initial_inventory)
             .map_err(|source| {
@@ -609,6 +716,9 @@ where
         config,
         inventory,
         functional_canary,
+        retained_canary_facility,
+        reviewed_canary_facility_planning,
+        retained_canary_facility_authority,
         ..
     } = admitted;
     let NativeDaemonPlatformParts {
@@ -631,12 +741,18 @@ where
         inspect_disable_path(&options.disable_path).map_err(DaemonError::Configuration)?;
     let initial_intent = initial_intent(&store, disable_present)?;
 
-    let subscription = SubscriptionRefreshRuntime::start(SubscriptionRuntimePaths::new(
-        &options.config_path,
-        &options.subscription_store_path,
-        runtime_layout.run_path(),
-        runtime_layout.run_path().join("subscription-check.log"),
-    ))
+    let reviewed_engine_credentials = reviewed_canary_facility_planning
+        .as_ref()
+        .map(|(policy, _)| policy.credentials());
+    let subscription = SubscriptionRefreshRuntime::start(
+        SubscriptionRuntimePaths::new(
+            &options.config_path,
+            &options.subscription_store_path,
+            runtime_layout.run_path(),
+            runtime_layout.run_path().join("subscription-check.log"),
+        ),
+        reviewed_engine_credentials,
+    )
     .map_err(|source| DaemonError::native("start subscription runtime", source))?;
     let bootstrap_digest = subscription.bootstrap_digest;
     let subscription_client = subscription.client.clone();
@@ -673,6 +789,17 @@ where
             accepted_subscription,
         ),
     };
+    let source = match (retained_canary_facility, reviewed_canary_facility_planning) {
+        (Some(facility), Some((policy, _))) => {
+            source.with_retained_canary_facility(facility, policy.credentials())
+        }
+        (None, None) => source,
+        _ => {
+            return Err(DaemonError::Invariant(
+                "native canary facility and reviewed credential authority diverged",
+            ));
+        }
+    };
     let maintenance_interval =
         engine_maintenance_interval(config.daemon().reconcile_debounce().get());
     let address_reconciler = AddressReconciler::for_network_inventory(
@@ -686,6 +813,7 @@ where
             move || source,
             maintenance_interval,
             functional_canary,
+            retained_canary_facility_authority,
         ),
         #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
         NativeEngineExecution::LinuxCompositionFixture => {

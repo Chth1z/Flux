@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, Read as _};
 use std::net::SocketAddr;
 use std::num::{NonZeroI32, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
@@ -18,12 +18,14 @@ use crate::engine_supervisor::{
 };
 use crate::functional_canary::{
     ActiveCanaryGenerationBinding, AdmittedSupervisedDeliveryReportBinding, CanaryAddressFamilies,
-    CanaryAttemptBinding, CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
+    CanaryAttemptBinding, CanaryAttemptCredentialBinding, CanaryAttemptObjectIdentities,
+    CanaryAttemptObjectRetirementEvidence, CanaryAttemptRequest,
     CanaryAttemptSocketObserverSession, CanaryCleanupStatus, CanaryCounterDeltaBounds,
     CanaryCounterSnapshot, CanaryDeadline, CanaryEngineBinding, CanaryEnvironmentBinding,
-    CanaryErrorKind, CanaryFacilityIdentity, CanaryFlow, CanaryFlowAddressFamily, CanaryNonce,
-    ClientReapedCanaryAttemptAuthority, FunctionalCanaryDisposition, FunctionalCanaryError,
-    FunctionalCanaryGateMode, InstalledSupervisedDeliveryReportProducer,
+    CanaryErrorKind, CanaryFacilityAdmissionToken, CanaryFacilityIdentity, CanaryFlow,
+    CanaryFlowAddressFamily, CanaryNonce, CanaryRpdbIdentity, ClientReapedCanaryAttemptAuthority,
+    FunctionalCanaryDisposition, FunctionalCanaryError, FunctionalCanaryGateMode,
+    InstalledSupervisedDeliveryReportProducer, MAX_FUNCTIONAL_CANARY_DURATION,
     PeerReapedCanaryAttemptAuthority, PreparedCanaryGenerationBinding,
     RetainedCanaryFacilityReadback, SupervisedDeliveryReportEngineHandoff,
     SupervisedDeliveryReportHandoffError, UnqualifiedCanaryCounterEvidence,
@@ -973,6 +975,203 @@ impl UnqualifiedFunctionalCanaryAttemptInputs {
             counter_bounds,
         })
     }
+}
+
+/// Owner-supplied attempt facts that do not duplicate active native ownership.
+///
+/// The owner must freshly collision-audit the retained facility and allocate the attempt objects
+/// before returning this value. The coordinator context remains the only layer that combines those
+/// facts with the descriptor-observed active Generation and the live prebound socket observer.
+pub(crate) struct QualificationCanaryAttemptEnvironmentSeed {
+    credentials: CanaryAttemptCredentialBinding,
+    facility_admission: CanaryFacilityAdmissionToken,
+    rpdb: CanaryRpdbIdentity,
+    attempt_objects: CanaryAttemptObjectIdentities,
+    peer_network_namespace: flux_core::NetworkNamespaceIdentity,
+    socket_observer: CanaryAttemptSocketObserverSession,
+    families: CanaryAddressFamilies,
+    counter_bounds: CanaryCounterDeltaBounds,
+}
+
+impl QualificationCanaryAttemptEnvironmentSeed {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        dead_code,
+        reason = "the native platform owner calls this only after exact device qualification"
+    )]
+    #[must_use]
+    pub(crate) const fn new(
+        credentials: CanaryAttemptCredentialBinding,
+        facility_admission: CanaryFacilityAdmissionToken,
+        rpdb: CanaryRpdbIdentity,
+        attempt_objects: CanaryAttemptObjectIdentities,
+        peer_network_namespace: flux_core::NetworkNamespaceIdentity,
+        socket_observer: CanaryAttemptSocketObserverSession,
+        families: CanaryAddressFamilies,
+        counter_bounds: CanaryCounterDeltaBounds,
+    ) -> Self {
+        Self {
+            credentials,
+            facility_admission,
+            rpdb,
+            attempt_objects,
+            peer_network_namespace,
+            socket_observer,
+            families,
+            counter_bounds,
+        }
+    }
+}
+
+/// Exact qualification-only owner for the facts that active capture ownership cannot supply.
+///
+/// Implementations remain private to the native platform composition. Returning a seed does not
+/// mint a request or receipt: the context below still checks it against the active Generation,
+/// while the serialized writer independently owns selector, counter, namespace, and cleanup
+/// mutation authority.
+pub(crate) trait QualificationCanaryAttemptEnvironmentOwner: Send + 'static {
+    fn prepare_environment(
+        &mut self,
+        generation: &ActiveCanaryGenerationBinding,
+        nonce: CanaryNonce,
+        deadline: CanaryDeadline,
+    ) -> Result<QualificationCanaryAttemptEnvironmentSeed, FunctionalCanaryError>;
+
+    fn reobserve_environment(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        generation: &ActiveCanaryGenerationBinding,
+    ) -> Result<(), FunctionalCanaryError>;
+}
+
+/// Production context that projects one platform-owned seed into the immutable attempt request.
+pub(crate) struct QualificationCanaryAttemptContext {
+    owner: Box<dyn QualificationCanaryAttemptEnvironmentOwner>,
+}
+
+impl QualificationCanaryAttemptContext {
+    #[must_use]
+    pub(crate) const fn new(owner: Box<dyn QualificationCanaryAttemptEnvironmentOwner>) -> Self {
+        Self { owner }
+    }
+}
+
+impl UnqualifiedFunctionalCanaryAttemptContext for QualificationCanaryAttemptContext {
+    fn prepare_attempt(
+        &mut self,
+        generation: ActiveCanaryGenerationBinding,
+    ) -> Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError> {
+        let started_at = Instant::now();
+        let deadline =
+            CanaryDeadline::new(started_at, MAX_FUNCTIONAL_CANARY_DURATION).map_err(|source| {
+                qualification_canary_error(
+                    CanaryErrorKind::AdapterFailure,
+                    &format!("construct qualification canary deadline: {source}"),
+                )
+            })?;
+        let nonce = system_canary_nonce()?;
+        let seed = self
+            .owner
+            .prepare_environment(&generation, nonce, deadline)?;
+        let QualificationCanaryAttemptEnvironmentSeed {
+            credentials,
+            facility_admission,
+            rpdb,
+            attempt_objects,
+            peer_network_namespace,
+            socket_observer,
+            families,
+            counter_bounds,
+        } = seed;
+        if socket_observer.deadline() != deadline {
+            return Err(qualification_canary_error(
+                CanaryErrorKind::IdentityChanged,
+                "qualified canary owner returned a socket observer with a different deadline",
+            ));
+        }
+        let facility = facility_admission.scope().facility();
+        if generation.retained_facility() != facility {
+            return Err(qualification_canary_error(
+                CanaryErrorKind::IdentityChanged,
+                "qualified canary owner substituted the active retained facility",
+            ));
+        }
+        let authority = generation
+            .bind_environment_authority(peer_network_namespace, socket_observer.binding())
+            .map_err(|source| {
+                qualification_canary_error(
+                    CanaryErrorKind::IdentityChanged,
+                    &format!("bind active qualification canary authority: {source}"),
+                )
+            })?;
+        let environment = CanaryEnvironmentBinding::new(
+            authority,
+            credentials,
+            facility,
+            facility_admission,
+            rpdb,
+            attempt_objects,
+        )
+        .map_err(|source| {
+            qualification_canary_error(
+                CanaryErrorKind::IdentityChanged,
+                &format!("bind qualification canary environment: {source}"),
+            )
+        })?;
+        if !generation.matches_environment(&environment) {
+            return Err(qualification_canary_error(
+                CanaryErrorKind::IdentityChanged,
+                "qualified canary environment does not match active native ownership",
+            ));
+        }
+        UnqualifiedFunctionalCanaryAttemptInputs::new(
+            environment,
+            socket_observer,
+            nonce,
+            families,
+            counter_bounds,
+        )
+    }
+
+    fn reobserve_environment(
+        &mut self,
+        request: &CanaryAttemptRequest,
+        generation: ActiveCanaryGenerationBinding,
+    ) -> Result<CanaryEnvironmentBinding, FunctionalCanaryError> {
+        if !generation.matches_environment(request.pre_binding().environment()) {
+            return Err(qualification_canary_error(
+                CanaryErrorKind::IdentityChanged,
+                "post-attempt active ownership does not match the qualification canary request",
+            ));
+        }
+        self.owner.reobserve_environment(request, &generation)?;
+        Ok(request.pre_binding().environment().clone())
+    }
+
+    fn monotonic_now(&mut self) -> Instant {
+        Instant::now()
+    }
+}
+
+fn system_canary_nonce() -> Result<CanaryNonce, FunctionalCanaryError> {
+    let mut bytes = [0_u8; crate::functional_canary::FUNCTIONAL_CANARY_NONCE_BYTES];
+    let mut source = std::fs::File::open("/dev/urandom").map_err(|error| {
+        qualification_canary_error(
+            CanaryErrorKind::AdapterFailure,
+            &format!("open operating-system canary randomness: {error}"),
+        )
+    })?;
+    source.read_exact(&mut bytes).map_err(|error| {
+        qualification_canary_error(
+            CanaryErrorKind::AdapterFailure,
+            &format!("read operating-system canary randomness: {error}"),
+        )
+    })?;
+    Ok(CanaryNonce::from_bytes(bytes))
+}
+
+fn qualification_canary_error(kind: CanaryErrorKind, diagnostic: &str) -> FunctionalCanaryError {
+    FunctionalCanaryError::new(kind, CanaryCleanupStatus::NotRequired, diagnostic)
 }
 
 pub(crate) trait UnqualifiedFunctionalCanaryAttemptContext: Send + 'static {
@@ -4143,7 +4342,8 @@ mod tests {
 
     use flux_core::{
         FluxConfig, InterfaceAddressFlags, InterfaceAddressRecord, InterfaceIndex,
-        NetworkInventoryTracker, Reason, RuntimeDispatcher, RuntimeIntent,
+        NetworkInventoryTracker, NetworkNamespaceIdentity, Reason, RuntimeDispatcher,
+        RuntimeIntent,
     };
     use flux_platform::{ReadinessEvidence, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
@@ -4152,12 +4352,16 @@ mod tests {
     use crate::functional_canary::tests::{
         Fixture as FunctionalCanaryFixture, active_generation_binding,
         request_with_engine_identity as functional_request_with_engine_identity,
+        request_with_engine_identity_and_network_namespaces as functional_request_with_engine_identity_and_network_namespaces,
         request_with_nonce as functional_request_with_nonce,
     };
     use crate::functional_canary::{
-        CanaryAddressFamilies, CanaryCleanupStatus, CanaryErrorKind, CanaryFacilityIdentity,
-        CanaryNonce, CanaryProcessIdentity, CanaryProcessRetirementEvidence, CanaryResponderPorts,
-        CanarySocketObserverBinding, FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
+        CANARY_FACILITY_AUDIT_DIGEST_BYTES, CanaryAddressFamilies, CanaryBindingError,
+        CanaryCleanupStatus, CanaryErrorKind, CanaryFacilityAdmissionObservation,
+        CanaryFacilityAdmissionScope, CanaryFacilityAdmissionToken, CanaryFacilityAuditDigest,
+        CanaryFacilityIdentity, CanaryNonce, CanaryProcessIdentity,
+        CanaryProcessRetirementEvidence, CanaryResponderPorts, CanarySocketObserverBinding,
+        FUNCTIONAL_CANARY_NONCE_BYTES, UnqualifiedCanaryGateEvidence,
     };
     use crate::generation_engine_config::{
         TproxyEngineConfigRequest, compile_tproxy_engine_config,
@@ -9953,6 +10157,378 @@ mod tests {
     struct ScriptedCanaryContext {
         script: Arc<Mutex<ScriptedCanary>>,
         events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    struct SeededQualificationCanaryEnvironmentOwner {
+        spec: EngineSpec,
+        families: CanaryAddressFamilies,
+        substitution: QualificationSeedSubstitution,
+    }
+
+    #[derive(Clone, Copy)]
+    enum QualificationSeedSubstitution {
+        None,
+        RetainedFacility,
+        ObserverDeadline,
+        PeerNetworkNamespace,
+        StaleFacilityAdmission,
+        WrongFacilityAdmission,
+        AttemptObjects,
+    }
+
+    impl SeededQualificationCanaryEnvironmentOwner {
+        fn new(spec: EngineSpec, families: CanaryAddressFamilies) -> Self {
+            Self {
+                spec,
+                families,
+                substitution: QualificationSeedSubstitution::None,
+            }
+        }
+
+        fn with_substitution(
+            spec: EngineSpec,
+            families: CanaryAddressFamilies,
+            substitution: QualificationSeedSubstitution,
+        ) -> Self {
+            Self {
+                spec,
+                families,
+                substitution,
+            }
+        }
+    }
+
+    impl QualificationCanaryAttemptEnvironmentOwner for SeededQualificationCanaryEnvironmentOwner {
+        fn prepare_environment(
+            &mut self,
+            generation: &ActiveCanaryGenerationBinding,
+            nonce: CanaryNonce,
+            deadline: CanaryDeadline,
+        ) -> Result<QualificationCanaryAttemptEnvironmentSeed, FunctionalCanaryError> {
+            let request = functional_request_with_nonce(
+                &self.spec,
+                self.families,
+                deadline.started_at(),
+                nonce,
+            );
+            let environment = request.pre_binding().environment();
+            let facility = if matches!(
+                self.substitution,
+                QualificationSeedSubstitution::RetainedFacility
+            ) {
+                let ports = environment.facility().ports();
+                CanaryFacilityIdentity::new(
+                    environment.facility().daemon_veth(),
+                    environment.facility().peer_veth(),
+                    environment.facility().ipv4(),
+                    environment.facility().ipv6(),
+                    environment.facility().peer_veth_topology(),
+                    CanaryResponderPorts::new(ports.udp_echo(), ports.tcp_echo(), ports.dns())
+                        .expect("fixture substituted responder ports"),
+                )
+                .expect("fixture substituted retained facility")
+            } else {
+                environment.facility()
+            };
+            let admission_nonce = if matches!(
+                self.substitution,
+                QualificationSeedSubstitution::WrongFacilityAdmission
+            ) {
+                substituted_nonce(nonce)
+            } else {
+                nonce
+            };
+            let facility_admission = CanaryFacilityAdmissionToken::new(
+                CanaryFacilityAdmissionScope::new(
+                    generation.generation(),
+                    admission_nonce,
+                    facility,
+                    CanaryFacilityAuditDigest::new([0x31; CANARY_FACILITY_AUDIT_DIGEST_BYTES])
+                        .expect("fixture facility digest"),
+                    CanaryFacilityAuditDigest::new([0x32; CANARY_FACILITY_AUDIT_DIGEST_BYTES])
+                        .expect("fixture reviewed pool digest"),
+                ),
+                CanaryFacilityAdmissionObservation::new(
+                    generation.network_epoch(),
+                    generation.network_inventory_snapshot_id(),
+                    NonZeroU64::new(1).expect("fixture collision audit revision"),
+                    CanaryFacilityAuditDigest::new([0x33; CANARY_FACILITY_AUDIT_DIGEST_BYTES])
+                        .expect("fixture collision audit digest"),
+                    deadline.started_at(),
+                    if matches!(
+                        self.substitution,
+                        QualificationSeedSubstitution::StaleFacilityAdmission
+                    ) {
+                        deadline.started_at()
+                    } else {
+                        deadline.expires_at()
+                    },
+                ),
+            );
+            let credentials = CanaryAttemptCredentialBinding::new(
+                environment.probe_credentials(),
+                environment.engine_credentials(),
+                environment.credential_domain(),
+            )
+            .expect("fixture credential binding");
+            let peer_network_namespace = if matches!(
+                self.substitution,
+                QualificationSeedSubstitution::PeerNetworkNamespace
+            ) {
+                environment.authority().network().daemon_network_namespace()
+            } else {
+                environment.authority().network().peer_network_namespace()
+            };
+            let observer_deadline = if matches!(
+                self.substitution,
+                QualificationSeedSubstitution::ObserverDeadline
+            ) {
+                CanaryDeadline::new(deadline.started_at(), Duration::from_secs(2))
+                    .expect("fixture substituted observer deadline")
+            } else {
+                deadline
+            };
+            let attempt_objects = if matches!(
+                self.substitution,
+                QualificationSeedSubstitution::AttemptObjects
+            ) {
+                functional_request_with_nonce(
+                    &self.spec,
+                    self.families,
+                    deadline.started_at(),
+                    substituted_nonce(nonce),
+                )
+                .pre_binding()
+                .environment()
+                .attempt_objects()
+            } else {
+                environment.attempt_objects()
+            };
+            Ok(QualificationCanaryAttemptEnvironmentSeed::new(
+                credentials,
+                facility_admission,
+                environment.rpdb(),
+                attempt_objects,
+                peer_network_namespace,
+                CanaryAttemptSocketObserverSession::scripted(
+                    environment.authority().socket_observer_binding(),
+                    observer_deadline,
+                ),
+                request.families(),
+                request.counter_bounds(),
+            ))
+        }
+
+        fn reobserve_environment(
+            &mut self,
+            request: &CanaryAttemptRequest,
+            generation: &ActiveCanaryGenerationBinding,
+        ) -> Result<(), FunctionalCanaryError> {
+            if generation.matches_environment(request.pre_binding().environment()) {
+                Ok(())
+            } else {
+                Err(qualification_canary_error(
+                    CanaryErrorKind::IdentityChanged,
+                    "fixture qualification owner observed a different active Generation",
+                ))
+            }
+        }
+    }
+
+    fn substituted_nonce(nonce: CanaryNonce) -> CanaryNonce {
+        let mut bytes = *nonce.as_bytes();
+        bytes[0] ^= u8::MAX;
+        CanaryNonce::from_bytes(bytes)
+    }
+
+    fn prepare_qualification_seed(
+        substitution: QualificationSeedSubstitution,
+    ) -> (
+        CanaryEngineBinding,
+        Result<UnqualifiedFunctionalCanaryAttemptInputs, FunctionalCanaryError>,
+    ) {
+        let fixture = EngineFixture::new();
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([0x41; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let engine = request.pre_binding().engine().clone();
+        let active = ActiveCanaryGenerationBinding::from_environment_fixture(
+            request.pre_binding().environment(),
+        );
+        let mut context = QualificationCanaryAttemptContext::new(Box::new(
+            SeededQualificationCanaryEnvironmentOwner::with_substitution(
+                fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+                substitution,
+            ),
+        ));
+        (engine, context.prepare_attempt(active))
+    }
+
+    fn request_from_qualification_inputs(
+        engine: CanaryEngineBinding,
+        inputs: UnqualifiedFunctionalCanaryAttemptInputs,
+    ) -> Result<CanaryAttemptRequest, CanaryBindingError> {
+        let UnqualifiedFunctionalCanaryAttemptInputs {
+            environment,
+            socket_observer: _,
+            nonce,
+            deadline,
+            families,
+            counter_bounds,
+        } = inputs;
+        CanaryAttemptRequest::new(
+            CanaryAttemptBinding::new(engine, environment),
+            nonce,
+            deadline,
+            families,
+            counter_bounds,
+        )
+    }
+
+    #[test]
+    fn qualification_context_projects_only_owner_seed_and_active_generation_facts() {
+        let fixture = EngineFixture::new();
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            CanaryNonce::from_bytes([0x41; FUNCTIONAL_CANARY_NONCE_BYTES]),
+        );
+        let active = ActiveCanaryGenerationBinding::from_environment_fixture(
+            request.pre_binding().environment(),
+        );
+        let mut context = QualificationCanaryAttemptContext::new(Box::new(
+            SeededQualificationCanaryEnvironmentOwner::new(
+                fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+            ),
+        ));
+
+        let prepared = context
+            .prepare_attempt(active.clone())
+            .expect("owner seed binds to active native ownership");
+
+        assert!(active.matches_environment(&prepared.environment));
+        assert_eq!(prepared.families, CanaryAddressFamilies::Ipv4Only);
+        assert_eq!(prepared.deadline, prepared.socket_observer.deadline());
+        assert_eq!(
+            prepared.environment.attempt_objects().nonce(),
+            prepared.nonce
+        );
+    }
+
+    #[test]
+    fn qualification_context_rejects_substituted_retained_facility() {
+        let (_, result) =
+            prepare_qualification_seed(QualificationSeedSubstitution::RetainedFacility);
+        let Err(error) = result else {
+            panic!("substituted retained facility must reject");
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+    }
+
+    #[test]
+    fn qualification_context_rejects_socket_observer_deadline_drift() {
+        let (_, result) =
+            prepare_qualification_seed(QualificationSeedSubstitution::ObserverDeadline);
+        let Err(error) = result else {
+            panic!("socket-observer deadline drift must reject");
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+    }
+
+    #[test]
+    fn qualification_context_rejects_peer_network_namespace_substitution() {
+        let (_, result) =
+            prepare_qualification_seed(QualificationSeedSubstitution::PeerNetworkNamespace);
+        let Err(error) = result else {
+            panic!("peer namespace substitution must reject");
+        };
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
+    }
+
+    #[test]
+    fn qualification_request_rejects_stale_facility_admission() {
+        let (engine, result) =
+            prepare_qualification_seed(QualificationSeedSubstitution::StaleFacilityAdmission);
+        let prepared = result.expect("stale admission reaches immutable request validation");
+
+        assert_eq!(
+            request_from_qualification_inputs(engine, prepared),
+            Err(CanaryBindingError::FacilityAdmissionExpired)
+        );
+    }
+
+    #[test]
+    fn qualification_request_rejects_wrong_facility_admission() {
+        let (engine, result) =
+            prepare_qualification_seed(QualificationSeedSubstitution::WrongFacilityAdmission);
+        let prepared = result.expect("wrong admission reaches immutable request validation");
+
+        assert_eq!(
+            request_from_qualification_inputs(engine, prepared),
+            Err(CanaryBindingError::FacilityAdmissionAttemptMismatch)
+        );
+    }
+
+    #[test]
+    fn qualification_request_rejects_substituted_attempt_objects() {
+        let (engine, result) =
+            prepare_qualification_seed(QualificationSeedSubstitution::AttemptObjects);
+        let prepared = result.expect("substituted objects reach immutable request validation");
+
+        assert_eq!(
+            request_from_qualification_inputs(engine, prepared),
+            Err(CanaryBindingError::AttemptObjectNonceMismatch)
+        );
+    }
+
+    #[test]
+    fn qualification_context_rejects_post_attempt_active_ownership_drift() {
+        let fixture = EngineFixture::new();
+        let nonce = CanaryNonce::from_bytes([0x41; FUNCTIONAL_CANARY_NONCE_BYTES]);
+        let request = functional_request_with_nonce(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            Instant::now(),
+            nonce,
+        );
+        let drifted_request = functional_request_with_engine_identity_and_network_namespaces(
+            &fixture.spec,
+            CanaryAddressFamilies::Ipv4Only,
+            request.deadline().started_at(),
+            nonce,
+            request.pre_binding().engine().generation(),
+            NonZeroU32::new(request.pre_binding().engine().engine().pid())
+                .expect("fixture engine PID"),
+            NonZeroU64::new(request.pre_binding().engine().engine().start_time_ticks())
+                .expect("fixture engine start ticks"),
+            request.pre_binding().engine().engine_snapshot_revision(),
+            NetworkNamespaceIdentity::new(1, 201).expect("drifted daemon namespace"),
+            NetworkNamespaceIdentity::new(1, 202).expect("drifted peer namespace"),
+        );
+        let drifted_active = ActiveCanaryGenerationBinding::from_environment_fixture(
+            drifted_request.pre_binding().environment(),
+        );
+        let mut context = QualificationCanaryAttemptContext::new(Box::new(
+            SeededQualificationCanaryEnvironmentOwner::new(
+                fixture.spec,
+                CanaryAddressFamilies::Ipv4Only,
+            ),
+        ));
+
+        let error = context
+            .reobserve_environment(&request, drifted_active)
+            .expect_err("post-attempt active ownership drift must reject");
+
+        assert_eq!(error.kind(), CanaryErrorKind::IdentityChanged);
     }
 
     impl UnqualifiedFunctionalCanaryAttemptContext for ScriptedCanaryContext {

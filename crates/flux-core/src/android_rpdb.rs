@@ -1,15 +1,20 @@
 use std::error::Error;
 use std::fmt;
+use std::net::IpAddr;
 
 use crate::android_netd::AndroidNetdSourceProfile;
+use crate::canary_facility_policy::{
+    ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
+};
 use crate::network_inventory::{InterfaceName, NetworkInventory};
 use crate::network_route::NetworkAddressFamily;
 use crate::network_rule::{
-    NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority,
+    NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RuleIpProtocol, RulePortRange,
+    RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId, RuleUidRange,
 };
 use crate::rpdb_placement::{
-    RpdbClassifierRevision, RpdbPlacementLease, RpdbPlacementPlanError, RpdbPlacementRequest,
-    RpdbRuleAudit, RpdbRuleClassification, plan_rpdb_placement,
+    RpdbClassifierRevision, RpdbFamilyPlacement, RpdbPlacementLease, RpdbPlacementPlanError,
+    RpdbPlacementRequest, RpdbRuleAudit, RpdbRuleClassification, plan_rpdb_placement,
 };
 
 const ROUTE_TABLE_UNSPECIFIED: u32 = 0;
@@ -111,7 +116,7 @@ impl AndroidRpdbPriorityContract {
     }
 }
 
-/// Strict semantic role extracted from one exact AOSP policy-rule shape.
+/// Strict semantic role extracted from one exact AOSP or reviewed device-policy rule shape.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AndroidRpdbRuleRole {
     KernelLocal,
@@ -142,6 +147,7 @@ pub enum AndroidRpdbRuleRole {
     UidDefaultUnreachable,
     DefaultNetwork,
     FinalUnreachable,
+    ReviewedEarlyUidLookup,
 }
 
 impl AndroidRpdbRuleRole {
@@ -180,7 +186,8 @@ impl AndroidRpdbRuleRole {
             | Self::BypassableVpnLocalExclusion
             | Self::VpnFallthrough
             | Self::UidDefaultNetwork
-            | Self::UidDefaultUnreachable => RpdbRuleClassification::MustPrecedeFlux,
+            | Self::UidDefaultUnreachable
+            | Self::ReviewedEarlyUidLookup => RpdbRuleClassification::MustPrecedeFlux,
         }
     }
 }
@@ -288,6 +295,7 @@ pub struct AndroidRpdbClassificationReport {
     profile: AndroidNetdSourceProfile,
     audit: RpdbRuleAudit,
     roles: Box<[Option<AndroidRpdbRuleRole>]>,
+    reviewed_canary_rule_indices: Box<[usize]>,
     unknown_rule_count: u32,
     unknown_rules: Box<[AndroidRpdbUnknownRule]>,
     omitted_unknown_rules: u32,
@@ -317,6 +325,10 @@ impl AndroidRpdbClassificationReport {
     #[must_use]
     pub fn roles(&self) -> &[Option<AndroidRpdbRuleRole>] {
         &self.roles
+    }
+
+    pub(crate) fn reviewed_canary_rule_indices(&self) -> &[usize] {
+        &self.reviewed_canary_rule_indices
     }
 
     #[must_use]
@@ -403,12 +415,92 @@ pub fn classify_android_rpdb(
     inventory: &NetworkInventory,
     profile: AndroidNetdSourceProfile,
 ) -> AndroidRpdbClassificationReport {
+    classify_android_rpdb_internal(
+        inventory,
+        profile,
+        &[],
+        &[],
+        profile.classifier_revision(),
+        None,
+    )
+}
+
+/// Classifies Android-owned rules plus one complete exact cohort created under reviewed canary
+/// policy. No arbitrary rule list is accepted: the policy-bound selection and every canonical
+/// rule must be present exactly once, and no extra rule may share its owned priority or table.
+pub fn classify_android_rpdb_with_reviewed_canary_facility(
+    inventory: &NetworkInventory,
+    profile: AndroidNetdSourceProfile,
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+) -> Result<AndroidRpdbClassificationReport, ReviewedCanaryRpdbClassificationError> {
+    if policy.netd_source_profile() != profile {
+        return Err(ReviewedCanaryRpdbClassificationError::ProfileMismatch);
+    }
+    let expected = reviewed_canary_peer_rules(policy, selection)?;
+    let rpdb = policy.rpdb();
+    let actual = inventory
+        .rules()
+        .iter()
+        .filter(|rule| {
+            rule.priority() == rpdb.peer_rule_priority()
+                || rule.properties().table().get() == rpdb.peer_table().get()
+        })
+        .collect::<Vec<_>>();
+    if actual.len() != expected.len()
+        || expected
+            .iter()
+            .any(|candidate| actual.iter().filter(|rule| ***rule == *candidate).count() != 1)
+        || actual
+            .iter()
+            .any(|rule| !expected.iter().any(|candidate| **rule == *candidate))
+    {
+        return Err(ReviewedCanaryRpdbClassificationError::OwnedCohortMismatch);
+    }
+    let early_uid_lookup_rule_indices = reviewed_early_uid_lookup_rule_indices(inventory, policy)?;
+    let revision = reviewed_canary_classifier_revision(policy);
+    let reviewed_last_must_precede = RulePriority::from_raw(
+        rpdb.proxy_rule_priority()
+            .get()
+            .checked_sub(1)
+            .expect("reviewed proxy priority is nonzero"),
+    );
+    Ok(classify_android_rpdb_internal(
+        inventory,
+        profile,
+        &expected,
+        &early_uid_lookup_rule_indices,
+        revision,
+        Some(reviewed_last_must_precede),
+    ))
+}
+
+fn classify_android_rpdb_internal(
+    inventory: &NetworkInventory,
+    profile: AndroidNetdSourceProfile,
+    reviewed_canary_rules: &[NetworkRuleRecord],
+    reviewed_early_uid_lookup_rule_indices: &[usize],
+    classifier_revision: RpdbClassifierRevision,
+    reviewed_last_must_precede: Option<RulePriority>,
+) -> AndroidRpdbClassificationReport {
     let mut roles = Vec::with_capacity(inventory.rules().len());
     let mut classifications = Vec::with_capacity(inventory.rules().len());
+    let mut reviewed_canary_rule_indices = Vec::with_capacity(reviewed_canary_rules.len());
     let mut unknown_reasons = Vec::with_capacity(inventory.rules().len());
 
-    for rule in inventory.rules() {
-        let decision = classify_rule(rule, profile);
+    for (dump_index, rule) in inventory.rules().iter().enumerate() {
+        let decision = if reviewed_canary_rules.contains(rule) {
+            reviewed_canary_rule_indices.push(dump_index);
+            RuleDecision {
+                role: None,
+                classification: RpdbRuleClassification::DoesNotConstrainFlux,
+                unknown_reason: None,
+            }
+        } else if reviewed_early_uid_lookup_rule_indices.contains(&dump_index) {
+            RuleDecision::recognized(AndroidRpdbRuleRole::ReviewedEarlyUidLookup)
+        } else {
+            classify_rule(rule, profile)
+        };
         roles.push(decision.role);
         classifications.push(decision.classification);
         unknown_reasons.push(decision.unknown_reason);
@@ -426,7 +518,7 @@ pub fn classify_android_rpdb(
     }
 
     let mut audit = RpdbRuleAudit::new(
-        profile.classifier_revision(),
+        classifier_revision,
         inventory,
         classifications.iter().copied(),
     )
@@ -440,7 +532,8 @@ pub fn classify_android_rpdb(
         {
             audit = audit.with_static_priority_window(
                 family,
-                contract.uid_default_unreachable_maximum(),
+                reviewed_last_must_precede
+                    .unwrap_or_else(|| contract.uid_default_unreachable_maximum()),
                 contract.default_network(),
             );
         }
@@ -472,11 +565,188 @@ pub fn classify_android_rpdb(
         profile,
         audit,
         roles: roles.into_boxed_slice(),
+        reviewed_canary_rule_indices: reviewed_canary_rule_indices.into_boxed_slice(),
         unknown_rule_count,
         unknown_rules: unknown_rules.into_boxed_slice(),
         omitted_unknown_rules,
         profile_issues: profile_issues.into_boxed_slice(),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewedCanaryRpdbClassificationError {
+    ProfileMismatch,
+    InvalidExpectedRule,
+    OwnedCohortMismatch,
+    EarlyUidLookupCohortMismatch,
+}
+
+impl fmt::Display for ReviewedCanaryRpdbClassificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ProfileMismatch => {
+                "reviewed canary facility uses a different Android netd source profile"
+            }
+            Self::InvalidExpectedRule => {
+                "reviewed canary facility cannot form a canonical peer-selection rule"
+            }
+            Self::OwnedCohortMismatch => {
+                "live canary peer-selection rules differ from the complete reviewed cohort"
+            }
+            Self::EarlyUidLookupCohortMismatch => {
+                "live early UID lookup rules differ from the reviewed device-policy cohort"
+            }
+        })
+    }
+}
+
+impl Error for ReviewedCanaryRpdbClassificationError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewedCanaryRpdbPlacementError {
+    Classification(ReviewedCanaryRpdbClassificationError),
+    ClassificationReportMismatch,
+    PlacementRequestMismatch,
+    Placement(RpdbPlacementPlanError),
+}
+
+impl fmt::Display for ReviewedCanaryRpdbPlacementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Classification(error) => error.fmt(formatter),
+            Self::ClassificationReportMismatch => formatter.write_str(
+                "Android RPDB classification differs from the exact reviewed canary facility report",
+            ),
+            Self::PlacementRequestMismatch => formatter.write_str(
+                "Android RPDB placement does not use the reviewed canary proxy slot and enabled families",
+            ),
+            Self::Placement(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ReviewedCanaryRpdbPlacementError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Classification(error) => Some(error),
+            Self::Placement(error) => Some(error),
+            Self::ClassificationReportMismatch | Self::PlacementRequestMismatch => None,
+        }
+    }
+}
+
+fn reviewed_canary_classifier_revision(
+    policy: &ReviewedCanaryFacilityPolicy,
+) -> RpdbClassifierRevision {
+    let digest = policy.artifact_digest();
+    let prefix = u64::from_be_bytes(
+        digest.as_bytes()[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    );
+    RpdbClassifierRevision::new((prefix ^ policy.revision().get().rotate_left(17)) | 1)
+        .expect("reviewed classifier revision is forced nonzero")
+}
+
+fn reviewed_canary_peer_rules(
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+) -> Result<Vec<NetworkRuleRecord>, ReviewedCanaryRpdbClassificationError> {
+    let rpdb = policy.rpdb();
+    let credentials = policy.credentials();
+    let mut rules = Vec::with_capacity(if selection.peer_ipv6().is_some() {
+        8
+    } else {
+        4
+    });
+    for destination in std::iter::once(IpAddr::V4(selection.peer_ipv4()))
+        .chain(selection.peer_ipv6().map(IpAddr::V6))
+    {
+        let family = match destination {
+            IpAddr::V4(_) => NetworkAddressFamily::Ipv4,
+            IpAddr::V6(_) => NetworkAddressFamily::Ipv6,
+        };
+        let prefix = match family {
+            NetworkAddressFamily::Ipv4 => 32,
+            NetworkAddressFamily::Ipv6 => 128,
+        };
+        for (protocol, port) in [
+            (6, selection.tcp_echo()),
+            (17, selection.udp_echo()),
+            (6, selection.dns()),
+            (17, selection.dns()),
+        ] {
+            let rule = NetworkRuleRecord::new(
+                RulePrefix::new(destination, prefix)
+                    .map_err(|_| ReviewedCanaryRpdbClassificationError::InvalidExpectedRule)?,
+                RulePrefix::unspecified(family),
+                RuleProperties::new(
+                    0,
+                    RuleTableId::from_raw(rpdb.peer_table().get()),
+                    RuleAction::TO_TABLE,
+                    RuleProtocol::from_raw(rpdb.rule_protocol().get()),
+                    RuleFlags::from_raw(0),
+                ),
+                rpdb.peer_rule_priority(),
+                None,
+            )
+            .map_err(|_| ReviewedCanaryRpdbClassificationError::InvalidExpectedRule)?
+            .with_fwmark(
+                RuleFwMark::new(0, rpdb.proxy_mark_mask().get())
+                    .ok_or(ReviewedCanaryRpdbClassificationError::InvalidExpectedRule)?,
+            )
+            .with_uid_range(
+                RuleUidRange::new(
+                    credentials.engine_uid().get(),
+                    credentials.engine_uid().get(),
+                )
+                .map_err(|_| ReviewedCanaryRpdbClassificationError::InvalidExpectedRule)?,
+            )
+            .with_ip_protocol(
+                RuleIpProtocol::new(protocol)
+                    .ok_or(ReviewedCanaryRpdbClassificationError::InvalidExpectedRule)?,
+            )
+            .with_destination_port_range(
+                RulePortRange::new(port.get(), port.get())
+                    .map_err(|_| ReviewedCanaryRpdbClassificationError::InvalidExpectedRule)?,
+            );
+            if !rule.has_complete_attribute_coverage() {
+                return Err(ReviewedCanaryRpdbClassificationError::InvalidExpectedRule);
+            }
+            rules.push(rule);
+        }
+    }
+    Ok(rules)
+}
+
+fn reviewed_early_uid_lookup_rule_indices(
+    inventory: &NetworkInventory,
+    policy: &ReviewedCanaryFacilityPolicy,
+) -> Result<Vec<usize>, ReviewedCanaryRpdbClassificationError> {
+    let mut indices = Vec::with_capacity(policy.early_uid_lookup_priorities().len());
+    for priority in policy.early_uid_lookup_priorities() {
+        let mut matching = inventory
+            .rules()
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.priority() == *priority);
+        let Some((dump_index, rule)) = matching.next() else {
+            return Err(ReviewedCanaryRpdbClassificationError::EarlyUidLookupCohortMismatch);
+        };
+        if matching.next().is_some()
+            || rule.destination().family() != NetworkAddressFamily::Ipv4
+            || !rule.has_complete_attribute_coverage()
+            || rule.properties().action() != RuleAction::TO_TABLE
+            || rule.properties().table().get() == 0
+            || rule.properties().flags() != RuleFlags::default()
+            || rule.goto_target().is_some()
+            || rule.uid_range().is_none()
+        {
+            return Err(ReviewedCanaryRpdbClassificationError::EarlyUidLookupCohortMismatch);
+        }
+        indices.push(dump_index);
+    }
+    Ok(indices)
 }
 
 /// Applies both observed-rule evidence and the selected profile's reserved priority bands.
@@ -535,6 +805,45 @@ pub fn plan_android_rpdb_placement(
     }
 
     Ok(lease)
+}
+
+/// Plans only the exact proxy placement reviewed together with a live canary facility.
+///
+/// The supplied classification is not trusted by shape: this function recreates the complete
+/// policy-and-selection-bound report and requires exact equality. Its classifier-owned static
+/// window begins immediately before the reviewed proxy slot, while the peer-rule cohort remains
+/// ordered between that proxy slot and Android's default-network barrier.
+pub fn plan_android_rpdb_placement_with_reviewed_canary_facility(
+    inventory: &NetworkInventory,
+    report: &AndroidRpdbClassificationReport,
+    request: RpdbPlacementRequest,
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+) -> Result<RpdbPlacementLease, ReviewedCanaryRpdbPlacementError> {
+    let expected_report = classify_android_rpdb_with_reviewed_canary_facility(
+        inventory,
+        report.profile(),
+        policy,
+        selection,
+    )
+    .map_err(ReviewedCanaryRpdbPlacementError::Classification)?;
+    if report != &expected_report {
+        return Err(ReviewedCanaryRpdbPlacementError::ClassificationReportMismatch);
+    }
+
+    let rpdb = policy.rpdb();
+    let expected_placement = RpdbFamilyPlacement::proxy_only(
+        rpdb.proxy_rule_priority(),
+        RuleTableId::from_raw(rpdb.proxy_capture_table().get()),
+    )
+    .expect("reviewed canary policy excludes zero priorities and reserved proxy tables");
+    let expected_ipv6 = selection.peer_ipv6().map(|_| expected_placement);
+    if request.ipv4() != Some(expected_placement) || request.ipv6() != expected_ipv6 {
+        return Err(ReviewedCanaryRpdbPlacementError::PlacementRequestMismatch);
+    }
+
+    plan_rpdb_placement(inventory, report.audit(), request)
+        .map_err(ReviewedCanaryRpdbPlacementError::Placement)
 }
 
 #[derive(Clone, Copy)]

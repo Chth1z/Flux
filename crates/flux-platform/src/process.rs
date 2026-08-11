@@ -222,6 +222,31 @@ pub enum ProcessCredentialMapKind {
     Gid,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn digest_current_process_id_map(
+    contents: &[u8],
+    kind: ProcessCredentialMapKind,
+) -> Result<ProcessCredentialMapDigest, ProcessHandleError> {
+    let path = match kind {
+        ProcessCredentialMapKind::Uid => std::path::Path::new("/proc/self/uid_map"),
+        ProcessCredentialMapKind::Gid => std::path::Path::new("/proc/self/gid_map"),
+    };
+    implementation::digest_process_id_map(contents, path, kind)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn current_process_id_map_contains(
+    contents: &[u8],
+    kind: ProcessCredentialMapKind,
+    inside_id: u32,
+) -> Result<bool, ProcessHandleError> {
+    let path = match kind {
+        ProcessCredentialMapKind::Uid => std::path::Path::new("/proc/self/uid_map"),
+        ProcessCredentialMapKind::Gid => std::path::Path::new("/proc/self/gid_map"),
+    };
+    implementation::process_id_map_contains(contents, path, inside_id)
+}
+
 impl ProcessCredentialMapKind {
     const fn label(self) -> &'static str {
         match self {
@@ -1775,6 +1800,16 @@ mod implementation {
             hasher.update(entry.length.to_le_bytes());
         }
         Ok(ProcessCredentialMapDigest(hasher.finalize().into()))
+    }
+
+    pub(super) fn process_id_map_contains(
+        contents: &[u8],
+        path: &Path,
+        inside_id: u32,
+    ) -> Result<bool, ProcessHandleError> {
+        Ok(parse_process_id_map(contents, path)?.iter().any(|entry| {
+            entry.inside <= inside_id && inside_id < entry.inside.saturating_add(entry.length)
+        }))
     }
 
     fn parse_process_id_map(

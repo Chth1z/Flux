@@ -18,6 +18,7 @@ mod functional_canary;
 mod inspection;
 mod intent_store;
 mod native_admission;
+mod native_canary_facility;
 mod native_generation_source;
 mod native_runtime_writer;
 mod offline_cleanup;
@@ -950,13 +951,7 @@ where
     let daemon_state = daemon_state_label(snapshot.native_admission);
 
     if json {
-        let document = OnlineStatusDocument {
-            daemon: daemon_state,
-            native_admission: snapshot.native_admission.into(),
-            capability_profile: capability_profile.into(),
-            control: OnlineControlDocument::from(snapshot.control),
-            runtime: OnlineRuntimeDocument::from(snapshot.runtime),
-        };
+        let document = online_status_document(snapshot);
         if serde_json::to_writer(&mut *stdout, &document).is_err() || writeln!(stdout).is_err() {
             return EXIT_RUNTIME_ERROR;
         }
@@ -1228,6 +1223,8 @@ struct KernelDocument<'a> {
 struct OnlineStatusDocument {
     daemon: &'static str,
     native_admission: OnlineNativeAdmissionDocument,
+    #[cfg(flux_android_qualification)]
+    qualification_selector_mismatches: Vec<&'static str>,
     capability_profile: WireCapabilityProfile,
     control: OnlineControlDocument,
     runtime: OnlineRuntimeDocument,
@@ -1243,6 +1240,10 @@ fn online_status_document(snapshot: DaemonSnapshot) -> OnlineStatusDocument {
     OnlineStatusDocument {
         daemon: daemon_state_label(snapshot.native_admission),
         native_admission: snapshot.native_admission.into(),
+        #[cfg(flux_android_qualification)]
+        qualification_selector_mismatches: flux_core::qualification_selector_mismatch_fields(
+            &snapshot.capability_profile,
+        ),
         capability_profile: (&snapshot.capability_profile).into(),
         control: OnlineControlDocument::from(snapshot.control),
         runtime: OnlineRuntimeDocument::from(snapshot.runtime),

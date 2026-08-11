@@ -18,8 +18,8 @@ use crate::capability::{
 };
 use crate::fwmark_audit::{
     FwmarkCandidate, FwmarkEvidenceSource, FwmarkEvidenceState, FwmarkPartialAudit,
-    FwmarkPartialAuditOutcome, audit_fwmark_candidate_partial, fwmark_evidence_source_tag,
-    update_fwmark_candidate_evidence,
+    FwmarkPartialAuditOutcome, audit_fwmark_candidate_partial_with_classification,
+    fwmark_evidence_source_tag, update_fwmark_candidate_evidence,
 };
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 use crate::network_route::NetworkAddressFamily;
@@ -47,13 +47,15 @@ pub const OWNERSHIP_JOURNAL_IDENTITY_BYTES: usize = 32;
 pub const MAX_COMPLETE_FWMARK_CENSUS_MARK_USES: usize = 512;
 /// Maximum number of exact ordered-late packet writes retained by one census or policy.
 pub const MAX_ORDERED_LATE_PACKET_WRITES: usize = 128;
+/// Maximum exact whole-mark sentinels retained by one census or reviewed policy.
+pub const MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS: usize = 32;
 /// Maximum UTF-8 bytes accepted for one observed netfilter child-chain name.
 pub const MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES: usize = 128;
 /// Exact byte length of a canonical ordered-write selector digest.
 pub const FWMARK_ORDERED_SELECTOR_DIGEST_BYTES: usize = 32;
 
 const ANDROID_MARK_PLANNING_EVIDENCE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Android mark planning evidence\0canonical-schema-v2\0sha256-v1\0";
+    b"Flux Android mark planning evidence\0canonical-schema-v3\0sha256-v1\0";
 
 const ALL_FWMARK_EVIDENCE_SOURCES: [FwmarkEvidenceSource; 9] = [
     FwmarkEvidenceSource::AndroidNetId,
@@ -586,6 +588,7 @@ pub struct AndroidMarkPositiveGrant {
     policy_revision: AndroidMarkDevicePolicyRevision,
     planes: FwmarkPlaneSet,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 }
 
 impl AndroidMarkPositiveGrant {
@@ -653,6 +656,11 @@ impl AndroidMarkPositiveGrant {
     pub fn ordered_late_writes(&self) -> &[FwmarkOrderedLateWriteQualification] {
         &self.ordered_late_writes
     }
+
+    #[must_use]
+    pub fn exact_mark_sentinels(&self) -> &[FwmarkExactMarkSentinelQualification] {
+        &self.exact_mark_sentinels
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -703,6 +711,7 @@ impl AndroidMarkDevicePolicy {
         network_namespace: NetworkNamespaceIdentity,
         planes: FwmarkPlaneSet,
         ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+        exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
     ) -> Result<Self, AndroidMarkDevicePolicyError> {
         ensure_candidate_eligible(candidate)
             .map_err(AndroidMarkDevicePolicyError::IneligibleCandidate)?;
@@ -722,6 +731,19 @@ impl AndroidMarkDevicePolicy {
             return Err(AndroidMarkDevicePolicyError::InvalidOrderedLateWriteSet);
         }
         let ordered_late_writes = ordered_late_writes.into_boxed_slice();
+        let mut exact_mark_sentinels = exact_mark_sentinels.into_vec();
+        exact_mark_sentinels.sort_unstable();
+        if exact_mark_sentinels.len() > MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS
+            || exact_mark_sentinels
+                .windows(2)
+                .any(|records| records[0] == records[1])
+            || exact_mark_sentinels
+                .iter()
+                .any(|record| !record.is_disjoint_from(candidate))
+        {
+            return Err(AndroidMarkDevicePolicyError::InvalidExactMarkSentinelSet);
+        }
+        let exact_mark_sentinels = exact_mark_sentinels.into_boxed_slice();
         if topology_scope.profile() != netd_source_profile {
             return Err(AndroidMarkDevicePolicyError::NetdSourceProfileMismatch {
                 selected: netd_source_profile,
@@ -761,6 +783,7 @@ impl AndroidMarkDevicePolicy {
             policy_revision: revision,
             planes,
             ordered_late_writes: ordered_late_writes.clone(),
+            exact_mark_sentinels: exact_mark_sentinels.clone(),
         };
         Ok(Self {
             identity,
@@ -799,6 +822,7 @@ pub enum AndroidMarkDevicePolicyError {
     IneligibleCandidate(AndroidMarkCandidateEligibilityError),
     EmptyPlaneGrant,
     InvalidOrderedLateWriteSet,
+    InvalidExactMarkSentinelSet,
     NetdSourceProfileMismatch {
         selected: AndroidNetdSourceProfile,
         topology: AndroidNetdSourceProfile,
@@ -824,6 +848,9 @@ impl fmt::Display for AndroidMarkDevicePolicyError {
             }
             Self::InvalidOrderedLateWriteSet => formatter.write_str(
                 "device-qualified Android mark policy has an invalid ordered-late write set",
+            ),
+            Self::InvalidExactMarkSentinelSet => formatter.write_str(
+                "device-qualified Android mark policy has an invalid exact-mark sentinel set",
             ),
             Self::NetdSourceProfileMismatch { selected, topology } => write!(
                 formatter,
@@ -855,6 +882,7 @@ impl Error for AndroidMarkDevicePolicyError {
             Self::IneligibleCandidate(error) => Some(error),
             Self::EmptyPlaneGrant
             | Self::InvalidOrderedLateWriteSet
+            | Self::InvalidExactMarkSentinelSet
             | Self::NetdSourceProfileMismatch { .. }
             | Self::UnverifiedBootIdentity { .. }
             | Self::UnverifiedDeviceIdentity { .. }
@@ -1081,6 +1109,7 @@ impl Error for FwmarkPacketSelectorDigestError {}
 /// Built-in netfilter hook at which an exact ordered writer was observed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum FwmarkNetfilterBuiltinHook {
+    Prerouting,
     Input,
     Postrouting,
 }
@@ -1241,6 +1270,155 @@ impl fmt::Display for FwmarkOrderedLateWriteQualificationError {
 
 impl Error for FwmarkOrderedLateWriteQualificationError {}
 
+/// Exact whole-mark predicate whose sentinel is disjoint from both reviewed Flux role values.
+///
+/// This qualification is deliberately narrower than general predicate-value reasoning. It admits
+/// only a non-inverted xtables packet predicate that reads all 32 mark bits from a raw PREROUTING
+/// child chain. The reviewed and live sets must match exactly; the record grants no writer,
+/// ordering, or mutation authority.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FwmarkExactMarkSentinelQualification {
+    mark_use: FwmarkUseRecord,
+    sentinel: u32,
+    family: NetworkAddressFamily,
+    hook: FwmarkNetfilterBuiltinHook,
+    child_chain: FwmarkNetfilterChainName,
+    hook_ordinal: NonZeroU32,
+    rule_ordinal: NonZeroU32,
+    selector_digest: FwmarkPacketSelectorDigest,
+}
+
+impl FwmarkExactMarkSentinelQualification {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mark_use: FwmarkUseRecord,
+        sentinel: u32,
+        candidate: FwmarkCandidate,
+        family: NetworkAddressFamily,
+        hook: FwmarkNetfilterBuiltinHook,
+        child_chain: FwmarkNetfilterChainName,
+        hook_ordinal: u32,
+        rule_ordinal: u32,
+        selector_digest: FwmarkPacketSelectorDigest,
+        inverted: bool,
+    ) -> Result<Self, FwmarkExactMarkSentinelQualificationError> {
+        if mark_use.source() != FwmarkEvidenceSource::Xtables
+            || mark_use.plane() != FwmarkPlane::Packet
+            || mark_use.operation() != FwmarkUseOperation::PredicateRead
+            || mark_use.mask() != u32::MAX
+        {
+            return Err(FwmarkExactMarkSentinelQualificationError::NotExactPacketPredicate);
+        }
+        if hook != FwmarkNetfilterBuiltinHook::Prerouting {
+            return Err(FwmarkExactMarkSentinelQualificationError::NotRawPrerouting);
+        }
+        if inverted {
+            return Err(FwmarkExactMarkSentinelQualificationError::InvertedPredicate);
+        }
+        let projected = sentinel & candidate.mask();
+        if projected == 0
+            || projected == candidate.proxy_value()
+            || projected == candidate.bypass_value()
+        {
+            return Err(FwmarkExactMarkSentinelQualificationError::RoleValueOverlap);
+        }
+        let hook_ordinal = NonZeroU32::new(hook_ordinal)
+            .ok_or(FwmarkExactMarkSentinelQualificationError::EmptyHookOrdinal)?;
+        let rule_ordinal = NonZeroU32::new(rule_ordinal)
+            .ok_or(FwmarkExactMarkSentinelQualificationError::EmptyRuleOrdinal)?;
+        Ok(Self {
+            mark_use,
+            sentinel,
+            family,
+            hook,
+            child_chain,
+            hook_ordinal,
+            rule_ordinal,
+            selector_digest,
+        })
+    }
+
+    #[must_use]
+    pub const fn mark_use(&self) -> FwmarkUseRecord {
+        self.mark_use
+    }
+
+    #[must_use]
+    pub const fn sentinel(&self) -> u32 {
+        self.sentinel
+    }
+
+    #[must_use]
+    pub const fn family(&self) -> NetworkAddressFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn hook(&self) -> FwmarkNetfilterBuiltinHook {
+        self.hook
+    }
+
+    #[must_use]
+    pub fn child_chain(&self) -> &FwmarkNetfilterChainName {
+        &self.child_chain
+    }
+
+    #[must_use]
+    pub const fn hook_ordinal(&self) -> u32 {
+        self.hook_ordinal.get()
+    }
+
+    #[must_use]
+    pub const fn rule_ordinal(&self) -> u32 {
+        self.rule_ordinal.get()
+    }
+
+    #[must_use]
+    pub const fn selector_digest(&self) -> FwmarkPacketSelectorDigest {
+        self.selector_digest
+    }
+
+    #[must_use]
+    const fn is_disjoint_from(&self, candidate: FwmarkCandidate) -> bool {
+        let projected = self.sentinel & candidate.mask();
+        self.mark_use.mask() == u32::MAX
+            && projected != 0
+            && projected != candidate.proxy_value()
+            && projected != candidate.bypass_value()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FwmarkExactMarkSentinelQualificationError {
+    NotExactPacketPredicate,
+    NotRawPrerouting,
+    InvertedPredicate,
+    RoleValueOverlap,
+    EmptyHookOrdinal,
+    EmptyRuleOrdinal,
+}
+
+impl fmt::Display for FwmarkExactMarkSentinelQualificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotExactPacketPredicate => {
+                "exact-mark sentinel qualification requires a full-mask xtables packet predicate"
+            }
+            Self::NotRawPrerouting => {
+                "exact-mark sentinel qualification requires raw PREROUTING placement"
+            }
+            Self::InvertedPredicate => "exact-mark sentinel predicate is inverted",
+            Self::RoleValueOverlap => {
+                "exact-mark sentinel can equal zero, proxy, or bypass within the candidate field"
+            }
+            Self::EmptyHookOrdinal => "exact-mark sentinel has an empty hook ordinal",
+            Self::EmptyRuleOrdinal => "exact-mark sentinel has an empty rule ordinal",
+        })
+    }
+}
+
+impl Error for FwmarkExactMarkSentinelQualificationError {}
+
 /// Opaque process-local identity of one consumed point-in-time census observation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CompleteFwmarkCensusObservationId(NonZeroU64);
@@ -1272,6 +1450,7 @@ pub struct CompleteFwmarkCensus {
     coverage: Box<[FwmarkCensusCoverageRecord]>,
     mark_uses: Box<[FwmarkUseRecord]>,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 }
 
 impl CompleteFwmarkCensus {
@@ -1294,6 +1473,7 @@ impl CompleteFwmarkCensus {
         coverage: impl IntoIterator<Item = FwmarkCensusCoverageRecord>,
         mark_uses: impl IntoIterator<Item = FwmarkUseRecord>,
         ordered_late_writes: impl IntoIterator<Item = FwmarkOrderedLateWriteQualification>,
+        exact_mark_sentinels: impl IntoIterator<Item = FwmarkExactMarkSentinelQualification>,
     ) -> Result<Self, CompleteFwmarkCensusError> {
         if capability_profile.boot_identity().verified().is_none() {
             return Err(CompleteFwmarkCensusError::UnverifiedBootIdentity {
@@ -1385,6 +1565,26 @@ impl CompleteFwmarkCensus {
             }
         }
 
+        let mut canonical_exact_mark_sentinels: Vec<_> = exact_mark_sentinels.into_iter().collect();
+        if canonical_exact_mark_sentinels.len() > MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS {
+            return Err(CompleteFwmarkCensusError::TooManyExactMarkSentinels {
+                maximum: MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS,
+                required_at_least: canonical_exact_mark_sentinels.len(),
+            });
+        }
+        canonical_exact_mark_sentinels.sort_unstable();
+        if canonical_exact_mark_sentinels
+            .windows(2)
+            .any(|records| records[0] == records[1])
+        {
+            return Err(CompleteFwmarkCensusError::DuplicateExactMarkSentinel);
+        }
+        for record in &canonical_exact_mark_sentinels {
+            if !canonical_mark_uses.contains(&record.mark_use()) {
+                return Err(CompleteFwmarkCensusError::ExactMarkSentinelHasNoMarkUse);
+            }
+        }
+
         for coverage in &canonical_coverage {
             let has_mark_use = canonical_mark_uses
                 .iter()
@@ -1431,6 +1631,7 @@ impl CompleteFwmarkCensus {
             coverage: canonical_coverage.into_boxed_slice(),
             mark_uses: canonical_mark_uses.into_boxed_slice(),
             ordered_late_writes: canonical_ordered_late_writes.into_boxed_slice(),
+            exact_mark_sentinels: canonical_exact_mark_sentinels.into_boxed_slice(),
         })
     }
 
@@ -1521,6 +1722,11 @@ impl CompleteFwmarkCensus {
     pub fn ordered_late_writes(&self) -> &[FwmarkOrderedLateWriteQualification] {
         &self.ordered_late_writes
     }
+
+    #[must_use]
+    pub fn exact_mark_sentinels(&self) -> &[FwmarkExactMarkSentinelQualification] {
+        &self.exact_mark_sentinels
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1562,6 +1768,12 @@ pub enum CompleteFwmarkCensusError {
     },
     DuplicateOrderedLateWrite,
     OrderedLateWriteHasNoMarkUse,
+    TooManyExactMarkSentinels {
+        maximum: usize,
+        required_at_least: usize,
+    },
+    DuplicateExactMarkSentinel,
+    ExactMarkSentinelHasNoMarkUse,
     PresentCoverageHasNoMarkUse {
         source: FwmarkEvidenceSource,
         plane: FwmarkPlane,
@@ -1634,6 +1846,19 @@ impl fmt::Display for CompleteFwmarkCensusError {
             }
             Self::OrderedLateWriteHasNoMarkUse => formatter.write_str(
                 "complete fwmark census retains an ordered-late write without its canonical mark-use record",
+            ),
+            Self::TooManyExactMarkSentinels {
+                maximum,
+                required_at_least,
+            } => write!(
+                formatter,
+                "complete fwmark census has at least {required_at_least} exact-mark sentinels but its limit is {maximum}"
+            ),
+            Self::DuplicateExactMarkSentinel => {
+                formatter.write_str("complete fwmark census repeats an exact-mark sentinel")
+            }
+            Self::ExactMarkSentinelHasNoMarkUse => formatter.write_str(
+                "complete fwmark census retains an exact-mark sentinel without its canonical mark-use record",
             ),
             Self::PresentCoverageHasNoMarkUse { source, plane } => write!(
                 formatter,
@@ -2012,8 +2237,9 @@ fn digest_complete_census(digest: &mut CanonicalEvidenceDigest, census: &Complet
             NetworkAddressFamily::Ipv6 => 1,
         });
         digest.tag(match record.hook {
-            FwmarkNetfilterBuiltinHook::Input => 0,
-            FwmarkNetfilterBuiltinHook::Postrouting => 1,
+            FwmarkNetfilterBuiltinHook::Prerouting => 0,
+            FwmarkNetfilterBuiltinHook::Input => 1,
+            FwmarkNetfilterBuiltinHook::Postrouting => 2,
         });
         digest.bytes(record.child_chain.as_str().as_bytes());
         digest.u32(record.hook_ordinal.get());
@@ -2023,6 +2249,28 @@ fn digest_complete_census(digest: &mut CanonicalEvidenceDigest, census: &Complet
             FwmarkOrderedLateWritePlacement::InputAfterRouting => 0,
             FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse => 1,
         });
+    }
+    digest.usize(census.exact_mark_sentinels.len());
+    for record in &census.exact_mark_sentinels {
+        let mark_use = record.mark_use();
+        digest.tag(fwmark_evidence_source_tag(mark_use.source()));
+        digest.tag(fwmark_plane_tag(mark_use.plane()));
+        digest.tag(fwmark_use_operation_tag(mark_use.operation()));
+        digest.u32(mark_use.mask());
+        digest.u32(record.sentinel());
+        digest.tag(match record.family() {
+            NetworkAddressFamily::Ipv4 => 0,
+            NetworkAddressFamily::Ipv6 => 1,
+        });
+        digest.tag(match record.hook() {
+            FwmarkNetfilterBuiltinHook::Prerouting => 0,
+            FwmarkNetfilterBuiltinHook::Input => 1,
+            FwmarkNetfilterBuiltinHook::Postrouting => 2,
+        });
+        digest.bytes(record.child_chain().as_str().as_bytes());
+        digest.u32(record.hook_ordinal());
+        digest.u32(record.rule_ordinal());
+        digest.bytes(record.selector_digest().as_bytes());
     }
 }
 
@@ -2153,7 +2401,8 @@ pub fn authorize_android_mark_planning(
         );
     }
 
-    let partial_audit = audit_fwmark_candidate_partial(inventory, candidate);
+    let partial_audit =
+        audit_fwmark_candidate_partial_with_classification(inventory, classification, candidate);
     if partial_audit.outcome() == FwmarkPartialAuditOutcome::Conflicting {
         return Err(
             AndroidMarkPlanningAuthorizationError::PartialAuditConflict {
@@ -2176,6 +2425,13 @@ pub fn authorize_android_mark_planning(
         {
             continue;
         }
+        if census
+            .exact_mark_sentinels
+            .iter()
+            .any(|record| record.mark_use() == mark_use)
+        {
+            continue;
+        }
         if let Some(requirement) = ordered_packet_write_requirement(mark_use) {
             ordered_packet_writes.push(FwmarkCensusOrderedPacketWrite {
                 mark_use,
@@ -2190,6 +2446,14 @@ pub fn authorize_android_mark_planning(
         return Err(AndroidMarkPlanningAuthorizationError::CensusConflict {
             conflicts: census_conflicts.into_boxed_slice(),
         });
+    }
+    if grant.exact_mark_sentinels != census.exact_mark_sentinels {
+        return Err(
+            AndroidMarkPlanningAuthorizationError::ExactMarkSentinelQualificationMismatch {
+                expected: grant.exact_mark_sentinels.clone(),
+                observed: census.exact_mark_sentinels.clone(),
+            },
+        );
     }
     if grant.ordered_late_writes != census.ordered_late_writes {
         return Err(
@@ -2458,6 +2722,10 @@ pub enum AndroidMarkPlanningAuthorizationError {
         expected: Box<[FwmarkOrderedLateWriteQualification]>,
         observed: Box<[FwmarkOrderedLateWriteQualification]>,
     },
+    ExactMarkSentinelQualificationMismatch {
+        expected: Box<[FwmarkExactMarkSentinelQualification]>,
+        observed: Box<[FwmarkExactMarkSentinelQualification]>,
+    },
     NonFreshCensusObservation {
         previous_observation_id: CompleteFwmarkCensusObservationId,
         replacement_observation_id: CompleteFwmarkCensusObservationId,
@@ -2502,6 +2770,22 @@ impl AndroidMarkPlanningAuthorizationError {
     pub fn ordered_late_write_observed(&self) -> &[FwmarkOrderedLateWriteQualification] {
         match self {
             Self::OrderedLateWriteQualificationMismatch { observed, .. } => observed,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn exact_mark_sentinel_expected(&self) -> &[FwmarkExactMarkSentinelQualification] {
+        match self {
+            Self::ExactMarkSentinelQualificationMismatch { expected, .. } => expected,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn exact_mark_sentinel_observed(&self) -> &[FwmarkExactMarkSentinelQualification] {
+        match self {
+            Self::ExactMarkSentinelQualificationMismatch { observed, .. } => observed,
             _ => &[],
         }
     }
@@ -2629,22 +2913,51 @@ impl fmt::Display for AndroidMarkPlanningAuthorizationError {
                 formatter,
                 "partial fwmark audit requires trusted {source:?} evidence but observed {state:?}"
             ),
-            Self::CensusConflict { conflicts } => write!(
-                formatter,
-                "complete fwmark census found {} candidate-mask conflicts",
-                conflicts.len()
-            ),
+            Self::CensusConflict { conflicts } => {
+                write!(
+                    formatter,
+                    "complete fwmark census found {} candidate-mask conflicts",
+                    conflicts.len()
+                )?;
+                for conflict in conflicts {
+                    let mark_use = conflict.mark_use();
+                    write!(
+                        formatter,
+                        "; {:?}/{:?}/{:?}/mask={:#010x}/overlap={:#010x}",
+                        mark_use.source(),
+                        mark_use.plane(),
+                        mark_use.operation(),
+                        mark_use.mask(),
+                        conflict.overlap(),
+                    )?;
+                }
+                Ok(())
+            }
             Self::OrderedPacketWriteQualificationRequired { overlaps } => write!(
                 formatter,
                 "complete fwmark census found {} ordered packet writes requiring device qualification",
                 overlaps.len()
             ),
-            Self::OrderedLateWriteQualificationMismatch { expected, observed } => write!(
-                formatter,
-                "ordered-late write qualification set differs (expected {}, observed {})",
-                expected.len(),
-                observed.len()
-            ),
+            Self::OrderedLateWriteQualificationMismatch { expected, observed } => {
+                write!(
+                    formatter,
+                    "ordered-late write qualification set differs (expected {}, observed {})",
+                    expected.len(),
+                    observed.len()
+                )?;
+                write_ordered_late_write_diagnostics(formatter, "expected", expected)?;
+                write_ordered_late_write_diagnostics(formatter, "observed", observed)
+            }
+            Self::ExactMarkSentinelQualificationMismatch { expected, observed } => {
+                write!(
+                    formatter,
+                    "exact-mark sentinel qualification set differs (expected {}, observed {})",
+                    expected.len(),
+                    observed.len()
+                )?;
+                write_exact_mark_sentinel_diagnostics(formatter, "expected", expected)?;
+                write_exact_mark_sentinel_diagnostics(formatter, "observed", observed)
+            }
             Self::NonFreshCensusObservation {
                 previous_observation_id,
                 replacement_observation_id,
@@ -2656,6 +2969,56 @@ impl fmt::Display for AndroidMarkPlanningAuthorizationError {
             ),
         }
     }
+}
+
+fn write_ordered_late_write_diagnostics(
+    formatter: &mut fmt::Formatter<'_>,
+    label: &str,
+    records: &[FwmarkOrderedLateWriteQualification],
+) -> fmt::Result {
+    for record in records {
+        let mark_use = record.mark_use();
+        write!(
+            formatter,
+            "; {label}={:?}/{:?}/{:?}/{:?}/chain={}/hook-ordinal={}/rule-ordinal={}/placement={:?}/mask={:#010x}/selector=",
+            mark_use.source(),
+            mark_use.plane(),
+            mark_use.operation(),
+            record.family(),
+            record.child_chain().as_str(),
+            record.hook_ordinal(),
+            record.rule_ordinal(),
+            record.placement(),
+            mark_use.mask(),
+        )?;
+        for byte in record.selector_digest().as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_exact_mark_sentinel_diagnostics(
+    formatter: &mut fmt::Formatter<'_>,
+    label: &str,
+    records: &[FwmarkExactMarkSentinelQualification],
+) -> fmt::Result {
+    for record in records {
+        write!(
+            formatter,
+            "; {label}={:?}/{:?}/chain={}/hook-ordinal={}/rule-ordinal={}/sentinel={:#010x}/selector=",
+            record.family(),
+            record.hook(),
+            record.child_chain().as_str(),
+            record.hook_ordinal(),
+            record.rule_ordinal(),
+            record.sentinel(),
+        )?;
+        for byte in record.selector_digest().as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+    }
+    Ok(())
 }
 
 impl Error for AndroidMarkPlanningAuthorizationError {

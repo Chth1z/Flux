@@ -584,6 +584,21 @@ impl CanaryAttemptCredentialBinding {
             domain,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn probe(self) -> CanaryProcessCredentialIdentity {
+        self.probe
+    }
+
+    #[must_use]
+    pub(crate) const fn engine(self) -> CanaryProcessCredentialIdentity {
+        self.engine
+    }
+
+    #[must_use]
+    pub(crate) const fn domain(self) -> CanaryCredentialDomainBinding {
+        self.domain
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1569,6 +1584,11 @@ impl CanaryFacilityAdmissionScope {
     #[must_use]
     pub(crate) const fn facility_digest(self) -> CanaryFacilityAuditDigest {
         self.facility_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn facility(self) -> CanaryFacilityIdentity {
+        self.facility
     }
 }
 
@@ -2679,6 +2699,42 @@ impl ActiveCanaryGenerationBinding {
     }
 
     #[must_use]
+    pub(crate) const fn retained_facility(&self) -> CanaryFacilityIdentity {
+        self.retained_facility
+    }
+
+    #[must_use]
+    pub(crate) const fn network_epoch(&self) -> NetworkEpoch {
+        self.network_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn network_inventory_snapshot_id(&self) -> NetworkInventorySnapshotId {
+        self.network_inventory_snapshot_id
+    }
+
+    pub(crate) fn bind_environment_authority(
+        &self,
+        peer_network_namespace: NetworkNamespaceIdentity,
+        socket_observer: CanarySocketObserverBinding,
+    ) -> Result<CanaryEnvironmentAuthorityBinding, CanaryBindingError> {
+        let network = CanaryNetworkObservationBinding::new(
+            self.daemon_network_namespace,
+            peer_network_namespace,
+            self.network_epoch,
+            self.network_inventory_snapshot_id,
+        )?;
+        Ok(CanaryEnvironmentAuthorityBinding::new(
+            self.boot_identity.clone(),
+            self.capability_profile_revision,
+            network,
+            self.capture_program_digest,
+            self.ownership.clone(),
+            socket_observer,
+        ))
+    }
+
+    #[must_use]
     pub(crate) fn matches_environment(&self, environment: &CanaryEnvironmentBinding) -> bool {
         let authority = environment.authority();
         self.boot_identity == authority.boot_identity
@@ -3049,11 +3105,13 @@ impl CanaryAttemptRequest {
         {
             return Err(CanaryBindingError::FacilityAdmissionAttemptMismatch);
         }
-        if admission.observation.observed_at > deadline.started_at()
-            || deadline
-                .started_at()
-                .saturating_duration_since(admission.observation.observed_at)
+        if admission.observation.observed_at < deadline.started_at()
+            || admission
+                .observation
+                .observed_at
+                .saturating_duration_since(deadline.started_at())
                 > MAX_CANARY_FACILITY_OBSERVATION_AGE
+            || admission.observation.observed_at >= deadline.expires_at()
             || admission.observation.fresh_until < deadline.expires_at()
         {
             return Err(CanaryBindingError::FacilityAdmissionExpired);
@@ -6301,6 +6359,35 @@ pub(crate) mod tests {
         ResidualPeerRule,
         DisabledIpv6PeerRule,
         OpaquePeerRule,
+    }
+
+    #[test]
+    fn facility_admission_observation_must_follow_start_and_precede_expiry() {
+        let engine = EngineFixture::new();
+        let started_at = Instant::now();
+        let valid = request(&engine.spec, CanaryAddressFamilies::Ipv4Only, started_at);
+        let rebuild = |observed_at| {
+            let mut environment = valid.pre_binding.environment.clone();
+            environment.facility_admission.observation.observed_at = observed_at;
+            CanaryAttemptRequest::new(
+                CanaryAttemptBinding::new(valid.pre_binding.engine.clone(), environment),
+                valid.nonce,
+                valid.deadline,
+                valid.families,
+                valid.counter_bounds,
+            )
+        };
+
+        rebuild(started_at + Duration::from_millis(1))
+            .expect("completed admission audit occurs inside the immutable deadline");
+        assert_eq!(
+            rebuild(started_at - Duration::from_nanos(1)),
+            Err(CanaryBindingError::FacilityAdmissionExpired)
+        );
+        assert_eq!(
+            rebuild(valid.deadline.expires_at()),
+            Err(CanaryBindingError::FacilityAdmissionExpired)
+        );
     }
 
     fn retained_peer_reaped_authority(

@@ -9,8 +9,10 @@ use flux_core::{
     AddressHostFamilySelection, AndroidNetdSourceProfile, AndroidTproxyRoutingShape,
     AndroidTproxyTopologyScopeRequest, AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain,
     FluxConfig, FwmarkCandidate, GenerationId, NetworkAddressFamily, NetworkInventory, Reason,
+    ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection, ReviewedCanaryRoleCredentials,
     RpdbFamilyPlacement, RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
-    plan_android_rpdb_placement,
+    classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
+    plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_core::{CapabilityProfile, NetworkNamespaceIdentity};
@@ -179,6 +181,11 @@ const SYSTEM_ANDROID_PRIVATE_TABLE: u32 = 20_253;
 /// Production Android planning adapter backed by the complete system census coordinator.
 pub(crate) struct SystemAndroidGenerationPlanningSource {
     census: SystemAndroidFwmarkCensusSource,
+    reviewed_canary_facility: Option<(
+        ReviewedCanaryFacilityPolicy,
+        ReviewedCanaryFacilitySelection,
+        FwmarkCandidate,
+    )>,
     initial: Option<(FluxConfig, GenerationPlanningAuthority)>,
 }
 
@@ -187,8 +194,20 @@ impl SystemAndroidGenerationPlanningSource {
     pub(crate) fn for_current_daemon(durable_root: impl AsRef<Path>) -> Self {
         Self {
             census: SystemAndroidFwmarkCensusSource::for_current_daemon(durable_root),
+            reviewed_canary_facility: None,
             initial: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_reviewed_canary_facility(
+        mut self,
+        policy: ReviewedCanaryFacilityPolicy,
+        selection: ReviewedCanaryFacilitySelection,
+        candidate: FwmarkCandidate,
+    ) -> Self {
+        self.reviewed_canary_facility = Some((policy, selection, candidate));
+        self
     }
 
     pub(crate) fn plan_initial(
@@ -233,12 +252,17 @@ impl SystemAndroidGenerationPlanningSource {
         {
             return Err(SystemAndroidGenerationPlanningError::ForwardedIngressUnsupported);
         }
-        let candidate = FwmarkCandidate::new(
-            SYSTEM_ANDROID_CANDIDATE_MASK,
-            SYSTEM_ANDROID_PROXY_VALUE,
-            SYSTEM_ANDROID_BYPASS_VALUE,
-        )
-        .expect("compiled Android mark candidate is structurally valid");
+        let candidate = self.reviewed_canary_facility.as_ref().map_or_else(
+            || {
+                FwmarkCandidate::new(
+                    SYSTEM_ANDROID_CANDIDATE_MASK,
+                    SYSTEM_ANDROID_PROXY_VALUE,
+                    SYSTEM_ANDROID_BYPASS_VALUE,
+                )
+                .expect("compiled Android mark candidate is structurally valid")
+            },
+            |(_, _, candidate)| *candidate,
+        );
         let topology = AndroidTproxyTopologyScopeRequest::new(
             AndroidTproxyRoutingShape::PreMarkAddressHostSet,
             [
@@ -251,13 +275,20 @@ impl SystemAndroidGenerationPlanningSource {
             ],
         )
         .expect("compiled Android topology request is structurally valid");
-        let request = AndroidFwmarkCensusCoordinatorRequest::new(
+        let netd_source_profile = self.reviewed_canary_facility.as_ref().map_or(
             AndroidNetdSourceProfile::AospNetd20250324,
+            |(policy, _, _)| policy.netd_source_profile(),
+        );
+        let mut request = AndroidFwmarkCensusCoordinatorRequest::new(
+            netd_source_profile,
             candidate,
             topology,
             SYSTEM_ANDROID_CENSUS_BOUND,
         )
         .expect("compiled Android census request is structurally valid");
+        if let Some((policy, selection, _)) = self.reviewed_canary_facility.as_ref() {
+            request = request.with_reviewed_canary_facility(policy.clone(), *selection);
+        }
         let outcome = coordinate_android_fwmark_census_for_inventory(
             &mut self.census,
             &request,
@@ -274,19 +305,59 @@ impl SystemAndroidGenerationPlanningSource {
             }
         };
 
-        let family = RpdbFamilyPlacement::proxy_only(
-            RulePriority::from_raw(SYSTEM_ANDROID_PROXY_PRIORITY),
-            RuleTableId::from_raw(SYSTEM_ANDROID_PRIVATE_TABLE),
-        )
-        .expect("compiled Android one-rule placement is structurally valid");
-        let placement_request = RpdbPlacementRequest::new(Some(family), Some(family))
-            .expect("compiled Android placement enables both families");
-        let classification =
-            classify_android_rpdb(&inventory, AndroidNetdSourceProfile::AospNetd20250324);
-        let placement = plan_android_rpdb_placement(&inventory, &classification, placement_request)
+        let family = match self.reviewed_canary_facility.as_ref() {
+            Some((policy, _, _)) => RpdbFamilyPlacement::proxy_only(
+                policy.rpdb().proxy_rule_priority(),
+                RuleTableId::from_raw(policy.rpdb().proxy_capture_table().get()),
+            ),
+            None => RpdbFamilyPlacement::proxy_only(
+                RulePriority::from_raw(SYSTEM_ANDROID_PROXY_PRIORITY),
+                RuleTableId::from_raw(SYSTEM_ANDROID_PRIVATE_TABLE),
+            ),
+        }
+        .expect("reviewed or compiled Android one-rule placement is structurally valid");
+        let ipv6_placement = self
+            .reviewed_canary_facility
+            .as_ref()
+            .map_or(Some(family), |(_, selection, _)| {
+                selection.peer_ipv6().map(|_| family)
+            });
+        let placement_request = RpdbPlacementRequest::new(Some(family), ipv6_placement)
+            .expect("compiled Android placement always enables IPv4");
+        let classification = match self.reviewed_canary_facility.as_ref() {
+            Some((policy, selection, _)) => classify_android_rpdb_with_reviewed_canary_facility(
+                &inventory,
+                netd_source_profile,
+                policy,
+                *selection,
+            )
             .map_err(|source| {
                 SystemAndroidGenerationPlanningError::Placement(source.to_string().into_boxed_str())
-            })?;
+            })?,
+            None => classify_android_rpdb(&inventory, netd_source_profile),
+        };
+        let placement = match self.reviewed_canary_facility.as_ref() {
+            Some((policy, selection, _)) => {
+                plan_android_rpdb_placement_with_reviewed_canary_facility(
+                    &inventory,
+                    &classification,
+                    placement_request,
+                    policy,
+                    *selection,
+                )
+                .map_err(|source| {
+                    SystemAndroidGenerationPlanningError::Placement(
+                        source.to_string().into_boxed_str(),
+                    )
+                })?
+            }
+            None => plan_android_rpdb_placement(&inventory, &classification, placement_request)
+                .map_err(|source| {
+                    SystemAndroidGenerationPlanningError::Placement(
+                        source.to_string().into_boxed_str(),
+                    )
+                })?,
+        };
         GenerationPlanningAuthority::android(evidence, Instant::now(), Some(placement))
             .map_err(SystemAndroidGenerationPlanningError::CapturePathEvidence)
     }
@@ -552,6 +623,9 @@ where
     admission: A,
     engine_profiles: Box<dyn EngineCapabilityProfileSource>,
     canary_facility: Option<CanaryFacilityIdentity>,
+    reviewed_canary_credentials: Option<ReviewedCanaryRoleCredentials>,
+    #[cfg(test)]
+    allow_test_root_canary_credentials: bool,
     accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
     latest_capture_path_decision: Option<CapturePathDecision>,
     pending: Option<PendingGeneration>,
@@ -619,6 +693,9 @@ where
             admission,
             engine_profiles,
             canary_facility: None,
+            reviewed_canary_credentials: None,
+            #[cfg(test)]
+            allow_test_root_canary_credentials: false,
             accepted_subscription,
             latest_capture_path_decision: None,
             pending: None,
@@ -629,16 +706,22 @@ where
     }
 
     /// Bind an already-validated facility without granting this source network mutation authority.
-    #[allow(
-        dead_code,
-        reason = "the serialized native facility owner supplies this value in the next checkpoint"
-    )]
     #[must_use]
     pub(crate) fn with_retained_canary_facility(
         mut self,
         facility: CanaryFacilityIdentity,
+        credentials: ReviewedCanaryRoleCredentials,
     ) -> Self {
         self.canary_facility = Some(facility);
+        self.reviewed_canary_credentials = Some(credentials);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_test_retained_canary_facility(mut self, facility: CanaryFacilityIdentity) -> Self {
+        self.canary_facility = Some(facility);
+        self.allow_test_root_canary_credentials = true;
         self
     }
 
@@ -673,6 +756,7 @@ where
         NativeGenerationSourceError,
     > {
         let desired_state = inputs.desired_state();
+        self.validate_configured_engine_credentials(desired_state)?;
         let canary_route = self.required_canary_route(desired_state)?;
         if desired_state.subscription().enabled() {
             let subscription = self
@@ -755,6 +839,37 @@ where
             ports.udp_echo(),
             ports.dns(),
         )))
+    }
+
+    fn validate_configured_engine_credentials(
+        &self,
+        desired_state: &FluxConfig,
+    ) -> Result<(), NativeGenerationSourceError> {
+        let configured = desired_state.engine().credentials();
+        if !desired_state.safety().require_functional_canary() {
+            return if configured.uid().get() == 0 && configured.gid().get() == 0 {
+                Ok(())
+            } else {
+                Err(NativeGenerationSourceError::UnsupportedEngineIdentity)
+            };
+        }
+
+        let Some(reviewed) = self.reviewed_canary_credentials else {
+            #[cfg(test)]
+            if self.allow_test_root_canary_credentials
+                && configured.uid().get() == 0
+                && configured.gid().get() == 0
+            {
+                return Ok(());
+            }
+            return Err(NativeGenerationSourceError::CanaryCredentialAuthorityUnavailable);
+        };
+        if configured.uid().get() != reviewed.engine_uid().get()
+            || configured.gid().get() != reviewed.engine_gid().get()
+        {
+            return Err(NativeGenerationSourceError::CanaryEngineIdentityDrift);
+        }
+        Ok(())
     }
 
     fn prepare_candidate(
@@ -1071,6 +1186,7 @@ where
         if config.desired_state() != inputs.desired_state() {
             return Err(NativeGenerationSourceError::SelectedSourceDrift);
         }
+        self.validate_configured_engine_credentials(inputs.desired_state())?;
         let stored_artifact = config
             .reconstruct_artifact(inputs.desired_state().listener().port())
             .map_err(NativeGenerationSourceError::EngineConfig)?;
@@ -1146,10 +1262,6 @@ fn build_engine_spec(
     config_path: &Path,
     paths: &NativeGenerationSourcePaths,
 ) -> Result<EngineSpec, NativeGenerationSourceError> {
-    let credentials = desired_state.engine().credentials();
-    if credentials.uid().get() != 0 || credentials.gid().get() != 0 {
-        return Err(NativeGenerationSourceError::UnsupportedEngineIdentity);
-    }
     let configured_restart = desired_state.engine().restart();
     let restart = RestartPolicy::new(
         configured_restart.max_attempts(),
@@ -1189,6 +1301,8 @@ pub(crate) enum NativeGenerationSourceError {
     Address(AddressReconciliationError),
     SubscriptionUnavailable,
     CanaryFacilityUnavailable,
+    CanaryCredentialAuthorityUnavailable,
+    CanaryEngineIdentityDrift,
     UnsupportedCanaryAddressFamilies,
     SelectedSourceDrift,
     Template {
@@ -1222,6 +1336,12 @@ impl fmt::Display for NativeGenerationSourceError {
                 .write_str("subscription-enabled Desired State has no accepted engine source"),
             Self::CanaryFacilityUnavailable => formatter
                 .write_str("required functional-canary Generation has no retained native facility"),
+            Self::CanaryCredentialAuthorityUnavailable => formatter.write_str(
+                "required functional-canary Generation has no reviewed engine credential authority",
+            ),
+            Self::CanaryEngineIdentityDrift => formatter.write_str(
+                "required functional-canary engine UID/GID differ from the reviewed boot facility",
+            ),
             Self::UnsupportedCanaryAddressFamilies => formatter.write_str(
                 "required functional-canary Generation supports IPv4 or dual-stack capture",
             ),
@@ -1273,6 +1393,8 @@ impl Error for NativeGenerationSourceError {
             Self::InventoryUnavailable
             | Self::SubscriptionUnavailable
             | Self::CanaryFacilityUnavailable
+            | Self::CanaryCredentialAuthorityUnavailable
+            | Self::CanaryEngineIdentityDrift
             | Self::UnsupportedCanaryAddressFamilies
             | Self::SelectedSourceDrift
             | Self::UnsupportedEngineIdentity
@@ -1485,7 +1607,7 @@ esac
                 accepted_subscription,
                 Box::new(InheritedEngineProfileSource),
             )
-            .with_retained_canary_facility(test_canary_facility());
+            .with_test_retained_canary_facility(test_canary_facility());
 
             Self {
                 _directory: directory,
@@ -1709,6 +1831,24 @@ esac
         assert!(matches!(
             error,
             NativeGenerationSourceError::CanaryFacilityUnavailable
+        ));
+        assert!(!fixture.generation_path(1).exists());
+        assert!(fixture.source.pending.is_none());
+    }
+
+    #[test]
+    fn required_source_without_reviewed_credentials_rejects_root_engine_before_artifact_creation() {
+        let mut fixture = SourceFixture::new(false);
+        fixture.source.allow_test_root_canary_credentials = false;
+
+        let error = match fixture.source.prepare(Reason::Boot, None) {
+            Ok(_) => panic!("required source cannot infer credential authority from root config"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            NativeGenerationSourceError::CanaryCredentialAuthorityUnavailable
         ));
         assert!(!fixture.generation_path(1).exists());
         assert!(fixture.source.pending.is_none());

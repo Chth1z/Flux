@@ -1,21 +1,26 @@
 use std::error::Error;
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::android_mark_authority::{
     ANDROID_DEVICE_QUALIFIED_CANDIDATE_MASK, AndroidMarkDevicePolicy,
     AndroidMarkDevicePolicyArtifactDigest, AndroidMarkDevicePolicyError,
     AndroidMarkDevicePolicyName, AndroidMarkDevicePolicyRevision, AndroidMarkPolicyAssuranceClass,
-    FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName, FwmarkOrderedLateWritePlacement,
-    FwmarkOrderedLateWriteQualification, FwmarkPacketSelectorDigest, FwmarkPlaneSet,
-    FwmarkUseOperation, FwmarkUseRecord, ReviewedPolicyCatalogEntryId,
+    FwmarkExactMarkSentinelQualification, FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName,
+    FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
+    FwmarkPacketSelectorDigest, FwmarkPlaneSet, FwmarkUseOperation, FwmarkUseRecord,
+    ReviewedPolicyCatalogEntryId,
 };
 use crate::android_netd::AndroidNetdSourceProfile;
 use crate::android_tproxy_topology::AndroidTproxyTopologyScopeReport;
+use crate::canary_facility_policy::ReviewedCanaryFacilityPolicy;
 use crate::capability::{
     AndroidBuildIdentity, AndroidProductIdentity, ArtifactIdentity, CapabilityProfile,
     KernelBuildIdentity, NetworkNamespaceIdentity, ObservationKind, ReviewedPolicySelector,
     SecurityPatchLevel, SelinuxPolicyIdentity, Sha256Digest, VendorBuildIdentity,
 };
+#[cfg(flux_android_qualification)]
+use crate::capture_path::CapturePathQualificationState;
 use crate::capture_path::{
     CapturePathBehavioralEvidence, CapturePathQualifications,
     ReviewedCapturePathEvidenceArtifactDigest, ReviewedCapturePathEvidenceRevision,
@@ -75,15 +80,373 @@ const SAMSUNG_SM_S9180_FZDP_PLATFORM_PROFILE_V1: ReviewedAndroidPlatformProfileC
             bypass_value: 0x0200_0000,
             planes: FwmarkPlaneSet::ALL.bits(),
             ordered_late_writes: &[],
+            exact_mark_sentinels: &[],
         }),
         // This exact device has reviewed mark behavior only. Capture Path authority remains absent
         // until a rooted ARM64 behavioral artifact is independently reviewed.
         capture_path: None,
+        canary_facility: None,
     };
 
+#[cfg(any(test, flux_android_qualification))]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELINUX_POLICY_DIGEST: [u8; 32] = [
+    0x01, 0xa2, 0xe2, 0x16, 0xac, 0xe3, 0x76, 0x34, 0xfd, 0x90, 0x1c, 0x5e, 0x8b, 0x66, 0xa0, 0xb7,
+    0x7a, 0xcb, 0x9d, 0xd8, 0x07, 0xb9, 0x94, 0x59, 0x8b, 0x01, 0xee, 0x5b, 0x21, 0xd5, 0xea, 0xbb,
+];
+
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELINUX_POLICY_SHA256: &str =
+    "01a2e216ace37634fd901c5e8b66a0b77acb9dd807b994598b01ee5b21d5eabb";
+
+#[cfg(any(test, flux_android_qualification))]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR: ReviewedPolicySelectorLiteral =
+    ReviewedPolicySelectorLiteral {
+        android_product: "samsung/dm3qzhx/dm3q",
+        android_build: "samsung/dm3qzhx/dm3q:16/BP4A.251205.006/S9180ZHU7FZDP:user/release-keys",
+        vendor_build: "samsung/dm3qzhx/dm3q:13/TP1A.220624.014/S9180ZHU7FZDP:user/release-keys",
+        security_patch: "2026-04-05",
+        kernel_build: "5.15.211-Qkernel-g9dd1df9bde #2 SMP PREEMPT Wed Jul 22 14:51:28 UTC 2026",
+        selinux_policy: ReviewedArtifactLiteral {
+            digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELINUX_POLICY_DIGEST,
+            size: 2_825_262,
+        },
+        netd: ReviewedArtifactLiteral {
+            digest: [
+                0xaa, 0xbe, 0xab, 0x17, 0x6d, 0x29, 0xa2, 0xef, 0x29, 0x9f, 0xdd, 0xa3, 0x18, 0x00,
+                0x2d, 0xde, 0x25, 0x3e, 0x00, 0xa1, 0xc4, 0x75, 0x06, 0xf3, 0xaf, 0x06, 0x2b, 0x73,
+                0x11, 0x2d, 0x0a, 0xdd,
+            ],
+            size: 1_033_576,
+        },
+        connectivity: ReviewedArtifactLiteral {
+            digest: [
+                0xec, 0x4d, 0x66, 0xb2, 0x4a, 0x5d, 0x7b, 0xf2, 0xfe, 0x4f, 0x0a, 0xff, 0x22, 0x04,
+                0xdd, 0x51, 0xb4, 0x04, 0x97, 0x48, 0x56, 0x9e, 0xe0, 0xc0, 0xbc, 0x85, 0x01, 0x04,
+                0xbf, 0x0d, 0x75, 0x49,
+            ],
+            size: 36_827_136,
+        },
+    };
+
+#[cfg(any(test, flux_android_qualification))]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST: [u8; 32] = [
+    0x5d, 0x16, 0xd0, 0x7a, 0x27, 0xc5, 0x88, 0x09, 0x37, 0x61, 0x34, 0x9d, 0xf1, 0x73, 0x68, 0xba,
+    0xa4, 0xad, 0x6c, 0x07, 0x4c, 0xde, 0x41, 0x75, 0xb2, 0xdf, 0xf7, 0x04, 0xb5, 0xbf, 0x0b, 0xe0,
+];
+
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ADDRESSES:
+    &[ReviewedCanaryFacilityAddressLiteral] = &[
+    ReviewedCanaryFacilityAddressLiteral {
+        daemon_ipv4: Ipv4Addr::new(9, 254, 254, 252),
+        peer_ipv4: Ipv4Addr::new(9, 254, 254, 253),
+        daemon_ipv6: Some(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0xf110)),
+        peer_ipv6: Some(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0xf111)),
+    },
+    ReviewedCanaryFacilityAddressLiteral {
+        daemon_ipv4: Ipv4Addr::new(11, 254, 254, 252),
+        peer_ipv4: Ipv4Addr::new(11, 254, 254, 253),
+        daemon_ipv6: Some(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0xf120)),
+        peer_ipv6: Some(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0xf121)),
+    },
+];
+
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_PORTS:
+    &[ReviewedCanaryResponderPortsLiteral] = &[
+    ReviewedCanaryResponderPortsLiteral {
+        tcp_echo: 41_801,
+        udp_echo: 41_802,
+        dns: 41_803,
+    },
+    ReviewedCanaryResponderPortsLiteral {
+        tcp_echo: 42_801,
+        udp_echo: 42_802,
+        dns: 42_803,
+    },
+];
+
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES:
+    &[ReviewedOrderedLateWriteLiteral] = &[
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv4,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 1,
+        selector_digest: [
+            0x82, 0xa5, 0x86, 0xae, 0x7f, 0xff, 0x9e, 0xb6, 0x85, 0x1b, 0x8b, 0xbd, 0x49, 0xf0,
+            0xcd, 0x05, 0xe9, 0xd2, 0xd4, 0xbc, 0x52, 0x13, 0x2b, 0x50, 0xb8, 0x85, 0xef, 0xf3,
+            0xa1, 0xa8, 0x01, 0x82,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv4,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 2,
+        selector_digest: [
+            0xe2, 0x05, 0x16, 0x68, 0x58, 0xaa, 0x4a, 0x9e, 0x57, 0x9f, 0x38, 0xac, 0x77, 0x88,
+            0x1a, 0x29, 0xb5, 0x7d, 0x36, 0x38, 0xfd, 0x77, 0xd4, 0x11, 0x6e, 0xb8, 0xc3, 0x01,
+            0x68, 0xa2, 0xa3, 0x2e,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv4,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 3,
+        selector_digest: [
+            0x2e, 0x8d, 0x6a, 0xb0, 0xeb, 0xd9, 0x73, 0x94, 0xc3, 0xfe, 0xbf, 0x44, 0xaa, 0x64,
+            0xd6, 0x8b, 0xe0, 0xd1, 0xf1, 0x3a, 0x1d, 0xaf, 0x03, 0x99, 0x9e, 0x1a, 0xfe, 0x52,
+            0x83, 0xaf, 0x61, 0x8f,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv4,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 4,
+        selector_digest: [
+            0xfc, 0xcc, 0xdc, 0x24, 0x61, 0x30, 0xaa, 0x42, 0x87, 0x6b, 0xd4, 0x5e, 0x4f, 0xa0,
+            0x5d, 0xa5, 0xe2, 0x1a, 0xc2, 0x9a, 0xe5, 0x5e, 0x32, 0xf3, 0xb1, 0x22, 0x91, 0xb0,
+            0x4d, 0xaa, 0x16, 0xb1,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 1,
+        selector_digest: [
+            0xe0, 0x59, 0x93, 0x19, 0xcc, 0xc1, 0x66, 0xc1, 0x77, 0x53, 0xe7, 0x2b, 0xa3, 0x07,
+            0xaf, 0xa8, 0xaf, 0xe6, 0xfe, 0x22, 0x96, 0x9b, 0x7a, 0x65, 0x95, 0xba, 0x13, 0x46,
+            0x52, 0xc6, 0x82, 0xf7,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 2,
+        selector_digest: [
+            0x22, 0x6b, 0x06, 0xcb, 0x9b, 0x1a, 0xe2, 0x56, 0xab, 0x3c, 0x0b, 0xa3, 0xac, 0x7d,
+            0xb1, 0x42, 0xba, 0x3f, 0x00, 0x9b, 0x9b, 0xdb, 0xe0, 0x62, 0xa9, 0x62, 0x43, 0x03,
+            0x2c, 0x24, 0x52, 0xbb,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 3,
+        selector_digest: [
+            0xa0, 0xe7, 0x62, 0x96, 0xb3, 0xed, 0xf4, 0xbe, 0x1c, 0xab, 0xc2, 0x16, 0x75, 0xbf,
+            0xb2, 0x56, 0x38, 0x5a, 0x06, 0xa0, 0x6e, 0x89, 0xc0, 0x2e, 0x12, 0xee, 0x3b, 0x31,
+            0x71, 0x70, 0xf1, 0xe5,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 4,
+        selector_digest: [
+            0xbd, 0x04, 0x6c, 0x13, 0x1c, 0x7f, 0xe2, 0x1e, 0xf1, 0x18, 0x22, 0xe0, 0x12, 0xbc,
+            0xf6, 0xa0, 0x09, 0x76, 0xa8, 0x9a, 0xf1, 0xdf, 0x36, 0x65, 0xa5, 0x07, 0x70, 0x93,
+            0xf8, 0x35, 0x3e, 0x43,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::Xtables,
+        family: NetworkAddressFamily::Ipv4,
+        hook: FwmarkNetfilterBuiltinHook::Postrouting,
+        child_chain: "qcom_qos_reset_POSTROUTING",
+        hook_ordinal: 4,
+        rule_ordinal: 1,
+        selector_digest: [
+            0x87, 0x72, 0xb6, 0xc4, 0x24, 0x43, 0x11, 0x78, 0xf8, 0xb1, 0x9e, 0x34, 0x5e, 0x4e,
+            0xbf, 0x97, 0x38, 0x20, 0x3e, 0xd3, 0x7f, 0x0a, 0x39, 0x42, 0xa9, 0xa3, 0x01, 0x21,
+            0xee, 0x86, 0x46, 0x81,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
+        mask: u32::MAX,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::Xtables,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Postrouting,
+        child_chain: "qcom_qos_reset_POSTROUTING",
+        hook_ordinal: 4,
+        rule_ordinal: 1,
+        selector_digest: [
+            0x8e, 0x10, 0x06, 0x5a, 0x93, 0xf8, 0xa5, 0x0a, 0x07, 0xcd, 0x7f, 0x0a, 0xc6, 0x3a,
+            0x3d, 0x1a, 0x58, 0xbd, 0x29, 0x47, 0x07, 0x70, 0x41, 0x54, 0x40, 0x57, 0x7e, 0xe5,
+            0x91, 0xf0, 0xfc, 0x48,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
+        mask: u32::MAX,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::Xtables,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Postrouting,
+        child_chain: "qcom_qos_reset_POSTROUTING",
+        hook_ordinal: 4,
+        rule_ordinal: 2,
+        selector_digest: [
+            0x1b, 0x45, 0xda, 0x63, 0x0d, 0x26, 0xc1, 0x21, 0xa8, 0xf8, 0x8c, 0x77, 0x24, 0x78,
+            0xa9, 0x7f, 0x0f, 0xcb, 0xb2, 0x4a, 0xa0, 0xba, 0x8f, 0x4b, 0x7f, 0x9b, 0x6b, 0x07,
+            0xc3, 0xe0, 0xfa, 0x48,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
+        mask: u32::MAX,
+    },
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::Xtables,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Postrouting,
+        child_chain: "qcom_qos_reset_POSTROUTING",
+        hook_ordinal: 4,
+        rule_ordinal: 3,
+        selector_digest: [
+            0xe2, 0x9e, 0x51, 0x6c, 0x49, 0xac, 0x16, 0xac, 0xbf, 0x0e, 0x4a, 0xc8, 0x74, 0x6e,
+            0x2c, 0xfd, 0x5c, 0x83, 0xe8, 0x1f, 0xe4, 0x89, 0x8b, 0x3f, 0xee, 0x77, 0xff, 0x6b,
+            0x1f, 0x28, 0xfa, 0xd9,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
+        mask: u32::MAX,
+    },
+];
+
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_EXACT_MARK_SENTINELS:
+    &[ReviewedExactMarkSentinelLiteral] = &[
+    ReviewedExactMarkSentinelLiteral {
+        family: NetworkAddressFamily::Ipv4,
+        child_chain: "bw_raw_PREROUTING",
+        hook_ordinal: 2,
+        rule_ordinal: 1,
+        selector_digest: [
+            0xd1, 0x7b, 0xaf, 0xab, 0x41, 0xe2, 0x67, 0xb3, 0x13, 0x67, 0xe9, 0xf9, 0x8f, 0x4a,
+            0x2a, 0x13, 0x62, 0x8e, 0xd6, 0xc6, 0xe4, 0x2d, 0x05, 0x90, 0x03, 0xc2, 0xe6, 0x1b,
+            0x1d, 0x6d, 0xda, 0xec,
+        ],
+        sentinel: 0xdeadc1a7,
+    },
+    ReviewedExactMarkSentinelLiteral {
+        family: NetworkAddressFamily::Ipv6,
+        child_chain: "bw_raw_PREROUTING",
+        hook_ordinal: 2,
+        rule_ordinal: 1,
+        selector_digest: [
+            0x4c, 0x77, 0x4d, 0x28, 0xef, 0x9f, 0x17, 0x7c, 0x30, 0x05, 0xe0, 0xf9, 0x09, 0x37,
+            0xff, 0x06, 0x2a, 0x04, 0x78, 0xbd, 0xd5, 0xf3, 0x2a, 0xa7, 0x65, 0x60, 0x6e, 0x6e,
+            0xbb, 0xfb, 0xd2, 0x92,
+        ],
+        sentinel: 0xdeadc1a7,
+    },
+];
+
+// This entry is deliberately absent from every ordinary build, including `--all-features`.
+// Only the repository-owned non-shipping Android qualification command adds the custom cfg.
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1:
+    ReviewedAndroidPlatformProfileCatalogEntry = ReviewedAndroidPlatformProfileCatalogEntry {
+    id: "samsung-sm-s9180-fzdp-qkernel-20260722-qualification-v1",
+    selector: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR,
+    mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
+        assurance_class: AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        name: "Samsung SM-S9180 FZDP Qkernel qualification",
+        revision: 2,
+        artifact_digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST,
+        netd_source_profile: AndroidNetdSourceProfile::AospNetd20250324,
+        candidate_mask: 0x0c00_0000,
+        proxy_value: 0x0400_0000,
+        bypass_value: 0x0800_0000,
+        planes: FwmarkPlaneSet::ALL.bits(),
+        ordered_late_writes: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES,
+        exact_mark_sentinels:
+            SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_EXACT_MARK_SENTINELS,
+    }),
+    capture_path: Some(ReviewedCapturePathEvidenceLiteral {
+        revision: 1,
+        artifact_digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST,
+        qualifications: CapturePathQualifications::new(
+            CapturePathQualificationState::Unqualified,
+            CapturePathQualificationState::Qualified,
+            CapturePathQualificationState::Unqualified,
+        ),
+    }),
+    canary_facility: Some(ReviewedCanaryFacilityPolicyLiteral {
+        revision: 2,
+        artifact_digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST,
+        daemon_veth_name: "fxq11d0",
+        peer_veth_name: "fxq11p0",
+        probe_uid: 2_900_001,
+        probe_gid: 2_900_001,
+        engine_uid: 2_900_002,
+        engine_gid: 2_900_002,
+        addresses: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ADDRESSES,
+        ports: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_PORTS,
+        netd_source_profile: AndroidNetdSourceProfile::AospNetd20250324,
+        early_uid_lookup_priorities: &[1, 2],
+        proxy_rule_priority: 30_997,
+        peer_rule_priority: 30_998,
+        proxy_capture_table: 20_253,
+        peer_table: 20_254,
+        peer_return_table: 254,
+        rule_protocol: 186,
+        route_protocol: 186,
+        route_metric: 1_031,
+        proxy_mark_value: 0x0400_0000,
+        proxy_mark_mask: 0x0c00_0000,
+    }),
+};
+
 /// Exact reviewed Android platform profiles compiled into production selection.
+#[cfg(not(flux_android_qualification))]
 const REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG: &[ReviewedAndroidPlatformProfileCatalogEntry] =
     &[SAMSUNG_SM_S9180_FZDP_PLATFORM_PROFILE_V1];
+
+/// Exact reviewed profiles compiled only into the non-shipping qualification executable.
+#[cfg(flux_android_qualification)]
+const REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG: &[ReviewedAndroidPlatformProfileCatalogEntry] = &[
+    SAMSUNG_SM_S9180_FZDP_PLATFORM_PROFILE_V1,
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1,
+];
 
 /// First-stage exact selection against the compiled Android platform-profile catalog.
 ///
@@ -132,11 +495,30 @@ impl ReviewedAndroidPlatformProfileSelection {
             .map(|policy| policy.assurance_class)
     }
 
+    /// Returns the exact candidate named by the selected reviewed policy.
+    ///
+    /// This is configuration identity only. It does not replace topology binding or the complete
+    /// live census required to construct planning authority.
+    #[must_use]
+    pub fn mark_candidate(&self) -> Option<FwmarkCandidate> {
+        self.matched
+            .as_ref()
+            .and_then(|matched| matched.mark_policy.as_ref())
+            .map(|policy| policy.candidate)
+    }
+
     #[must_use]
     pub fn has_reviewed_capture_path_evidence(&self) -> bool {
         self.matched
             .as_ref()
             .is_some_and(|matched| matched.capture_path.is_some())
+    }
+
+    #[must_use]
+    pub fn canary_facility_policy(&self) -> Option<&ReviewedCanaryFacilityPolicy> {
+        self.matched
+            .as_ref()
+            .and_then(|matched| matched.canary_facility.as_ref())
     }
 
     /// Projects the Capture Path aspect without binding the independent mark-policy aspect.
@@ -179,12 +561,13 @@ impl ReviewedAndroidPlatformProfileSelection {
             return Ok(BoundReviewedAndroidPlatformProfile {
                 mark_policy: AndroidMarkDevicePolicy::generic_aosp(),
                 capture_path_evidence,
+                canary_facility_policy: None,
             });
         };
         let mark_policy = match matched.mark_policy {
             Some(policy) => AndroidMarkDevicePolicy::device_qualified_cooperative(
                 policy.assurance_class,
-                matched.catalog_entry,
+                matched.catalog_entry.clone(),
                 policy.name,
                 policy.revision,
                 policy.artifact_digest,
@@ -195,6 +578,7 @@ impl ReviewedAndroidPlatformProfileSelection {
                 self.network_namespace,
                 policy.planes,
                 policy.ordered_late_writes,
+                policy.exact_mark_sentinels,
             )
             .map_err(ReviewedAndroidPlatformProfileCatalogError::MarkPolicyConstruction)?,
             None => AndroidMarkDevicePolicy::generic_aosp(),
@@ -203,6 +587,7 @@ impl ReviewedAndroidPlatformProfileSelection {
         Ok(BoundReviewedAndroidPlatformProfile {
             mark_policy,
             capture_path_evidence,
+            canary_facility_policy: matched.canary_facility,
         })
     }
 }
@@ -212,6 +597,7 @@ impl ReviewedAndroidPlatformProfileSelection {
 pub struct BoundReviewedAndroidPlatformProfile {
     mark_policy: AndroidMarkDevicePolicy,
     capture_path_evidence: CapturePathBehavioralEvidence,
+    canary_facility_policy: Option<ReviewedCanaryFacilityPolicy>,
 }
 
 impl BoundReviewedAndroidPlatformProfile {
@@ -226,8 +612,28 @@ impl BoundReviewedAndroidPlatformProfile {
     }
 
     #[must_use]
+    pub const fn canary_facility_policy(&self) -> Option<&ReviewedCanaryFacilityPolicy> {
+        self.canary_facility_policy.as_ref()
+    }
+
+    #[must_use]
     pub fn into_parts(self) -> (AndroidMarkDevicePolicy, CapturePathBehavioralEvidence) {
         (self.mark_policy, self.capture_path_evidence)
+    }
+
+    #[must_use]
+    pub fn into_parts_with_canary(
+        self,
+    ) -> (
+        AndroidMarkDevicePolicy,
+        CapturePathBehavioralEvidence,
+        Option<ReviewedCanaryFacilityPolicy>,
+    ) {
+        (
+            self.mark_policy,
+            self.capture_path_evidence,
+            self.canary_facility_policy,
+        )
     }
 }
 
@@ -236,6 +642,7 @@ struct MatchedReviewedAndroidPlatformProfile {
     catalog_entry: ReviewedPolicyCatalogEntryId,
     mark_policy: Option<ValidatedAndroidMarkPolicy>,
     capture_path: Option<ValidatedCapturePathEvidence>,
+    canary_facility: Option<ReviewedCanaryFacilityPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,9 +663,11 @@ pub enum ReviewedAndroidPlatformProfileCatalogField {
     MarkCandidate,
     MarkPlanes,
     MarkOrderedLateWrites,
+    MarkExactMarkSentinels,
     CapturePathEvidenceRevision,
     CapturePathEvidenceArtifactDigest,
     CapturePathQualifications,
+    CanaryFacilityPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,6 +783,85 @@ pub fn select_reviewed_android_platform_profile(
     )
 }
 
+/// Returns only the stable selector field names that differ from the non-shipping qualification
+/// profile. This diagnostic surface is absent from ordinary builds and conveys no policy grant or
+/// observed identity value.
+#[cfg(flux_android_qualification)]
+#[must_use]
+pub fn qualification_selector_mismatch_fields(
+    capability_profile: &CapabilityProfile,
+) -> Vec<&'static str> {
+    let Some(device_identity) = capability_profile.device_identity().verified() else {
+        return vec!["device_identity"];
+    };
+    let expected = &SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR;
+    let mut mismatches = Vec::with_capacity(11);
+    if device_identity.android_product().as_str() != expected.android_product {
+        mismatches.push("android_product");
+    }
+    if device_identity.android_build().as_str() != expected.android_build {
+        mismatches.push("android_build");
+    }
+    if device_identity.vendor_build().as_str() != expected.vendor_build {
+        mismatches.push("vendor_build");
+    }
+    if device_identity.security_patch().as_str() != expected.security_patch {
+        mismatches.push("security_patch");
+    }
+    if device_identity.kernel_build().as_str() != expected.kernel_build {
+        mismatches.push("kernel_build");
+    }
+    if qualification_hex_digest(device_identity.selinux_policy().digest())
+        != SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELINUX_POLICY_SHA256
+    {
+        mismatches.push("selinux_policy_sha256");
+    }
+    if device_identity.selinux_policy().size() != expected.selinux_policy.size {
+        mismatches.push("selinux_policy_size");
+    }
+    if qualification_digest_differs(
+        device_identity.netd().digest().as_bytes(),
+        &expected.netd.digest,
+    ) {
+        mismatches.push("netd_sha256");
+    }
+    if device_identity.netd().size() != expected.netd.size {
+        mismatches.push("netd_size");
+    }
+    if qualification_digest_differs(
+        device_identity.connectivity().digest().as_bytes(),
+        &expected.connectivity.digest,
+    ) {
+        mismatches.push("connectivity_sha256");
+    }
+    if device_identity.connectivity().size() != expected.connectivity.size {
+        mismatches.push("connectivity_size");
+    }
+    mismatches
+}
+
+#[cfg(flux_android_qualification)]
+fn qualification_digest_differs(actual: &[u8; 32], expected: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    let mut index = 0;
+    while index < actual.len() {
+        difference |= actual[index] ^ expected[index];
+        index += 1;
+    }
+    difference != 0
+}
+
+#[cfg(flux_android_qualification)]
+fn qualification_hex_digest(digest: Sha256Digest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 fn select_from_catalog(
     entries: &[ReviewedAndroidPlatformProfileCatalogEntry],
     capability_profile: &CapabilityProfile,
@@ -409,6 +897,7 @@ fn select_from_catalog(
             catalog_entry: entry.catalog_entry,
             mark_policy: entry.mark_policy,
             capture_path: entry.capture_path,
+            canary_facility: entry.canary_facility,
         });
 
     Ok(ReviewedAndroidPlatformProfileSelection {
@@ -462,7 +951,10 @@ fn validate_entry(
     let catalog_entry = ReviewedPolicyCatalogEntryId::new(entry.id)
         .map_err(|_| invalid(ReviewedAndroidPlatformProfileCatalogField::CatalogEntryId))?;
     let selector = validate_selector(&entry.selector, index)?;
-    if entry.mark_policy.is_none() && entry.capture_path.is_none() {
+    if entry.mark_policy.is_none()
+        && entry.capture_path.is_none()
+        && entry.canary_facility.is_none()
+    {
         return Err(invalid(
             ReviewedAndroidPlatformProfileCatalogField::ProfileAspects,
         ));
@@ -475,12 +967,26 @@ fn validate_entry(
         .capture_path
         .map(|evidence| validate_capture_path_evidence(evidence, index))
         .transpose()?;
+    let canary_facility = entry
+        .canary_facility
+        .map(|policy| validate_canary_facility_policy(policy, index, catalog_entry.clone()))
+        .transpose()?;
+    if let (Some(mark), Some(canary)) = (&mark_policy, &canary_facility)
+        && (mark.netd_source_profile != canary.netd_source_profile()
+            || mark.candidate.proxy_value() != canary.rpdb().proxy_mark_value()
+            || mark.candidate.mask() != canary.rpdb().proxy_mark_mask().get())
+    {
+        return Err(invalid(
+            ReviewedAndroidPlatformProfileCatalogField::CanaryFacilityPolicy,
+        ));
+    }
 
     Ok(ValidatedCatalogEntry {
         catalog_entry,
         selector,
         mark_policy,
         capture_path,
+        canary_facility,
     })
 }
 
@@ -526,6 +1032,10 @@ fn validate_mark_policy(
             ReviewedAndroidPlatformProfileCatalogField::MarkOrderedLateWrites,
         ));
     }
+    let exact_mark_sentinels =
+        validate_exact_mark_sentinels(policy.exact_mark_sentinels, candidate).map_err(|_| {
+            invalid(ReviewedAndroidPlatformProfileCatalogField::MarkExactMarkSentinels)
+        })?;
 
     Ok(ValidatedAndroidMarkPolicy {
         assurance_class: policy.assurance_class,
@@ -536,6 +1046,7 @@ fn validate_mark_policy(
         netd_source_profile: policy.netd_source_profile,
         planes,
         ordered_late_writes,
+        exact_mark_sentinels,
     })
 }
 
@@ -562,6 +1073,53 @@ fn validate_capture_path_evidence(
         artifact_digest,
         qualifications: evidence.qualifications,
     })
+}
+
+fn validate_canary_facility_policy(
+    policy: ReviewedCanaryFacilityPolicyLiteral,
+    index: usize,
+    catalog_entry: ReviewedPolicyCatalogEntryId,
+) -> Result<ReviewedCanaryFacilityPolicy, ReviewedAndroidPlatformProfileCatalogError> {
+    let invalid = || ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
+        index,
+        field: ReviewedAndroidPlatformProfileCatalogField::CanaryFacilityPolicy,
+    };
+    ReviewedCanaryFacilityPolicy::reviewed(
+        catalog_entry,
+        policy.revision,
+        policy.artifact_digest,
+        policy.daemon_veth_name.as_bytes(),
+        policy.peer_veth_name.as_bytes(),
+        policy.probe_uid,
+        policy.probe_gid,
+        policy.engine_uid,
+        policy.engine_gid,
+        policy.addresses.iter().map(|candidate| {
+            (
+                candidate.daemon_ipv4,
+                candidate.peer_ipv4,
+                candidate.daemon_ipv6,
+                candidate.peer_ipv6,
+            )
+        }),
+        policy
+            .ports
+            .iter()
+            .map(|candidate| (candidate.tcp_echo, candidate.udp_echo, candidate.dns)),
+        policy.netd_source_profile,
+        policy.early_uid_lookup_priorities.iter().copied(),
+        policy.proxy_rule_priority,
+        policy.peer_rule_priority,
+        policy.proxy_capture_table,
+        policy.peer_table,
+        policy.peer_return_table,
+        policy.rule_protocol,
+        policy.route_protocol,
+        policy.route_metric,
+        policy.proxy_mark_value,
+        policy.proxy_mark_mask,
+    )
+    .map_err(|_| invalid())
 }
 
 fn validate_selector(
@@ -609,6 +1167,7 @@ struct ValidatedCatalogEntry {
     selector: ReviewedPolicySelector,
     mark_policy: Option<ValidatedAndroidMarkPolicy>,
     capture_path: Option<ValidatedCapturePathEvidence>,
+    canary_facility: Option<ReviewedCanaryFacilityPolicy>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -621,6 +1180,7 @@ struct ValidatedAndroidMarkPolicy {
     netd_source_profile: AndroidNetdSourceProfile,
     planes: FwmarkPlaneSet,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -654,6 +1214,7 @@ struct ReviewedAndroidPlatformProfileCatalogEntry {
     selector: ReviewedPolicySelectorLiteral,
     mark_policy: Option<ReviewedAndroidMarkPolicyLiteral>,
     capture_path: Option<ReviewedCapturePathEvidenceLiteral>,
+    canary_facility: Option<ReviewedCanaryFacilityPolicyLiteral>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -668,6 +1229,7 @@ struct ReviewedAndroidMarkPolicyLiteral {
     bypass_value: u32,
     planes: u8,
     ordered_late_writes: &'static [ReviewedOrderedLateWriteLiteral],
+    exact_mark_sentinels: &'static [ReviewedExactMarkSentinelLiteral],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -675,6 +1237,47 @@ struct ReviewedCapturePathEvidenceLiteral {
     revision: u64,
     artifact_digest: [u8; 32],
     qualifications: CapturePathQualifications,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedCanaryFacilityAddressLiteral {
+    daemon_ipv4: Ipv4Addr,
+    peer_ipv4: Ipv4Addr,
+    daemon_ipv6: Option<Ipv6Addr>,
+    peer_ipv6: Option<Ipv6Addr>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedCanaryResponderPortsLiteral {
+    tcp_echo: u16,
+    udp_echo: u16,
+    dns: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedCanaryFacilityPolicyLiteral {
+    revision: u64,
+    artifact_digest: [u8; 32],
+    daemon_veth_name: &'static str,
+    peer_veth_name: &'static str,
+    probe_uid: u32,
+    probe_gid: u32,
+    engine_uid: u32,
+    engine_gid: u32,
+    addresses: &'static [ReviewedCanaryFacilityAddressLiteral],
+    ports: &'static [ReviewedCanaryResponderPortsLiteral],
+    netd_source_profile: AndroidNetdSourceProfile,
+    early_uid_lookup_priorities: &'static [u32],
+    proxy_rule_priority: u32,
+    peer_rule_priority: u32,
+    proxy_capture_table: u32,
+    peer_table: u32,
+    peer_return_table: u32,
+    rule_protocol: u8,
+    route_protocol: u8,
+    route_metric: u32,
+    proxy_mark_value: u32,
+    proxy_mark_mask: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -688,6 +1291,16 @@ struct ReviewedOrderedLateWriteLiteral {
     selector_digest: [u8; 32],
     placement: FwmarkOrderedLateWritePlacement,
     mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReviewedExactMarkSentinelLiteral {
+    family: NetworkAddressFamily,
+    child_chain: &'static str,
+    hook_ordinal: u32,
+    rule_ordinal: u32,
+    selector_digest: [u8; 32],
+    sentinel: u32,
 }
 
 fn validate_ordered_late_writes(
@@ -719,6 +1332,44 @@ fn validate_ordered_late_writes(
             literal.placement,
             false,
             false,
+            false,
+        )
+        .map_err(|_| ())?;
+        if records.contains(&record) {
+            return Err(());
+        }
+        records.push(record);
+    }
+    records.sort_unstable();
+    Ok(records.into_boxed_slice())
+}
+
+fn validate_exact_mark_sentinels(
+    literals: &[ReviewedExactMarkSentinelLiteral],
+    candidate: FwmarkCandidate,
+) -> Result<Box<[FwmarkExactMarkSentinelQualification]>, ()> {
+    if literals.len() > crate::android_mark_authority::MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS {
+        return Err(());
+    }
+    let mark_use = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::Xtables,
+        crate::android_mark_authority::FwmarkPlane::Packet,
+        FwmarkUseOperation::PredicateRead,
+        u32::MAX,
+    )
+    .map_err(|_| ())?;
+    let mut records = Vec::with_capacity(literals.len());
+    for literal in literals {
+        let record = FwmarkExactMarkSentinelQualification::new(
+            mark_use,
+            literal.sentinel,
+            candidate,
+            literal.family,
+            FwmarkNetfilterBuiltinHook::Prerouting,
+            FwmarkNetfilterChainName::new(literal.child_chain).map_err(|_| ())?,
+            literal.hook_ordinal,
+            literal.rule_ordinal,
+            FwmarkPacketSelectorDigest::new(literal.selector_digest).map_err(|_| ())?,
             false,
         )
         .map_err(|_| ())?;

@@ -35,6 +35,78 @@ fn fixture(family: NetworkAddressFamily, input_ordinal_padding: &str) -> String 
     )
 }
 
+fn with_exact_mark_sentinel(ruleset: String, rule: &str) -> String {
+    ruleset.replace(
+        "*mangle\n",
+        &format!(
+            "*raw\n:PREROUTING ACCEPT [0:0]\n:bw_raw_PREROUTING - [0:0]\n-A PREROUTING -j bw_raw_PREROUTING\n-A bw_raw_PREROUTING {rule}\nCOMMIT\n*mangle\n"
+        ),
+    )
+}
+
+fn sentinel_candidate() -> FwmarkCandidate {
+    FwmarkCandidate::new(0x0c00_0000, 0x0400_0000, 0x0800_0000).unwrap()
+}
+
+#[test]
+fn exact_full_mark_sentinel_is_qualified_only_when_both_role_values_are_disjoint() {
+    let ipv4 = with_exact_mark_sentinel(
+        fixture(NetworkAddressFamily::Ipv4, ""),
+        "-m mark --mark 0xdeadc1a7 -j DROP",
+    );
+    let ipv6 = with_exact_mark_sentinel(
+        fixture(NetworkAddressFamily::Ipv6, ""),
+        "-m mark --mark 0xdeadc1a7 -j DROP",
+    );
+    let observation = observe_android_xtables_fwmarks(
+        ipv4.as_bytes(),
+        ipv6.as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        sentinel_candidate(),
+    )
+    .expect("exact role-disjoint sentinels");
+
+    assert_eq!(observation.exact_mark_sentinels().len(), 2);
+    assert!(observation.exact_mark_sentinels().iter().all(|record| {
+        record.sentinel() == 0xdeadc1a7
+            && record.hook() == FwmarkNetfilterBuiltinHook::Prerouting
+            && record.child_chain().as_str() == "bw_raw_PREROUTING"
+    }));
+
+    let role_overlapping = with_exact_mark_sentinel(
+        fixture(NetworkAddressFamily::Ipv4, ""),
+        "-m mark --mark 0xd6adc1a7 -j DROP",
+    );
+    let observation = observe_android_xtables_fwmarks(
+        role_overlapping.as_bytes(),
+        ipv6.as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        sentinel_candidate(),
+    )
+    .expect("role-overlapping predicate remains ordinary conflict evidence");
+    assert!(observation.exact_mark_sentinels().is_empty());
+}
+
+#[test]
+fn inverted_or_non_prerouting_sentinel_keeps_the_canonical_mark_use_unqualified() {
+    let inverted = with_exact_mark_sentinel(
+        fixture(NetworkAddressFamily::Ipv4, ""),
+        "-m mark ! --mark 0xdeadc1a7 -j DROP",
+    );
+    let exact = with_exact_mark_sentinel(
+        fixture(NetworkAddressFamily::Ipv6, ""),
+        "-m mark --mark 0xdeadc1a7 -j DROP",
+    );
+    let observation = observe_android_xtables_fwmarks(
+        inverted.as_bytes(),
+        exact.as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        sentinel_candidate(),
+    )
+    .expect("inverted predicate is modeled but cannot qualify");
+    assert!(observation.exact_mark_sentinels().is_empty());
+}
+
 #[test]
 fn complete_dual_stack_projection_separates_sources_and_qualifies_exact_writes() {
     let observation = observe_android_xtables_fwmarks(

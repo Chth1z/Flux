@@ -109,6 +109,27 @@ fn comprehensive_ipv4_rule_is_canonical_and_preserves_selection_facts() {
 }
 
 #[test]
+fn asymmetric_port_range_decodes_native_order_uapi_words() {
+    let start = 0x1234_u16;
+    let end = 0x5678_u16;
+    let encoded = range_u16(start, end);
+    assert_eq!(
+        encoded,
+        [start.to_ne_bytes(), end.to_ne_bytes()].concat(),
+        "fib_rule_port_range stores native-order __u16 fields"
+    );
+
+    let decoded = decoder(true)
+        .decode_datagram(&basic_rule(&[(FRA_DPORT_RANGE, &encoded)]))
+        .expect("native-order asymmetric destination-port range");
+    let range = decoded.events()[0]
+        .record()
+        .destination_port_range()
+        .expect("destination-port range");
+    assert_eq!((range.start(), range.end()), (start, end));
+}
+
+#[test]
 fn ipv6_goto_delete_preserves_raw_tclass_and_masks_prefix_host_bits() {
     let destination = Ipv6Addr::new(0x2001, 0xdb8, 7, 0, 0, 0, 0, 0x1234).octets();
     let priority = 100_u32.to_ne_bytes();

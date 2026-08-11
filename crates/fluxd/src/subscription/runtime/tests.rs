@@ -131,6 +131,46 @@ fn test_desired_state() -> FluxConfig {
         .expect("packaged test Desired State")
 }
 
+#[test]
+fn subscription_identity_is_bound_to_root_or_the_reviewed_engine_role() {
+    let root = test_desired_state();
+    assert!(require_supported_identity(&root, None).is_ok());
+
+    let reviewed = ReviewedEngineCredentials {
+        uid: 20_002,
+        gid: 20_002,
+    };
+    let reviewed_config = FluxConfig::parse(
+        &include_str!("../../../../../conf/flux.toml")
+            .replace("runtime_uid = 0", "runtime_uid = 20002")
+            .replace("runtime_gid = 0", "runtime_gid = 20002"),
+    )
+    .expect("reviewed credential fixture");
+    assert!(require_supported_identity(&reviewed_config, Some(reviewed)).is_ok());
+
+    for (uid, gid) in [(20_003, 20_002), (20_002, 20_003), (0, 0)] {
+        let drifted = FluxConfig::parse(
+            &include_str!("../../../../../conf/flux.toml")
+                .replace("runtime_uid = 0", &format!("runtime_uid = {uid}"))
+                .replace("runtime_gid = 0", &format!("runtime_gid = {gid}")),
+        )
+        .expect("drifted credential fixture");
+        assert_eq!(
+            require_supported_identity(&drifted, Some(reviewed))
+                .expect_err("credential drift must remain fail-closed")
+                .kind(),
+            SubscriptionRefreshErrorKind::UnsupportedIdentity
+        );
+    }
+
+    assert_eq!(
+        require_supported_identity(&reviewed_config, None)
+            .expect_err("non-root identity without reviewed authority must fail closed")
+            .kind(),
+        SubscriptionRefreshErrorKind::UnsupportedIdentity
+    );
+}
+
 #[cfg(target_os = "linux")]
 struct RuntimeFixtureFetch {
     subscription: Vec<u8>,

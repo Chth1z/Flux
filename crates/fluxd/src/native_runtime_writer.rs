@@ -153,18 +153,11 @@ struct RetainedNativeGeneration<T> {
 pub(crate) struct RetainedCanaryFacilityAuthority {
     facility: crate::functional_canary::CanaryFacilityIdentity,
     peer_network_namespace: NetworkNamespaceIdentity,
+    _cleanup: Option<crate::native_canary_facility::NativeCanaryFacilityCleanup>,
     peer_network_namespace_handle: File,
 }
 
-#[allow(
-    dead_code,
-    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-)]
 impl RetainedCanaryFacilityAuthority {
-    #[allow(
-        dead_code,
-        reason = "the production facility creator is intentionally not connected in this checkpoint"
-    )]
     pub(crate) fn new(
         facility: crate::functional_canary::CanaryFacilityIdentity,
         peer_network_namespace: NetworkNamespaceIdentity,
@@ -178,7 +171,23 @@ impl RetainedCanaryFacilityAuthority {
             facility,
             peer_network_namespace,
             peer_network_namespace_handle,
+            _cleanup: None,
         })
+    }
+
+    pub(crate) fn new_with_cleanup(
+        facility: crate::functional_canary::CanaryFacilityIdentity,
+        peer_network_namespace: NetworkNamespaceIdentity,
+        peer_network_namespace_handle: File,
+        cleanup: crate::native_canary_facility::NativeCanaryFacilityCleanup,
+    ) -> Result<Self, NativeCoordinatorWriterError> {
+        let mut authority = Self::new(
+            facility,
+            peer_network_namespace,
+            peer_network_namespace_handle,
+        )?;
+        authority._cleanup = Some(cleanup);
+        Ok(authority)
     }
 
     fn matches_request(&self, request: &CanaryAttemptRequest) -> bool {
@@ -330,10 +339,6 @@ impl RetainedCanaryFacilityAuthority {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(
-    dead_code,
-    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-)]
 struct PeerFacilityObservation {
     namespace: NetworkNamespaceIdentity,
     inventory: std::sync::Arc<flux_core::NetworkInventory>,
@@ -343,10 +348,6 @@ struct PeerFacilityObservation {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(
-    dead_code,
-    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-)]
 fn collect_inventory_until(
     deadline: Instant,
 ) -> Result<
@@ -385,10 +386,6 @@ fn collect_inventory_until(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(
-    dead_code,
-    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-)]
 fn current_network_namespace_identity()
 -> Result<NetworkNamespaceIdentity, NativeCoordinatorWriterError> {
     let metadata = std::fs::metadata("/proc/thread-self/ns/net").map_err(|source| {
@@ -405,10 +402,6 @@ fn current_network_namespace_identity()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(
-    dead_code,
-    reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-)]
 fn collect_peer_facility_observation(
     namespace_handle: File,
     expected_namespace: NetworkNamespaceIdentity,
@@ -642,10 +635,6 @@ where
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "the production facility creator is intentionally not connected in this checkpoint"
-    )]
     pub(crate) fn with_retained_canary_facility_authority(
         mut self,
         authority: RetainedCanaryFacilityAuthority,
@@ -711,10 +700,6 @@ where
             ))
     }
 
-    #[allow(
-        dead_code,
-        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-    )]
     fn active_canary_attempt(
         &self,
         generation: &PreparedGeneration,
@@ -894,6 +879,7 @@ pub(crate) fn compose_native_runtime<S, F>(
     source_factory: F,
     maintenance_interval: Duration,
     functional_canary: RuntimeFunctionalCanary,
+    retained_canary_facility_authority: Option<RetainedCanaryFacilityAuthority>,
 ) -> Result<
     RuntimeCoordinator<NativeCoordinatorWriter<NativeXtablesCaptureConverger, S>, EngineSupervisor>,
     NativeCoordinatorWriterError,
@@ -907,6 +893,7 @@ where
         source_factory,
         maintenance_interval,
         functional_canary,
+        retained_canary_facility_authority,
         EngineSupervisor::new(),
     )
 }
@@ -930,6 +917,7 @@ where
         source_factory,
         maintenance_interval,
         functional_canary,
+        None,
         EngineSupervisor::for_linux_native_composition_test(),
     )
 }
@@ -940,6 +928,7 @@ fn compose_native_runtime_with_engine<S, F>(
     source_factory: F,
     maintenance_interval: Duration,
     functional_canary: RuntimeFunctionalCanary,
+    retained_canary_facility_authority: Option<RetainedCanaryFacilityAuthority>,
     engine: EngineSupervisor,
 ) -> Result<
     RuntimeCoordinator<NativeCoordinatorWriter<NativeXtablesCaptureConverger, S>, EngineSupervisor>,
@@ -950,6 +939,10 @@ where
     F: FnOnce() -> S,
 {
     let writer = NativeCoordinatorWriter::recover_then_accept_source(convergence, source_factory)?;
+    let writer = match retained_canary_facility_authority {
+        Some(authority) => writer.with_retained_canary_facility_authority(authority)?,
+        None => writer,
+    };
     Ok(RuntimeCoordinator::with_dependencies(
         writer,
         engine,
@@ -1486,10 +1479,6 @@ pub(crate) enum NativeCoordinatorWriterError {
         operation: &'static str,
         source: io::Error,
     },
-    #[allow(
-        dead_code,
-        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-    )]
     Observation {
         operation: &'static str,
         source: Box<dyn Error + Send + Sync>,
@@ -1516,10 +1505,6 @@ impl NativeCoordinatorWriterError {
         Self::Authority { operation, source }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the packaged attempt remains uninhabited until its evidence transaction lands"
-    )]
     fn observation(operation: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
         Self::Observation {
             operation,

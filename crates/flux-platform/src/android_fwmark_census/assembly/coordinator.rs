@@ -10,9 +10,13 @@ use flux_core::{
     CompleteFwmarkCensus, CompleteFwmarkCensusError, FwmarkCandidate,
     FwmarkCensusCollectorEvidenceDigest, FwmarkCensusCollectorRevision, NetworkInventory,
     NetworkNamespaceIdentity, ObservationKind, ReviewedAndroidPlatformProfileCatalogError,
-    ReviewedPolicyCatalogEntryId, RpdbFwmarkCensusFragmentError,
-    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
-    project_android_net_id_fwmark_census_fragment, project_rpdb_fwmark_census_fragment,
+    ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
+    ReviewedCanaryRpdbClassificationError, ReviewedPolicyCatalogEntryId,
+    RpdbFwmarkCensusFragmentError, assess_android_tproxy_topology_scope,
+    authorize_android_mark_planning, classify_android_rpdb,
+    classify_android_rpdb_with_reviewed_canary_facility,
+    project_android_net_id_fwmark_census_fragment,
+    project_rpdb_fwmark_census_fragment_with_classification,
     select_reviewed_android_platform_profile,
 };
 use sha2::{Digest, Sha256};
@@ -164,6 +168,10 @@ pub struct AndroidFwmarkCensusCoordinatorRequest {
     netd_source_profile: AndroidNetdSourceProfile,
     candidate: FwmarkCandidate,
     topology_scope: AndroidTproxyTopologyScopeRequest,
+    reviewed_canary_facility: Option<(
+        ReviewedCanaryFacilityPolicy,
+        ReviewedCanaryFacilitySelection,
+    )>,
     stage_bound: Duration,
 }
 
@@ -186,8 +194,19 @@ impl AndroidFwmarkCensusCoordinatorRequest {
             netd_source_profile,
             candidate,
             topology_scope,
+            reviewed_canary_facility: None,
             stage_bound,
         })
+    }
+
+    #[must_use]
+    pub fn with_reviewed_canary_facility(
+        mut self,
+        policy: ReviewedCanaryFacilityPolicy,
+        selection: ReviewedCanaryFacilitySelection,
+    ) -> Self {
+        self.reviewed_canary_facility = Some((policy, selection));
+        self
     }
 
     #[must_use]
@@ -434,6 +453,8 @@ pub enum AndroidFwmarkCensusCoordinatorError<E> {
         selected: AndroidNetdSourceProfile,
         requested: AndroidNetdSourceProfile,
     },
+    ReviewedCanaryFacilityPolicyMismatch,
+    ReviewedCanaryRpdb(Box<ReviewedCanaryRpdbClassificationError>),
     Topology(Box<AndroidTproxyTopologyScopeError>),
     Rpdb(RpdbFwmarkCensusFragmentError),
     Assembly(AndroidFwmarkCensusAssemblyError),
@@ -452,6 +473,8 @@ impl<E> AndroidFwmarkCensusCoordinatorError<E> {
             | Self::ExternalSnapshotDrift { .. }
             | Self::PlatformProfile(_)
             | Self::SelectedNetdSourceProfileMismatch { .. }
+            | Self::ReviewedCanaryFacilityPolicyMismatch
+            | Self::ReviewedCanaryRpdb(_)
             | Self::Topology(_)
             | Self::Rpdb(_)
             | Self::Assembly(_)
@@ -512,6 +535,12 @@ impl<E: fmt::Display> fmt::Display for AndroidFwmarkCensusCoordinatorError<E> {
                 formatter,
                 "reviewed Android policy selected {selected:?} but the census request uses {requested:?}"
             ),
+            Self::ReviewedCanaryFacilityPolicyMismatch => formatter.write_str(
+                "Android fwmark census can exempt canary peer rules only under the exact selected facility policy",
+            ),
+            Self::ReviewedCanaryRpdb(error) => {
+                write!(formatter, "reviewed canary RPDB classification failed: {error}")
+            }
             Self::Topology(error) => write!(formatter, "Android topology assessment failed: {error}"),
             Self::Rpdb(error) => write!(formatter, "Android RPDB census projection failed: {error}"),
             Self::Assembly(error) => write!(formatter, "Android fwmark census assembly failed: {error}"),
@@ -530,6 +559,7 @@ impl<E: Error + 'static> Error for AndroidFwmarkCensusCoordinatorError<E> {
         match self {
             Self::Collection { source, .. } => Some(source),
             Self::PlatformProfile(error) => Some(error),
+            Self::ReviewedCanaryRpdb(error) => Some(error.as_ref()),
             Self::Topology(error) => Some(error.as_ref()),
             Self::Rpdb(error) => Some(error),
             Self::Assembly(error) => Some(error),
@@ -539,7 +569,8 @@ impl<E: Error + 'static> Error for AndroidFwmarkCensusCoordinatorError<E> {
             | Self::CapabilityDrift { .. }
             | Self::ExternalSnapshotContextMismatch { .. }
             | Self::ExternalSnapshotDrift { .. }
-            | Self::SelectedNetdSourceProfileMismatch { .. } => None,
+            | Self::SelectedNetdSourceProfileMismatch { .. }
+            | Self::ReviewedCanaryFacilityPolicyMismatch => None,
         }
     }
 }
@@ -581,6 +612,11 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
                 requested: request.netd_source_profile,
             },
         );
+    }
+    if let Some((requested_policy, _)) = request.reviewed_canary_facility.as_ref()
+        && platform_profile_selection.canary_facility_policy() != Some(requested_policy)
+    {
+        return Err(AndroidFwmarkCensusCoordinatorError::ReviewedCanaryFacilityPolicyMismatch);
     }
 
     let external_before = source
@@ -657,7 +693,18 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         });
     }
 
-    let classification = classify_android_rpdb(&inventory, request.netd_source_profile);
+    let classification = match request.reviewed_canary_facility.as_ref() {
+        Some((policy, selection)) => classify_android_rpdb_with_reviewed_canary_facility(
+            &inventory,
+            request.netd_source_profile,
+            policy,
+            *selection,
+        )
+        .map_err(|error| {
+            AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(Box::new(error))
+        })?,
+        None => classify_android_rpdb(&inventory, request.netd_source_profile),
+    };
     let topology_scope =
         assess_android_tproxy_topology_scope(&inventory, &classification, &request.topology_scope)
             .map_err(|error| AndroidFwmarkCensusCoordinatorError::Topology(Box::new(error)))?;
@@ -666,7 +713,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         .map_err(AndroidFwmarkCensusCoordinatorError::PlatformProfile)?;
     let (device_policy, capture_path_evidence) = bound_platform_profile.into_parts();
     let android_net_id = project_android_net_id_fwmark_census_fragment(request.netd_source_profile);
-    let rpdb = project_rpdb_fwmark_census_fragment(&inventory)
+    let rpdb = project_rpdb_fwmark_census_fragment_with_classification(&inventory, &classification)
         .map_err(AndroidFwmarkCensusCoordinatorError::Rpdb)?;
     let projection = assemble_android_fwmark_census_projection(
         &inventory,
@@ -779,6 +826,7 @@ fn complete_census_from_projection(
         cells,
         mark_uses,
         ordered_late_writes,
+        exact_mark_sentinels,
         metrics: _,
         digest,
     } = projection;
@@ -795,6 +843,7 @@ fn complete_census_from_projection(
         cells,
         mark_uses.into_vec(),
         ordered_late_writes.into_vec(),
+        exact_mark_sentinels.into_vec(),
     )
 }
 

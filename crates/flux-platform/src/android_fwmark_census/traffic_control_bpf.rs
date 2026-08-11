@@ -88,6 +88,8 @@ const BPF_LINK_TYPE_NETKIT: u32 = 13;
 const BPF_LINK_TYPE_SOCKMAP: u32 = 14;
 
 const SAMSUNG_SM_S9180_FZDP_POLICY_V1: &str = "samsung-sm-s9180-fzdp-observed-behavior-v1";
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_POLICY_V1: &str =
+    "samsung-sm-s9180-fzdp-qkernel-20260722-qualification-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReviewedNoFwmarkProgram {
@@ -801,7 +803,10 @@ fn update_review_profile_digest(digest: &mut Sha256, reviewed_policy_id: Option<
 
 fn reviewed_no_fwmark_catalog(reviewed_policy_id: Option<&str>) -> &[ReviewedNoFwmarkProgram] {
     match reviewed_policy_id {
-        Some(SAMSUNG_SM_S9180_FZDP_POLICY_V1) => SAMSUNG_SM_S9180_FZDP_NO_FWMARK_PROGRAMS_V1,
+        Some(SAMSUNG_SM_S9180_FZDP_POLICY_V1)
+        | Some(SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_POLICY_V1) => {
+            SAMSUNG_SM_S9180_FZDP_NO_FWMARK_PROGRAMS_V1
+        }
         _ => &[],
     }
 }
@@ -1685,6 +1690,13 @@ mod tests {
     fn samsung_no_fwmark_catalog_is_exact_and_policy_bound() {
         let catalog = reviewed_no_fwmark_catalog(Some(SAMSUNG_SM_S9180_FZDP_POLICY_V1));
         assert_eq!(catalog.len(), 19);
+        assert_eq!(
+            reviewed_no_fwmark_catalog(Some(
+                SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_POLICY_V1
+            )),
+            catalog,
+            "the exact reobserved artifacts remain bound to the non-shipping profile"
+        );
         assert!(reviewed_no_fwmark_catalog(None).is_empty());
         assert!(reviewed_no_fwmark_catalog(Some("unknown-policy")).is_empty());
         for (index, entry) in catalog.iter().enumerate() {

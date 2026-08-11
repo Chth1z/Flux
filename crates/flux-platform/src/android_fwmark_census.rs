@@ -3,8 +3,9 @@ use std::error::Error;
 use std::fmt;
 
 use flux_core::{
-    AndroidNetdSourceProfile, FwmarkCandidate, FwmarkEvidenceSource, FwmarkNetfilterBuiltinHook,
-    FwmarkNetfilterChainName, FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
+    AndroidNetdSourceProfile, FwmarkCandidate, FwmarkEvidenceSource,
+    FwmarkExactMarkSentinelQualification, FwmarkNetfilterBuiltinHook, FwmarkNetfilterChainName,
+    FwmarkOrderedLateWritePlacement, FwmarkOrderedLateWriteQualification,
     FwmarkPacketSelectorDigest, FwmarkPlane, FwmarkUseOperation, FwmarkUseRecord,
     NetworkAddressFamily,
 };
@@ -108,6 +109,7 @@ pub struct AndroidXtablesFwmarkObservation {
     legacy_mark_uses: Box<[FwmarkUseRecord]>,
     transfer_mark_uses: Box<[FwmarkUseRecord]>,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
     table_count: usize,
     chain_count: usize,
     rule_count: usize,
@@ -143,6 +145,11 @@ impl AndroidXtablesFwmarkObservation {
     #[must_use]
     pub fn ordered_late_writes(&self) -> &[FwmarkOrderedLateWriteQualification] {
         &self.ordered_late_writes
+    }
+
+    #[must_use]
+    pub fn exact_mark_sentinels(&self) -> &[FwmarkExactMarkSentinelQualification] {
+        &self.exact_mark_sentinels
     }
 
     #[must_use]
@@ -265,15 +272,31 @@ pub fn observe_android_xtables_fwmarks(
     let mut legacy_mark_uses = BTreeSet::new();
     let mut transfer_mark_uses = BTreeSet::new();
     let mut ordered_late_writes = Vec::new();
+    let mut exact_mark_sentinels = Vec::new();
+    let mut unqualified_exact_mark_sentinel_uses = BTreeSet::new();
 
     for ruleset in [&ipv4, &ipv6] {
         let evidence = ruleset.observe_marks(profile, candidate)?;
         legacy_mark_uses.extend(evidence.legacy_mark_uses);
         transfer_mark_uses.extend(evidence.transfer_mark_uses);
         ordered_late_writes.extend(evidence.ordered_late_writes);
+        exact_mark_sentinels.extend(evidence.exact_mark_sentinels);
+        unqualified_exact_mark_sentinel_uses.extend(evidence.unqualified_exact_mark_sentinel_uses);
     }
     ordered_late_writes.sort_unstable();
     if ordered_late_writes
+        .windows(2)
+        .any(|records| records[0] == records[1])
+    {
+        return Err(AndroidXtablesFwmarkObservationError::global(
+            NetworkAddressFamily::Ipv4,
+            AndroidXtablesFwmarkObservationErrorKind::InvalidOrderedWrite,
+        ));
+    }
+    exact_mark_sentinels.sort_unstable();
+    exact_mark_sentinels
+        .retain(|record| !unqualified_exact_mark_sentinel_uses.contains(&record.mark_use()));
+    if exact_mark_sentinels
         .windows(2)
         .any(|records| records[0] == records[1])
     {
@@ -303,6 +326,7 @@ pub fn observe_android_xtables_fwmarks(
         legacy_mark_uses: legacy_mark_uses.into_iter().collect(),
         transfer_mark_uses: transfer_mark_uses.into_iter().collect(),
         ordered_late_writes: ordered_late_writes.into_boxed_slice(),
+        exact_mark_sentinels: exact_mark_sentinels.into_boxed_slice(),
         table_count,
         chain_count,
         rule_count,
@@ -696,11 +720,15 @@ struct FamilyMarkEvidence {
     legacy_mark_uses: BTreeSet<FwmarkUseRecord>,
     transfer_mark_uses: BTreeSet<FwmarkUseRecord>,
     ordered_late_writes: Vec<FwmarkOrderedLateWriteQualification>,
+    exact_mark_sentinels: Vec<FwmarkExactMarkSentinelQualification>,
+    unqualified_exact_mark_sentinel_uses: BTreeSet<FwmarkUseRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuleMarkSemantics {
     packet_predicate_mask: Option<u32>,
+    packet_predicate_value: Option<u32>,
+    packet_predicate_inverted: bool,
     packet_write_mask: Option<u32>,
     packet_write_value: Option<u32>,
     target: Option<MarkTarget>,
@@ -728,6 +756,16 @@ struct WriteOccurrence<'a> {
     qualification: Option<FwmarkOrderedLateWriteQualification>,
 }
 
+struct PredicateOccurrence<'a> {
+    mark_use: FwmarkUseRecord,
+    table: &'a str,
+    chain: &'a str,
+    rule: &'a ParsedRule,
+    sentinel: u32,
+    inverted: bool,
+    qualification: Option<FwmarkExactMarkSentinelQualification>,
+}
+
 impl ParsedRuleset {
     fn observe_marks(
         &self,
@@ -736,6 +774,7 @@ impl ParsedRuleset {
     ) -> Result<FamilyMarkEvidence, AndroidXtablesFwmarkObservationError> {
         let mut evidence = FamilyMarkEvidence::default();
         let mut writes = Vec::new();
+        let mut predicates = Vec::new();
         let mut transfer_overlap = false;
 
         for (table_name, table) in &self.tables {
@@ -743,14 +782,26 @@ impl ParsedRuleset {
                 for rule in rules {
                     let parsed = self.rule_mark_semantics(rule)?;
                     if let Some(mask) = parsed.packet_predicate_mask {
-                        evidence.legacy_mark_uses.insert(mark_use(
+                        let use_record = mark_use(
                             FwmarkEvidenceSource::Xtables,
                             FwmarkPlane::Packet,
                             FwmarkUseOperation::PredicateRead,
                             mask,
                             self.family,
                             rule.line,
-                        )?);
+                        )?;
+                        evidence.legacy_mark_uses.insert(use_record);
+                        if let Some(sentinel) = parsed.packet_predicate_value {
+                            predicates.push(PredicateOccurrence {
+                                mark_use: use_record,
+                                table: table_name,
+                                chain,
+                                rule,
+                                sentinel,
+                                inverted: parsed.packet_predicate_inverted,
+                                qualification: None,
+                            });
+                        }
                     }
                     let transfers = self.rule_transfer_semantics(rule)?;
                     transfer_overlap |= transfers
@@ -815,6 +866,13 @@ impl ParsedRuleset {
                 };
         }
 
+        for occurrence in &mut predicates {
+            if occurrence.mark_use.mask() & candidate.mask() == 0 {
+                continue;
+            }
+            occurrence.qualification = self.qualify_exact_mark_sentinel(occurrence, candidate)?;
+        }
+
         let mut by_mark_use: BTreeMap<FwmarkUseRecord, Vec<&WriteOccurrence<'_>>> = BTreeMap::new();
         for occurrence in &writes {
             if occurrence.mark_use.mask() & candidate.mask() != 0 {
@@ -834,6 +892,33 @@ impl ParsedRuleset {
                         .iter()
                         .filter_map(|occurrence| occurrence.qualification.clone()),
                 );
+            }
+        }
+
+        let mut predicates_by_mark_use: BTreeMap<FwmarkUseRecord, Vec<&PredicateOccurrence<'_>>> =
+            BTreeMap::new();
+        for occurrence in &predicates {
+            if occurrence.mark_use.mask() & candidate.mask() != 0 {
+                predicates_by_mark_use
+                    .entry(occurrence.mark_use)
+                    .or_default()
+                    .push(occurrence);
+            }
+        }
+        for occurrences in predicates_by_mark_use.values() {
+            if occurrences
+                .iter()
+                .all(|occurrence| occurrence.qualification.is_some())
+            {
+                evidence.exact_mark_sentinels.extend(
+                    occurrences
+                        .iter()
+                        .filter_map(|occurrence| occurrence.qualification.clone()),
+                );
+            } else if let Some(occurrence) = occurrences.first() {
+                evidence
+                    .unqualified_exact_mark_sentinel_uses
+                    .insert(occurrence.mark_use);
             }
         }
         Ok(evidence)
@@ -860,6 +945,8 @@ impl ParsedRuleset {
         let target = targets.first().map(String::as_str);
         validate_mark_option_context(tokens, &modules, target, self.family, rule.line)?;
         let mut packet_predicate_mask = None;
+        let mut packet_predicate_value = None;
+        let mut packet_predicate_inverted = false;
         for (index, token) in tokens.iter().enumerate() {
             if token.as_ref() != "--mark" {
                 continue;
@@ -879,7 +966,7 @@ impl ParsedRuleset {
                     AndroidXtablesFwmarkObservationErrorKind::UnknownMarkSemantics,
                 ));
             }
-            let (_, mask) = parse_mark_pair(value, u32::MAX).ok_or_else(|| {
+            let (mark_value, mask) = parse_mark_pair(value, u32::MAX).ok_or_else(|| {
                 self.error_at(
                     rule.line,
                     AndroidXtablesFwmarkObservationErrorKind::InvalidMarkValue,
@@ -892,6 +979,8 @@ impl ParsedRuleset {
                         AndroidXtablesFwmarkObservationErrorKind::UnknownMarkSemantics,
                     )
                 })?;
+                packet_predicate_value = Some(mark_value);
+                packet_predicate_inverted = index > 0 && tokens[index - 1].as_ref() == "!";
             }
         }
 
@@ -931,6 +1020,8 @@ impl ParsedRuleset {
 
         Ok(RuleMarkSemantics {
             packet_predicate_mask,
+            packet_predicate_value,
+            packet_predicate_inverted,
             packet_write_mask,
             packet_write_value,
             target: mark_target,
@@ -1125,6 +1216,7 @@ impl ParsedRuleset {
             return Ok(None);
         }
         let builtin = match hook {
+            FwmarkNetfilterBuiltinHook::Prerouting => return Ok(None),
             FwmarkNetfilterBuiltinHook::Input => "INPUT",
             FwmarkNetfilterBuiltinHook::Postrouting => "POSTROUTING",
         };
@@ -1186,6 +1278,71 @@ impl ParsedRuleset {
             false,
             false,
             false,
+        )
+        .map_err(|_| {
+            self.error_at(
+                occurrence.rule.line,
+                AndroidXtablesFwmarkObservationErrorKind::InvalidOrderedWrite,
+            )
+        })?;
+        Ok(Some(record))
+    }
+
+    fn qualify_exact_mark_sentinel(
+        &self,
+        occurrence: &PredicateOccurrence<'_>,
+        candidate: FwmarkCandidate,
+    ) -> Result<Option<FwmarkExactMarkSentinelQualification>, AndroidXtablesFwmarkObservationError>
+    {
+        let projected = occurrence.sentinel & candidate.mask();
+        if occurrence.table != "raw"
+            || occurrence.mark_use.mask() != u32::MAX
+            || occurrence.inverted
+            || projected == 0
+            || projected == candidate.proxy_value()
+            || projected == candidate.bypass_value()
+        {
+            return Ok(None);
+        }
+        let references = self.references_to(occurrence.chain);
+        if references.len() != 1 {
+            return Ok(None);
+        }
+        let (table, chain, reference) = references[0];
+        if table != "raw"
+            || chain != "PREROUTING"
+            || !is_unconditional_jump(reference, occurrence.chain)
+        {
+            return Ok(None);
+        }
+        let selector_digest = ordered_selector_digest(
+            self.family,
+            FwmarkNetfilterBuiltinHook::Prerouting,
+            occurrence.chain,
+            reference,
+            occurrence.rule,
+        );
+        let record = FwmarkExactMarkSentinelQualification::new(
+            occurrence.mark_use,
+            occurrence.sentinel,
+            candidate,
+            self.family,
+            FwmarkNetfilterBuiltinHook::Prerouting,
+            FwmarkNetfilterChainName::new(occurrence.chain).map_err(|_| {
+                self.error_at(
+                    occurrence.rule.line,
+                    AndroidXtablesFwmarkObservationErrorKind::InvalidOrderedWrite,
+                )
+            })?,
+            reference.ordinal,
+            occurrence.rule.ordinal,
+            FwmarkPacketSelectorDigest::new(selector_digest).map_err(|_| {
+                self.error_at(
+                    occurrence.rule.line,
+                    AndroidXtablesFwmarkObservationErrorKind::InvalidOrderedWrite,
+                )
+            })?,
+            occurrence.inverted,
         )
         .map_err(|_| {
             self.error_at(
@@ -1625,6 +1782,7 @@ fn ordered_selector_digest(
     digest.update(XTABLES_ORDERED_SELECTOR_DIGEST_DOMAIN);
     digest.update([family_tag(family)]);
     digest.update([match hook {
+        FwmarkNetfilterBuiltinHook::Prerouting => 0,
         FwmarkNetfilterBuiltinHook::Input => 1,
         FwmarkNetfilterBuiltinHook::Postrouting => 2,
     }]);

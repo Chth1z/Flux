@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
+use crate::android_rpdb::AndroidRpdbClassificationReport;
 use crate::canonical_evidence::CanonicalEvidenceDigest;
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 use crate::network_route::NetworkAddressFamily;
@@ -282,6 +283,7 @@ pub struct FwmarkPartialAudit {
     candidate: FwmarkCandidate,
     outcome: FwmarkPartialAuditOutcome,
     sources: [FwmarkSourceStatus; FWMARK_SOURCE_STATUSES.len()],
+    excluded_reviewed_canary_rule_indices: Box<[usize]>,
     conflicts: Box<[FwmarkPartialConflict]>,
     omitted_conflicts: u32,
 }
@@ -322,6 +324,11 @@ impl FwmarkPartialAudit {
     }
 
     #[must_use]
+    pub fn excluded_reviewed_canary_rule_indices(&self) -> &[usize] {
+        &self.excluded_reviewed_canary_rule_indices
+    }
+
+    #[must_use]
     pub const fn omitted_conflicts(&self) -> u32 {
         self.omitted_conflicts
     }
@@ -343,6 +350,10 @@ impl FwmarkPartialAudit {
                 FwmarkEvidenceState::Opaque => 1,
                 FwmarkEvidenceState::Unavailable => 2,
             });
+        }
+        digest.usize(self.excluded_reviewed_canary_rule_indices.len());
+        for dump_index in &self.excluded_reviewed_canary_rule_indices {
+            digest.usize(*dump_index);
         }
         digest.usize(self.conflicts.len());
         for conflict in &self.conflicts {
@@ -481,6 +492,31 @@ pub fn audit_fwmark_candidate_partial(
     inventory: &NetworkInventory,
     candidate: FwmarkCandidate,
 ) -> FwmarkPartialAudit {
+    audit_fwmark_candidate_partial_with_exclusions(inventory, candidate, &[])
+}
+
+pub(crate) fn audit_fwmark_candidate_partial_with_classification(
+    inventory: &NetworkInventory,
+    classification: &AndroidRpdbClassificationReport,
+    candidate: FwmarkCandidate,
+) -> FwmarkPartialAudit {
+    debug_assert_eq!(
+        classification.audit().snapshot_id(),
+        inventory.snapshot_id()
+    );
+    debug_assert_eq!(classification.audit().epoch(), inventory.epoch());
+    audit_fwmark_candidate_partial_with_exclusions(
+        inventory,
+        candidate,
+        classification.reviewed_canary_rule_indices(),
+    )
+}
+
+fn audit_fwmark_candidate_partial_with_exclusions(
+    inventory: &NetworkInventory,
+    candidate: FwmarkCandidate,
+    excluded_reviewed_canary_rule_indices: &[usize],
+) -> FwmarkPartialAudit {
     let mut conflicts = Vec::new();
     let mut omitted_conflicts = 0_u32;
     let mut sources = FWMARK_SOURCE_STATUSES;
@@ -505,6 +541,12 @@ pub fn audit_fwmark_candidate_partial(
     }
 
     for (dump_index, rule) in inventory.rules().iter().enumerate() {
+        if excluded_reviewed_canary_rule_indices
+            .binary_search(&dump_index)
+            .is_ok()
+        {
+            continue;
+        }
         let Some(selector) = rule.fwmark() else {
             continue;
         };
@@ -536,6 +578,9 @@ pub fn audit_fwmark_candidate_partial(
         candidate,
         outcome,
         sources,
+        excluded_reviewed_canary_rule_indices: excluded_reviewed_canary_rule_indices
+            .to_vec()
+            .into_boxed_slice(),
         conflicts: conflicts.into_boxed_slice(),
         omitted_conflicts,
     }

@@ -15,6 +15,7 @@ use super::implementation::{
 use super::{
     ProcessCredentialMapKind, ProcessHandle, ProcessHandleError, ProcessHandleErrorKind,
     ProcessIdentity, ProcessNamespaceIdentity, ProcessUserNamespaceObservation,
+    current_process_id_map_contains,
 };
 
 const THREAD_HELPER_MODE: &str = "FLUX_PROCESS_HANDLE_THREAD_HELPER";
@@ -521,6 +522,24 @@ fn process_id_map_digest_is_canonical_domain_separated_and_exact() {
     )
     .expect("digest merged UID map");
     assert_ne!(split, merged, "exact extent shape remains digest-bound");
+}
+
+#[test]
+fn process_id_map_membership_uses_the_same_strict_inside_ranges() {
+    let map = b"0 1000 1\n20000 50000 3\n";
+    for mapped in [0, 20_000, 20_001, 20_002] {
+        assert!(
+            current_process_id_map_contains(map, ProcessCredentialMapKind::Uid, mapped)
+                .expect("parse canonical map")
+        );
+    }
+    for unmapped in [1, 19_999, 20_003, u32::MAX] {
+        assert!(
+            !current_process_id_map_contains(map, ProcessCredentialMapKind::Uid, unmapped)
+                .expect("parse canonical map")
+        );
+    }
+    assert!(current_process_id_map_contains(b"0 0 0\n", ProcessCredentialMapKind::Uid, 0).is_err());
 }
 
 #[test]

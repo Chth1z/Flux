@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use flux_core::{
     FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkNetfilterBuiltinHook,
     FwmarkOrderedLateWritePlacement, FwmarkPlane, FwmarkUseOperation,
-    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES,
-    MAX_ORDERED_LATE_PACKET_WRITES, NetworkAddressFamily,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS,
+    MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES, MAX_ORDERED_LATE_PACKET_WRITES, NetworkAddressFamily,
 };
 
 use super::{
@@ -14,7 +14,7 @@ use super::{
 };
 
 const REPORT_AUTHORITY: &str = "read_only_fwmark_census_diagnostic_no_mutation_authority";
-const REPORT_SCHEMA_VERSION: u8 = 1;
+const REPORT_SCHEMA_VERSION: u8 = 2;
 const PRIMARY_REPORT_BEGIN: &str = "FLUX_ANDROID_FWMARK_CENSUS_PRIMARY_BEGIN";
 const PRIMARY_REPORT_END: &str = "FLUX_ANDROID_FWMARK_CENSUS_PRIMARY_END";
 const CLEANUP_REPORT_BEGIN: &str = "FLUX_ANDROID_FWMARK_CENSUS_CLEANUP_BEGIN";
@@ -115,6 +115,11 @@ pub fn write_android_fwmark_census_projection_report(
     )?;
     writeln!(
         output,
+        "exact_mark_sentinel_count={}",
+        projection.exact_mark_sentinels().len()
+    )?;
+    writeln!(
+        output,
         "metric_count={ANDROID_FWMARK_CENSUS_PROJECTION_METRICS}"
     )?;
     for cell in projection.cells() {
@@ -150,6 +155,19 @@ pub fn write_android_fwmark_census_projection_report(
             ordered_write.rule_ordinal(),
             hex(ordered_write.selector_digest().as_bytes()),
             placement_label(ordered_write.placement())
+        )?;
+    }
+    for sentinel in projection.exact_mark_sentinels() {
+        writeln!(
+            output,
+            "exact_mark_sentinel={}|{}|{}|{}|{}|0x{:08x}|{}",
+            family_label(sentinel.family()),
+            hook_label(sentinel.hook()),
+            sentinel.child_chain().as_str(),
+            sentinel.hook_ordinal(),
+            sentinel.rule_ordinal(),
+            sentinel.sentinel(),
+            hex(sentinel.selector_digest().as_bytes()),
         )?;
     }
     for metric in projection.metrics() {
@@ -329,6 +347,17 @@ struct OrderedWriteKey {
     placement: usize,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExactMarkSentinelKey {
+    family: usize,
+    hook: usize,
+    chain: String,
+    hook_ordinal: u32,
+    rule_ordinal: u32,
+    sentinel: u32,
+    selector_digest: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedProjectionReport {
     cells: Vec<ParsedCoverageState>,
@@ -366,6 +395,12 @@ fn parse_projection_report(
         lines.next(),
         "ordered_write_count",
         MAX_ORDERED_LATE_PACKET_WRITES,
+        phase,
+    )?;
+    let exact_mark_sentinel_count = parse_count_line(
+        lines.next(),
+        "exact_mark_sentinel_count",
+        MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS,
         phase,
     )?;
     require_report_line(
@@ -428,6 +463,23 @@ fn parse_projection_report(
             ));
         }
         previous_ordered_write = Some(key);
+    }
+
+    let mut previous_exact_mark_sentinel = None;
+    for _ in 0..exact_mark_sentinel_count {
+        let line = lines
+            .next()
+            .ok_or_else(|| format!("{phase} fwmark census exact-mark sentinel is missing"))?;
+        let key = parse_exact_mark_sentinel(line, phase)?;
+        if previous_exact_mark_sentinel
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            return Err(format!(
+                "{phase} fwmark census exact-mark sentinels are not strictly canonical"
+            ));
+        }
+        previous_exact_mark_sentinel = Some(key);
     }
 
     let mut metrics = Vec::with_capacity(ALL_METRIC_KINDS.len());
@@ -594,6 +646,57 @@ fn parse_ordered_write(line: &str, phase: &str) -> Result<OrderedWriteKey, Strin
     })
 }
 
+fn parse_exact_mark_sentinel(line: &str, phase: &str) -> Result<ExactMarkSentinelKey, String> {
+    let value = line
+        .strip_prefix("exact_mark_sentinel=")
+        .ok_or_else(|| format!("{phase} fwmark census exact-mark sentinel is misplaced"))?;
+    let parts = value.split('|').collect::<Vec<_>>();
+    let [
+        family,
+        hook,
+        chain,
+        hook_ordinal,
+        rule_ordinal,
+        sentinel,
+        selector,
+    ] = parts.as_slice()
+    else {
+        return Err(format!(
+            "{phase} fwmark census exact-mark sentinel is malformed"
+        ));
+    };
+    let family = label_index(family, &["ipv4", "ipv6"], "exact-mark sentinel family")?;
+    let hook = label_index(hook, &["prerouting"], "exact-mark sentinel hook")?;
+    if chain.is_empty()
+        || chain.len() > MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES
+        || !chain.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'+')
+        })
+    {
+        return Err(format!(
+            "{phase} fwmark census exact-mark sentinel chain is invalid"
+        ));
+    }
+    let hook_ordinal = parse_nonzero_u32(hook_ordinal, "exact-mark sentinel hook ordinal")?;
+    let rule_ordinal = parse_nonzero_u32(rule_ordinal, "exact-mark sentinel rule ordinal")?;
+    let sentinel = parse_mask(sentinel, phase)?;
+    require_lower_sha256(selector, "exact-mark sentinel selector digest")?;
+    if selector.bytes().all(|byte| byte == b'0') {
+        return Err(format!(
+            "{phase} fwmark census exact-mark sentinel selector digest is zero"
+        ));
+    }
+    Ok(ExactMarkSentinelKey {
+        family,
+        hook,
+        chain: (*chain).to_owned(),
+        hook_ordinal,
+        rule_ordinal,
+        sentinel,
+        selector_digest: (*selector).to_owned(),
+    })
+}
+
 fn label_index(value: &str, labels: &[&str], field: &str) -> Result<usize, String> {
     labels
         .iter()
@@ -751,6 +854,7 @@ const fn family_label(family: NetworkAddressFamily) -> &'static str {
 
 const fn hook_label(hook: FwmarkNetfilterBuiltinHook) -> &'static str {
     match hook {
+        FwmarkNetfilterBuiltinHook::Prerouting => "prerouting",
         FwmarkNetfilterBuiltinHook::Input => "input",
         FwmarkNetfilterBuiltinHook::Postrouting => "postrouting",
     }
@@ -823,6 +927,7 @@ mod tests {
             cells,
             mark_uses: vec![mark_use].into_boxed_slice(),
             ordered_late_writes: vec![ordered_write].into_boxed_slice(),
+            exact_mark_sentinels: Box::new([]),
             metrics,
             digest: AndroidFwmarkCensusProjectionDigest([digest_byte; 32]),
         }

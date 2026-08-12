@@ -5,7 +5,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine_supervisor::EngineCapabilityProbeErrorKind;
+use flux_platform::internal::{ProcessDiagnostics, SingBoxProcessError};
+
+use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::intent_store::record_io;
 use crate::{EngineSpec, IntentStoreError, MAX_ENGINE_CONFIG_BYTES};
 
@@ -43,7 +45,14 @@ impl SubscriptionAssetAccess {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotValidationErrorKind {
     Artifact,
-    Process,
+    ProcessSpawn,
+    ProcessSpawnPermissionDenied,
+    ProcessCheckPermissionDenied,
+    ProcessCheckPathUnavailable,
+    ProcessCheckRejected,
+    ProcessCheckTimedOut,
+    ProcessCleanup,
+    ProcessOther,
     #[cfg(test)]
     Rejected,
 }
@@ -76,11 +85,63 @@ impl SubscriptionSnapshotValidator for SingBoxSnapshotValidator {
         }
         candidate
             .validate_configuration()
-            .map_err(|error| match error.kind() {
-                EngineCapabilityProbeErrorKind::Artifact => SnapshotValidationErrorKind::Artifact,
-                EngineCapabilityProbeErrorKind::Process => SnapshotValidationErrorKind::Process,
-            })
+            .map_err(|error| classify_validation_error(&error))
     }
+}
+
+fn classify_validation_error(error: &EngineCapabilityProbeError) -> SnapshotValidationErrorKind {
+    let EngineCapabilityProbeError::Process { source } = error else {
+        return SnapshotValidationErrorKind::Artifact;
+    };
+    match source {
+        SingBoxProcessError::Spawn { source, .. }
+            if matches!(source.raw_os_error(), Some(libc::EACCES | libc::EPERM)) =>
+        {
+            SnapshotValidationErrorKind::ProcessSpawnPermissionDenied
+        }
+        SingBoxProcessError::Spawn { .. } => SnapshotValidationErrorKind::ProcessSpawn,
+        SingBoxProcessError::CheckFailed { diagnostics, .. }
+            if diagnostics_contain(
+                diagnostics,
+                &["permission denied", "operation not permitted"],
+            ) =>
+        {
+            SnapshotValidationErrorKind::ProcessCheckPermissionDenied
+        }
+        SingBoxProcessError::CheckFailed { diagnostics, .. }
+            if diagnostics_contain(
+                diagnostics,
+                &["no such file or directory", "not a directory"],
+            ) =>
+        {
+            SnapshotValidationErrorKind::ProcessCheckPathUnavailable
+        }
+        SingBoxProcessError::CheckFailed { .. } => {
+            SnapshotValidationErrorKind::ProcessCheckRejected
+        }
+        SingBoxProcessError::CheckTimedOut { .. } => {
+            SnapshotValidationErrorKind::ProcessCheckTimedOut
+        }
+        SingBoxProcessError::ValidationGroupSignal { .. }
+        | SingBoxProcessError::ValidationGroupCleanupTimedOut { .. }
+        | SingBoxProcessError::ProbeOutputDrainTimedOut { .. } => {
+            SnapshotValidationErrorKind::ProcessCleanup
+        }
+        _ => SnapshotValidationErrorKind::ProcessOther,
+    }
+}
+
+fn diagnostics_contain(diagnostics: &ProcessDiagnostics, needles: &[&str]) -> bool {
+    [
+        &diagnostics.stdout_tail(),
+        &diagnostics.stderr_tail(),
+        &diagnostics.log_tail(),
+    ]
+    .into_iter()
+    .any(|text| {
+        let text = text.to_ascii_lowercase();
+        needles.iter().any(|needle| text.contains(needle))
+    })
 }
 
 #[derive(Clone, Eq, PartialEq)]

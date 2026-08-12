@@ -326,6 +326,66 @@ fn production_validator_runs_pinned_check_and_rejects_engine_identity_drift() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn production_validator_reports_only_a_fixed_permission_failure_class() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().expect("temporary directory");
+    let binary = directory.path().join("sing-box");
+    fs::write(
+        &binary,
+        b"#!/bin/sh\nprintf '%s\\n' 'open /private/provider/path: permission denied' >&2\nexit 1\n",
+    )
+    .expect("write rejecting fake Sing-Box");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .expect("make fake Sing-Box executable");
+    let base_config = directory.path().join("base.json");
+    fs::write(&base_config, b"{}\n").expect("base config");
+    let engine = EngineSpec::new(
+        SingBoxLaunchSpec {
+            binary,
+            config: base_config,
+            working_directory: directory.path().to_path_buf(),
+            log: directory.path().join("sing-box.log"),
+            privilege: SingBoxPrivilege::Inherit,
+            readiness: SingBoxReadiness::Listener {
+                port: NonZeroU16::new(1536).expect("nonzero fixture port"),
+            },
+            startup_timeout: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(1),
+        },
+        RestartPolicy::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .expect("fixture restart policy"),
+    )
+    .expect("inspect base engine");
+    let validator = SingBoxSnapshotValidator::from_engine(&engine);
+    let mut store =
+        SubscriptionSnapshotStore::new(directory.path().join("subscriptions"), validator)
+            .expect("subscription store");
+
+    let error = store
+        .publish(prepared(&store, "first", b"asset-first"))
+        .expect_err("permission rejection must block publication");
+
+    assert!(matches!(
+        error,
+        SubscriptionSnapshotStoreError::Validation {
+            kind: SnapshotValidationErrorKind::ProcessCheckPermissionDenied,
+            ..
+        }
+    ));
+    let display = error.to_string();
+    assert!(display.contains("ProcessCheckPermissionDenied"));
+    assert!(!display.contains("/private/provider/path"));
+}
+
 #[test]
 fn identical_validated_candidate_does_not_rotate_history() {
     let directory = tempdir().expect("temporary directory");

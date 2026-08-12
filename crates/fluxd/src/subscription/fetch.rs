@@ -12,10 +12,10 @@ use ureq::{Agent, Body};
 use url::Url;
 
 const FETCH_USER_AGENT: &str = concat!("Flux/", env!("CARGO_PKG_VERSION"), " (Android; Rust)");
-// XBoard/V2Board-style subscription endpoints use the v2rayNG token to select their
-// base64-URI response. Keep that compatibility identity scoped to subscription requests;
-// binary rule-set downloads retain Flux's own identity.
-const SUBSCRIPTION_USER_AGENT: &str = "v2rayNG/2.3.3";
+// The reviewed provider returns a complete Sing-Box JSON document for this token. Keep that
+// compatibility identity scoped to subscription requests; binary rule-set downloads retain
+// Flux's own identity.
+const SUBSCRIPTION_USER_AGENT: &str = "sing-box";
 const MAX_REDIRECTS: u32 = 5;
 const MAX_FETCH_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_FETCH_URL_BYTES: usize = 4_096;
@@ -549,13 +549,13 @@ mod tests {
     }
 
     #[test]
-    fn subscription_agent_uses_v2rayng_compatible_identity() {
+    fn subscription_agent_uses_reviewed_sing_box_identity() {
         let agent = build_agent(Duration::from_secs(11), FetchPurpose::Subscription);
         let user_agent = match agent.config().user_agent() {
             ureq::config::AutoHeaderValue::Provided(value) => value.as_str(),
             value => panic!("subscription User-Agent must be explicit, got {value:?}"),
         };
-        assert_eq!(user_agent, SUBSCRIPTION_USER_AGENT);
+        assert_eq!(user_agent, "sing-box");
         assert!(!user_agent.contains("Flux/"));
     }
 

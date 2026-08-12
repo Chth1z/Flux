@@ -130,8 +130,8 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR: ReviewedPol
 
 #[cfg(any(test, flux_android_qualification))]
 const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST: [u8; 32] = [
-    0x5d, 0x16, 0xd0, 0x7a, 0x27, 0xc5, 0x88, 0x09, 0x37, 0x61, 0x34, 0x9d, 0xf1, 0x73, 0x68, 0xba,
-    0xa4, 0xad, 0x6c, 0x07, 0x4c, 0xde, 0x41, 0x75, 0xb2, 0xdf, 0xf7, 0x04, 0xb5, 0xbf, 0x0b, 0xe0,
+    0xe0, 0xcd, 0xa7, 0xd2, 0x68, 0xc0, 0x97, 0x0c, 0x97, 0x1c, 0xf2, 0x2b, 0x95, 0xb4, 0x28, 0xfb,
+    0x5d, 0x83, 0xb2, 0xed, 0x8c, 0xa0, 0xbb, 0x14, 0x04, 0x6c, 0x9c, 0x40, 0x6f, 0x8b, 0x27, 0x6e,
 ];
 
 #[cfg(flux_android_qualification)]
@@ -411,7 +411,7 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1:
         ),
     }),
     canary_facility: Some(ReviewedCanaryFacilityPolicyLiteral {
-        revision: 2,
+        revision: 3,
         artifact_digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST,
         daemon_veth_name: "fxq11d0",
         peer_veth_name: "fxq11p0",
@@ -422,7 +422,7 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1:
         addresses: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ADDRESSES,
         ports: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_PORTS,
         netd_source_profile: AndroidNetdSourceProfile::AospNetd20250324,
-        early_uid_lookup_priorities: &[1, 2],
+        early_uid_lookup_priorities: &[],
         proxy_rule_priority: 30_997,
         peer_rule_priority: 30_998,
         proxy_capture_table: 20_253,

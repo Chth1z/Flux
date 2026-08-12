@@ -642,11 +642,8 @@ fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
     let facility = selection
         .canary_facility_policy()
         .expect("qualification facility policy");
-    assert_eq!(facility.revision().get(), 2);
-    assert_eq!(
-        facility.early_uid_lookup_priorities(),
-        [RulePriority::from_raw(1), RulePriority::from_raw(2)]
-    );
+    assert_eq!(facility.revision().get(), 3);
+    assert!(facility.early_uid_lookup_priorities().is_empty());
     assert_eq!(
         selection.mark_candidate(),
         Some(
@@ -665,6 +662,73 @@ fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
         .expect("qualification mark grant");
     assert_eq!(grant.ordered_late_writes().len(), 12);
     assert_eq!(grant.exact_mark_sentinels().len(), 2);
+}
+
+#[cfg(flux_android_qualification)]
+#[test]
+fn qualification_policy_keeps_retired_early_uid_rules_unknown() {
+    let namespace = namespace(20, 234_674);
+    let profile = capability_profile_for_selector(
+        namespace,
+        0x72,
+        SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR,
+    );
+    let selection = select_reviewed_android_platform_profile(&profile, namespace)
+        .expect("exact non-shipping qualification selector");
+    let policy = selection
+        .canary_facility_policy()
+        .expect("qualification facility policy");
+    let live_selection = policy
+        .bind_live_selection(
+            std::net::Ipv4Addr::new(9, 254, 254, 253),
+            Some(std::net::Ipv6Addr::new(
+                0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0xf111,
+            )),
+            std::num::NonZeroU16::new(41_801).expect("TCP port"),
+            std::num::NonZeroU16::new(41_802).expect("UDP port"),
+            std::num::NonZeroU16::new(41_803).expect("DNS port"),
+        )
+        .expect("reviewed live selection");
+    let mut rules =
+        android_13_rules_for_families([NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]);
+    rules.extend(reviewed_canary_rules(policy, live_selection));
+    rules.extend(reviewed_vendor_early_uid_lookup_rules());
+    rules.sort_by_key(NetworkRuleRecord::priority);
+    let inventory = inventory_with_rules(rules);
+    let classification = classify_android_rpdb_with_reviewed_canary_facility(
+        &inventory,
+        AndroidNetdSourceProfile::AospNetd20250324,
+        policy,
+        live_selection,
+    )
+    .expect("retired early UID rules remain ordinary unknowns");
+
+    assert_eq!(classification.unknown_rule_count(), 2);
+    assert_eq!(
+        classification
+            .roles()
+            .iter()
+            .filter(|role| **role == Some(crate::AndroidRpdbRuleRole::ReviewedEarlyUidLookup))
+            .count(),
+        0
+    );
+    let topology_request = AndroidTproxyTopologyScopeRequest::new(
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet,
+        [
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv4),
+            AndroidTproxyTrafficDomainRequest::residual_local_output(NetworkAddressFamily::Ipv6),
+        ],
+    )
+    .expect("dual-stack topology request");
+    let topology =
+        assess_android_tproxy_topology_scope(&inventory, &classification, &topology_request)
+            .expect("unknown retired rules remain topology evidence");
+    assert_eq!(
+        topology.structural_feasibility(),
+        crate::AndroidTproxyTopologyScopeStructuralFeasibility::IncompleteEvidence {
+            incomplete_anchor_count: 1,
+        }
+    );
 }
 
 #[cfg(flux_android_qualification)]

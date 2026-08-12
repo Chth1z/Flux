@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(flux_android_qualification)]
+use crate::android_mark_authority::FwmarkOrderedLateWriteQualification;
 use crate::android_mark_authority::{AndroidMarkDeviceGrantKind, FwmarkPlaneSet};
 use crate::android_netd::AndroidNetdSourceProfile;
 use crate::android_rpdb::{
@@ -61,6 +63,7 @@ const MARK_POLICY: ReviewedAndroidMarkPolicyLiteral = ReviewedAndroidMarkPolicyL
     bypass_value: BYPASS_VALUE,
     planes: FwmarkPlaneSet::ALL.bits(),
     ordered_late_writes: &[],
+    ordered_late_write_alternatives: &[],
     exact_mark_sentinels: &[],
 };
 const CAPTURE_PATH_EVIDENCE: ReviewedCapturePathEvidenceLiteral =
@@ -660,10 +663,35 @@ fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
         .mark_policy()
         .positive_grant()
         .expect("qualification mark grant");
-    assert_eq!(bound.mark_policy().revision().get(), 3);
+    assert_eq!(bound.mark_policy().revision().get(), 4);
     assert_eq!(grant.ordered_late_writes().len(), 10);
-    let mut live_projection = format!("ordered_count={}\n", grant.ordered_late_writes().len());
-    for record in grant.ordered_late_writes() {
+    assert_eq!(grant.ordered_late_write_alternatives().len(), 1);
+    assert_eq!(grant.ordered_late_write_alternatives()[0].len(), 12);
+    assert_eq!(
+        qualification_ordered_write_projection_digest(grant.ordered_late_writes()),
+        [
+            0xd0, 0x61, 0x2c, 0xb2, 0x9f, 0x59, 0x62, 0x75, 0xf9, 0x42, 0x10, 0xd7, 0x7a, 0x9d,
+            0x6a, 0x0b, 0x6a, 0xa4, 0x44, 0x4b, 0x85, 0xca, 0x26, 0xc3, 0xca, 0x56, 0x42, 0x07,
+            0x30, 0x0e, 0xec, 0xfd,
+        ]
+    );
+    assert_eq!(
+        qualification_ordered_write_projection_digest(&grant.ordered_late_write_alternatives()[0]),
+        [
+            0x17, 0x91, 0x2f, 0xee, 0x01, 0x26, 0xde, 0x69, 0xa0, 0x62, 0x5d, 0x7b, 0x00, 0xf4,
+            0x36, 0x01, 0x99, 0x99, 0xab, 0xd2, 0xf2, 0x45, 0x46, 0xf9, 0x03, 0x40, 0xc0, 0xa9,
+            0x26, 0x97, 0xbd, 0xd5,
+        ]
+    );
+    assert_eq!(grant.exact_mark_sentinels().len(), 2);
+}
+
+#[cfg(flux_android_qualification)]
+fn qualification_ordered_write_projection_digest(
+    records: &[FwmarkOrderedLateWriteQualification],
+) -> [u8; 32] {
+    let mut live_projection = format!("ordered_count={}\n", records.len());
+    for record in records {
         use std::fmt::Write as _;
         let selector = record
             .selector_digest()
@@ -687,15 +715,7 @@ fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
         )
         .expect("write in-memory qualification projection");
     }
-    assert_eq!(
-        Sha256::digest(live_projection.trim_end()).as_slice(),
-        &[
-            0xd0, 0x61, 0x2c, 0xb2, 0x9f, 0x59, 0x62, 0x75, 0xf9, 0x42, 0x10, 0xd7, 0x7a, 0x9d,
-            0x6a, 0x0b, 0x6a, 0xa4, 0x44, 0x4b, 0x85, 0xca, 0x26, 0xc3, 0xca, 0x56, 0x42, 0x07,
-            0x30, 0x0e, 0xec, 0xfd,
-        ]
-    );
-    assert_eq!(grant.exact_mark_sentinels().len(), 2);
+    Sha256::digest(live_projection.trim_end()).into()
 }
 
 #[cfg(flux_android_qualification)]

@@ -80,6 +80,7 @@ const SAMSUNG_SM_S9180_FZDP_PLATFORM_PROFILE_V1: ReviewedAndroidPlatformProfileC
             bypass_value: 0x0200_0000,
             planes: FwmarkPlaneSet::ALL.bits(),
             ordered_late_writes: &[],
+            ordered_late_write_alternatives: &[],
             exact_mark_sentinels: &[],
         }),
         // This exact device has reviewed mark behavior only. Capture Path authority remains absent
@@ -130,8 +131,8 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_SELECTOR: ReviewedPol
 
 #[cfg(any(test, flux_android_qualification))]
 const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST: [u8; 32] = [
-    0x3d, 0x0b, 0xed, 0x89, 0xbd, 0xee, 0xfa, 0x52, 0x70, 0x3b, 0x1f, 0x9c, 0xf9, 0x52, 0xd8, 0x4a,
-    0xd7, 0x81, 0x9e, 0x20, 0x73, 0xba, 0x05, 0x9c, 0x4b, 0x74, 0x69, 0x0b, 0xc0, 0x02, 0x9b, 0xe2,
+    0x7d, 0x95, 0x2f, 0x8a, 0x32, 0x15, 0xcf, 0x33, 0x8f, 0x07, 0x8b, 0x34, 0xea, 0x7a, 0x06, 0x96,
+    0x1c, 0x3a, 0x55, 0x1b, 0x46, 0x75, 0x10, 0x60, 0x3e, 0xc3, 0x8d, 0x74, 0x07, 0x3a, 0x59, 0xbd,
 ];
 
 #[cfg(flux_android_qualification)]
@@ -168,7 +169,7 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_PORTS:
 
 #[cfg(flux_android_qualification)]
 const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES:
-    &[ReviewedOrderedLateWriteLiteral] = &[
+    [ReviewedOrderedLateWriteLiteral; 10] = [
     ReviewedOrderedLateWriteLiteral {
         source: FwmarkEvidenceSource::AndroidNetId,
         family: NetworkAddressFamily::Ipv4,
@@ -322,6 +323,56 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES:
 ];
 
 #[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES_12:
+    [ReviewedOrderedLateWriteLiteral; 12] = [
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[0],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[1],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[2],
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv4,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 4,
+        selector_digest: [
+            0xba, 0xf9, 0x86, 0x5a, 0xb7, 0x8a, 0xc5, 0xe6, 0x28, 0x37, 0x91, 0xa4, 0x86, 0x70,
+            0x8d, 0x22, 0x3b, 0xaf, 0x6b, 0xd2, 0xfb, 0x1e, 0xc7, 0x5a, 0x76, 0x0c, 0x95, 0x4a,
+            0xd9, 0xb5, 0x9e, 0x93,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[3],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[4],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[5],
+    ReviewedOrderedLateWriteLiteral {
+        source: FwmarkEvidenceSource::AndroidNetId,
+        family: NetworkAddressFamily::Ipv6,
+        hook: FwmarkNetfilterBuiltinHook::Input,
+        child_chain: "routectrl_mangle_INPUT",
+        hook_ordinal: 3,
+        rule_ordinal: 4,
+        selector_digest: [
+            0x22, 0x32, 0xad, 0xf0, 0x83, 0x30, 0x62, 0x1c, 0x21, 0xc9, 0x34, 0xf8, 0x28, 0x11,
+            0x96, 0xb0, 0xf1, 0x33, 0x80, 0x5e, 0x1e, 0xd0, 0x8d, 0xfd, 0x19, 0xd8, 0xdf, 0xa7,
+            0xfa, 0xde, 0x0b, 0xa1,
+        ],
+        placement: FwmarkOrderedLateWritePlacement::InputAfterRouting,
+        mask: 0x7fef_ffff,
+    },
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[6],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[7],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[8],
+    SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES[9],
+];
+
+#[cfg(flux_android_qualification)]
+const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITE_ALTERNATIVES:
+    &[&[ReviewedOrderedLateWriteLiteral]] =
+    &[&SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES_12];
+
+#[cfg(flux_android_qualification)]
 const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_EXACT_MARK_SENTINELS:
     &[ReviewedExactMarkSentinelLiteral] = &[
     ReviewedExactMarkSentinelLiteral {
@@ -360,14 +411,16 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1:
     mark_policy: Some(ReviewedAndroidMarkPolicyLiteral {
         assurance_class: AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
         name: "Samsung SM-S9180 FZDP Qkernel qualification",
-        revision: 3,
+        revision: 4,
         artifact_digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST,
         netd_source_profile: AndroidNetdSourceProfile::AospNetd20250324,
         candidate_mask: 0x0c00_0000,
         proxy_value: 0x0400_0000,
         bypass_value: 0x0800_0000,
         planes: FwmarkPlaneSet::ALL.bits(),
-        ordered_late_writes: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES,
+        ordered_late_writes: &SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES,
+        ordered_late_write_alternatives:
+            SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITE_ALTERNATIVES,
         exact_mark_sentinels:
             SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_EXACT_MARK_SENTINELS,
     }),
@@ -548,6 +601,7 @@ impl ReviewedAndroidPlatformProfileSelection {
                 self.network_namespace,
                 policy.planes,
                 policy.ordered_late_writes,
+                policy.ordered_late_write_alternatives,
                 policy.exact_mark_sentinels,
             )
             .map_err(ReviewedAndroidPlatformProfileCatalogError::MarkPolicyConstruction)?,
@@ -1002,6 +1056,25 @@ fn validate_mark_policy(
             ReviewedAndroidPlatformProfileCatalogField::MarkOrderedLateWrites,
         ));
     }
+    let mut ordered_late_write_alternatives =
+        Vec::with_capacity(policy.ordered_late_write_alternatives.len());
+    for literals in policy.ordered_late_write_alternatives {
+        let cohort = validate_ordered_late_writes(literals).map_err(|_| {
+            invalid(ReviewedAndroidPlatformProfileCatalogField::MarkOrderedLateWrites)
+        })?;
+        if cohort.is_empty()
+            || cohort == ordered_late_writes
+            || cohort
+                .iter()
+                .any(|record| record.mark_use().mask() & candidate.mask() == 0)
+            || ordered_late_write_alternatives.contains(&cohort)
+        {
+            return Err(invalid(
+                ReviewedAndroidPlatformProfileCatalogField::MarkOrderedLateWrites,
+            ));
+        }
+        ordered_late_write_alternatives.push(cohort);
+    }
     let exact_mark_sentinels =
         validate_exact_mark_sentinels(policy.exact_mark_sentinels, candidate).map_err(|_| {
             invalid(ReviewedAndroidPlatformProfileCatalogField::MarkExactMarkSentinels)
@@ -1016,6 +1089,7 @@ fn validate_mark_policy(
         netd_source_profile: policy.netd_source_profile,
         planes,
         ordered_late_writes,
+        ordered_late_write_alternatives: ordered_late_write_alternatives.into_boxed_slice(),
         exact_mark_sentinels,
     })
 }
@@ -1150,6 +1224,7 @@ struct ValidatedAndroidMarkPolicy {
     netd_source_profile: AndroidNetdSourceProfile,
     planes: FwmarkPlaneSet,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    ordered_late_write_alternatives: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
     exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 }
 
@@ -1199,6 +1274,7 @@ struct ReviewedAndroidMarkPolicyLiteral {
     bypass_value: u32,
     planes: u8,
     ordered_late_writes: &'static [ReviewedOrderedLateWriteLiteral],
+    ordered_late_write_alternatives: &'static [&'static [ReviewedOrderedLateWriteLiteral]],
     exact_mark_sentinels: &'static [ReviewedExactMarkSentinelLiteral],
 }
 

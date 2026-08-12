@@ -1057,6 +1057,20 @@ fn digest_policy(digest: &mut Sha256, policy: &AndroidMarkDevicePolicy) {
             digest.update(record.selector_digest().as_bytes());
             digest.update([placement_tag(record.placement())]);
         }
+        digest.update((grant.ordered_late_write_alternatives().len() as u64).to_be_bytes());
+        for cohort in grant.ordered_late_write_alternatives() {
+            digest.update((cohort.len() as u64).to_be_bytes());
+            for record in cohort {
+                digest_mark_use(digest, record.mark_use());
+                digest.update([family_tag(record.family())]);
+                digest.update([hook_tag(record.hook())]);
+                digest_bytes(digest, record.child_chain().as_str().as_bytes());
+                digest.update(record.hook_ordinal().to_be_bytes());
+                digest.update(record.rule_ordinal().to_be_bytes());
+                digest.update(record.selector_digest().as_bytes());
+                digest.update([placement_tag(record.placement())]);
+            }
+        }
         digest.update((grant.exact_mark_sentinels().len() as u64).to_be_bytes());
         for record in grant.exact_mark_sentinels() {
             digest_mark_use(digest, record.mark_use());

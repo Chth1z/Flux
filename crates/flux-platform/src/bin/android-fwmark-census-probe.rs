@@ -16,13 +16,13 @@ use flux_platform::{
     SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidKernelConfigErrorClass,
     SystemAndroidNftablesObservationErrorClass,
 };
+#[cfg(any(target_os = "android", test))]
+use flux_platform::{AndroidFwmarkCensusCoordinatorError, SystemAndroidFwmarkCensusSourceError};
 #[cfg(target_os = "android")]
 use flux_platform::{
-    AndroidFwmarkCensusCoordinatorError, AndroidFwmarkCensusCoordinatorOutcome,
-    AndroidFwmarkCensusCoordinatorPurpose, AndroidFwmarkCensusProjection,
-    AndroidFwmarkCensusReportPhase, SystemAndroidFwmarkCensusSource,
-    SystemAndroidFwmarkCensusSourceError, coordinate_android_fwmark_census,
-    validate_android_fwmark_census_projection_report,
+    AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
+    AndroidFwmarkCensusProjection, AndroidFwmarkCensusReportPhase, SystemAndroidFwmarkCensusSource,
+    coordinate_android_fwmark_census, validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,
 };
 
@@ -127,7 +127,7 @@ fn collect_diagnostic(
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 fn coordinator_error_label(
     error: &AndroidFwmarkCensusCoordinatorError<SystemAndroidFwmarkCensusSourceError>,
 ) -> String {
@@ -155,6 +155,12 @@ fn coordinator_error_label(
         AndroidFwmarkCensusCoordinatorError::SelectedNetdSourceProfileMismatch { .. } => {
             "selected-netd-source-profile-mismatch".to_owned()
         }
+        AndroidFwmarkCensusCoordinatorError::ReviewedCanaryFacilityPolicyMismatch => {
+            "reviewed-canary-facility-policy-mismatch".to_owned()
+        }
+        AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(_) => {
+            "reviewed-canary-rpdb".to_owned()
+        }
         AndroidFwmarkCensusCoordinatorError::Topology(_) => "topology-assessment".to_owned(),
         AndroidFwmarkCensusCoordinatorError::Rpdb(_) => "rpdb-projection".to_owned(),
         AndroidFwmarkCensusCoordinatorError::Assembly(_) => "projection-assembly".to_owned(),
@@ -167,7 +173,7 @@ fn coordinator_error_label(
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 const fn source_error_label(source: &SystemAndroidFwmarkCensusSourceError) -> &'static str {
     match source.kind() {
         SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => {
@@ -389,6 +395,17 @@ mod tests {
                     NetworkAddressFamily::Ipv6
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn coordinator_facility_policy_mismatch_label_is_bounded_and_payload_free() {
+        let error = AndroidFwmarkCensusCoordinatorError::<
+            SystemAndroidFwmarkCensusSourceError,
+        >::ReviewedCanaryFacilityPolicyMismatch;
+        assert_eq!(
+            coordinator_error_label(&error),
+            "reviewed-canary-facility-policy-mismatch"
         );
     }
 

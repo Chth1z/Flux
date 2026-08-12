@@ -753,6 +753,78 @@ fn exact_ordered_late_write_set_survives_policy_census_and_planning_evidence() {
 }
 
 #[test]
+fn each_reviewed_ordered_late_write_cohort_authorizes_but_hybrids_reject() {
+    let first = ordered_write(
+        FwmarkEvidenceSource::AndroidNetId,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Input,
+        "routectrl_mangle_INPUT",
+        3,
+        1,
+        0x7fef_ffff,
+        0x53,
+        FwmarkOrderedLateWritePlacement::InputAfterRouting,
+    );
+    let second = ordered_write(
+        FwmarkEvidenceSource::AndroidNetId,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Input,
+        "routectrl_mangle_INPUT",
+        3,
+        2,
+        0x7fef_ffff,
+        0x54,
+        FwmarkOrderedLateWritePlacement::InputAfterRouting,
+    );
+    let context = TestContext::with_policy_cohorts(
+        AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior,
+        vec![first.clone()].into_boxed_slice(),
+        vec![vec![first.clone(), second.clone()].into_boxed_slice()].into_boxed_slice(),
+    );
+    let uses = [first.mark_use()];
+    let primary = context
+        .census_with_ordered(coverage_for_uses(uses), uses, [first.clone()])
+        .expect("primary reviewed cohort");
+    context
+        .authorize(primary)
+        .expect("primary reviewed cohort authorizes");
+
+    let alternative = context
+        .census_with_ordered(
+            coverage_for_uses(uses),
+            uses,
+            [first.clone(), second.clone()],
+        )
+        .expect("alternative reviewed cohort");
+    context
+        .authorize(alternative)
+        .expect("alternative reviewed cohort authorizes");
+
+    let changed = ordered_write(
+        FwmarkEvidenceSource::AndroidNetId,
+        NetworkAddressFamily::Ipv4,
+        FwmarkNetfilterBuiltinHook::Input,
+        "routectrl_mangle_INPUT",
+        3,
+        2,
+        0x7fef_ffff,
+        0x55,
+        FwmarkOrderedLateWritePlacement::InputAfterRouting,
+    );
+    let hybrid = context
+        .census_with_ordered(coverage_for_uses(uses), uses, [first, changed])
+        .expect("structurally valid hybrid cohort");
+    let error = context
+        .authorize(hybrid)
+        .expect_err("unreviewed hybrid cohort rejects");
+    assert!(matches!(
+        error,
+        AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. }
+    ));
+    assert_eq!(error.ordered_late_write_expected_cohorts().len(), 2);
+}
+
+#[test]
 fn missing_extra_or_changed_ordered_late_write_records_reject() {
     let expected = ordered_write(
         FwmarkEvidenceSource::AndroidNetId,
@@ -809,7 +881,7 @@ fn missing_extra_or_changed_ordered_late_write_records_reject() {
         AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch { .. }
     ));
     let diagnostic = error.to_string();
-    assert!(diagnostic.contains("expected 0, observed 1"));
+    assert!(diagnostic.contains("expected one of 1 cohorts, observed 1"));
     assert!(
         diagnostic
             .contains("observed=AndroidNetId/Packet/MaskedWrite/Ipv4/chain=routectrl_mangle_INPUT")
@@ -2033,12 +2105,39 @@ impl TestContext {
         assurance_class: AndroidMarkPolicyAssuranceClass,
         ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
     ) -> Self {
-        Self::with_policy_qualifications(assurance_class, ordered_late_writes, Box::new([]))
+        Self::with_policy_cohorts(assurance_class, ordered_late_writes, Box::new([]))
+    }
+
+    fn with_policy_cohorts(
+        assurance_class: AndroidMarkPolicyAssuranceClass,
+        ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+        ordered_late_write_alternatives: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
+    ) -> Self {
+        Self::with_policy_qualifications_and_cohorts(
+            assurance_class,
+            ordered_late_writes,
+            ordered_late_write_alternatives,
+            Box::new([]),
+        )
     }
 
     fn with_policy_qualifications(
         assurance_class: AndroidMarkPolicyAssuranceClass,
         ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+        exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
+    ) -> Self {
+        Self::with_policy_qualifications_and_cohorts(
+            assurance_class,
+            ordered_late_writes,
+            Box::new([]),
+            exact_mark_sentinels,
+        )
+    }
+
+    fn with_policy_qualifications_and_cohorts(
+        assurance_class: AndroidMarkPolicyAssuranceClass,
+        ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+        ordered_late_write_alternatives: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
         exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
     ) -> Self {
         let fixture = profile_fixture(false);
@@ -2065,6 +2164,7 @@ impl TestContext {
             network_namespace,
             FwmarkPlaneSet::ALL,
             ordered_late_writes,
+            ordered_late_write_alternatives,
             exact_mark_sentinels,
         )
         .expect("valid synthetic cooperative policy");
@@ -2246,6 +2346,7 @@ fn cooperative_policy_with_assurance(
     network_namespace: NetworkNamespaceIdentity,
     planes: FwmarkPlaneSet,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    ordered_late_write_alternatives: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
     exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 ) -> Result<AndroidMarkDevicePolicy, AndroidMarkDevicePolicyError> {
     AndroidMarkDevicePolicy::device_qualified_cooperative(
@@ -2262,6 +2363,7 @@ fn cooperative_policy_with_assurance(
         network_namespace,
         planes,
         ordered_late_writes,
+        ordered_late_write_alternatives,
         exact_mark_sentinels,
     )
 }
@@ -2290,6 +2392,7 @@ fn cooperative_policy_with_catalog_entry(
         capability_profile,
         network_namespace,
         planes,
+        Box::new([]),
         Box::new([]),
         Box::new([]),
     )

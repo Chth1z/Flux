@@ -47,6 +47,7 @@ pub const OWNERSHIP_JOURNAL_IDENTITY_BYTES: usize = 32;
 pub const MAX_COMPLETE_FWMARK_CENSUS_MARK_USES: usize = 512;
 /// Maximum number of exact ordered-late packet writes retained by one census or policy.
 pub const MAX_ORDERED_LATE_PACKET_WRITES: usize = 128;
+pub const MAX_REVIEWED_ORDERED_LATE_WRITE_COHORTS: usize = 8;
 /// Maximum exact whole-mark sentinels retained by one census or reviewed policy.
 pub const MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS: usize = 32;
 /// Maximum UTF-8 bytes accepted for one observed netfilter child-chain name.
@@ -588,6 +589,7 @@ pub struct AndroidMarkPositiveGrant {
     policy_revision: AndroidMarkDevicePolicyRevision,
     planes: FwmarkPlaneSet,
     ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+    ordered_late_write_alternatives: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
     exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
 }
 
@@ -657,6 +659,12 @@ impl AndroidMarkPositiveGrant {
         &self.ordered_late_writes
     }
 
+    /// Additional complete, exact reviewed cohorts accepted in place of the primary cohort.
+    #[must_use]
+    pub fn ordered_late_write_alternatives(&self) -> &[Box<[FwmarkOrderedLateWriteQualification]>] {
+        &self.ordered_late_write_alternatives
+    }
+
     #[must_use]
     pub fn exact_mark_sentinels(&self) -> &[FwmarkExactMarkSentinelQualification] {
         &self.exact_mark_sentinels
@@ -711,6 +719,7 @@ impl AndroidMarkDevicePolicy {
         network_namespace: NetworkNamespaceIdentity,
         planes: FwmarkPlaneSet,
         ordered_late_writes: Box<[FwmarkOrderedLateWriteQualification]>,
+        ordered_late_write_alternatives: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
         exact_mark_sentinels: Box<[FwmarkExactMarkSentinelQualification]>,
     ) -> Result<Self, AndroidMarkDevicePolicyError> {
         ensure_candidate_eligible(candidate)
@@ -718,19 +727,27 @@ impl AndroidMarkDevicePolicy {
         if planes.is_empty() {
             return Err(AndroidMarkDevicePolicyError::EmptyPlaneGrant);
         }
-        let mut ordered_late_writes = ordered_late_writes.into_vec();
-        ordered_late_writes.sort_unstable();
-        if ordered_late_writes.len() > MAX_ORDERED_LATE_PACKET_WRITES
-            || ordered_late_writes
-                .windows(2)
-                .any(|records| records[0] == records[1])
-            || ordered_late_writes
-                .iter()
-                .any(|record| record.mark_use().mask() & candidate.mask() == 0)
+        let ordered_late_writes =
+            canonical_ordered_late_write_cohort(ordered_late_writes, candidate)?;
+        if ordered_late_write_alternatives.len() + 1 > MAX_REVIEWED_ORDERED_LATE_WRITE_COHORTS {
+            return Err(AndroidMarkDevicePolicyError::InvalidOrderedLateWriteSet);
+        }
+        let mut canonical_alternatives = Vec::with_capacity(ordered_late_write_alternatives.len());
+        for cohort in ordered_late_write_alternatives.into_vec() {
+            let cohort = canonical_ordered_late_write_cohort(cohort, candidate)?;
+            if cohort.is_empty() || cohort == ordered_late_writes {
+                return Err(AndroidMarkDevicePolicyError::InvalidOrderedLateWriteSet);
+            }
+            canonical_alternatives.push(cohort);
+        }
+        canonical_alternatives.sort_unstable();
+        if canonical_alternatives
+            .windows(2)
+            .any(|cohorts| cohorts[0] == cohorts[1])
         {
             return Err(AndroidMarkDevicePolicyError::InvalidOrderedLateWriteSet);
         }
-        let ordered_late_writes = ordered_late_writes.into_boxed_slice();
+        let ordered_late_write_alternatives = canonical_alternatives.into_boxed_slice();
         let mut exact_mark_sentinels = exact_mark_sentinels.into_vec();
         exact_mark_sentinels.sort_unstable();
         if exact_mark_sentinels.len() > MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS
@@ -783,6 +800,7 @@ impl AndroidMarkDevicePolicy {
             policy_revision: revision,
             planes,
             ordered_late_writes: ordered_late_writes.clone(),
+            ordered_late_write_alternatives: ordered_late_write_alternatives.clone(),
             exact_mark_sentinels: exact_mark_sentinels.clone(),
         };
         Ok(Self {
@@ -815,6 +833,23 @@ impl AndroidMarkDevicePolicy {
     pub const fn positive_grant(&self) -> Option<&AndroidMarkPositiveGrant> {
         self.positive_grant.as_ref()
     }
+}
+
+fn canonical_ordered_late_write_cohort(
+    cohort: Box<[FwmarkOrderedLateWriteQualification]>,
+    candidate: FwmarkCandidate,
+) -> Result<Box<[FwmarkOrderedLateWriteQualification]>, AndroidMarkDevicePolicyError> {
+    let mut cohort = cohort.into_vec();
+    cohort.sort_unstable();
+    if cohort.len() > MAX_ORDERED_LATE_PACKET_WRITES
+        || cohort.windows(2).any(|records| records[0] == records[1])
+        || cohort
+            .iter()
+            .any(|record| record.mark_use().mask() & candidate.mask() == 0)
+    {
+        return Err(AndroidMarkDevicePolicyError::InvalidOrderedLateWriteSet);
+    }
+    Ok(cohort.into_boxed_slice())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2455,10 +2490,18 @@ pub fn authorize_android_mark_planning(
             },
         );
     }
-    if grant.ordered_late_writes != census.ordered_late_writes {
+    if grant.ordered_late_writes != census.ordered_late_writes
+        && !grant
+            .ordered_late_write_alternatives
+            .iter()
+            .any(|cohort| cohort.as_ref() == census.ordered_late_writes.as_ref())
+    {
+        let mut expected = Vec::with_capacity(grant.ordered_late_write_alternatives.len() + 1);
+        expected.push(grant.ordered_late_writes.clone());
+        expected.extend(grant.ordered_late_write_alternatives.iter().cloned());
         return Err(
             AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch {
-                expected: grant.ordered_late_writes.clone(),
+                expected: expected.into_boxed_slice(),
                 observed: census.ordered_late_writes.clone(),
             },
         );
@@ -2719,7 +2762,7 @@ pub enum AndroidMarkPlanningAuthorizationError {
         overlaps: Box<[FwmarkCensusOrderedPacketWrite]>,
     },
     OrderedLateWriteQualificationMismatch {
-        expected: Box<[FwmarkOrderedLateWriteQualification]>,
+        expected: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
         observed: Box<[FwmarkOrderedLateWriteQualification]>,
     },
     ExactMarkSentinelQualificationMismatch {
@@ -2760,6 +2803,18 @@ impl AndroidMarkPlanningAuthorizationError {
 
     #[must_use]
     pub fn ordered_late_write_expected(&self) -> &[FwmarkOrderedLateWriteQualification] {
+        match self {
+            Self::OrderedLateWriteQualificationMismatch { expected, .. } => {
+                expected.first().map_or(&[], Box::as_ref)
+            }
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn ordered_late_write_expected_cohorts(
+        &self,
+    ) -> &[Box<[FwmarkOrderedLateWriteQualification]>] {
         match self {
             Self::OrderedLateWriteQualificationMismatch { expected, .. } => expected,
             _ => &[],
@@ -2941,11 +2996,17 @@ impl fmt::Display for AndroidMarkPlanningAuthorizationError {
             Self::OrderedLateWriteQualificationMismatch { expected, observed } => {
                 write!(
                     formatter,
-                    "ordered-late write qualification set differs (expected {}, observed {})",
+                    "ordered-late write qualification cohort differs (expected one of {} cohorts, observed {})",
                     expected.len(),
                     observed.len()
                 )?;
-                write_ordered_late_write_diagnostics(formatter, "expected", expected)?;
+                for (index, cohort) in expected.iter().enumerate() {
+                    write_ordered_late_write_diagnostics(
+                        formatter,
+                        &format!("expected-cohort-{index}"),
+                        cohort,
+                    )?;
+                }
                 write_ordered_late_write_diagnostics(formatter, "observed", observed)
             }
             Self::ExactMarkSentinelQualificationMismatch { expected, observed } => {

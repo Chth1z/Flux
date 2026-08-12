@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -24,7 +25,7 @@ use crate::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashSet;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -45,11 +46,20 @@ pub struct SingBoxProcessAdapter;
 pub struct PinnedSingBoxLaunch {
     binary: File,
     config: File,
+    execution_config: File,
 }
 
 impl PinnedSingBoxLaunch {
     pub fn new(binary: File, config: File) -> Result<Self, SingBoxProcessError> {
-        let pinned = Self { binary, config };
+        validate_pinned_descriptor("binary", &binary)?;
+        validate_pinned_executable_privilege(&binary)?;
+        validate_pinned_descriptor("config", &config)?;
+        let execution_config = sealed_execution_config(&config)?;
+        let pinned = Self {
+            binary,
+            config,
+            execution_config,
+        };
         pinned.revalidate()?;
         Ok(pinned)
     }
@@ -64,10 +74,16 @@ impl PinnedSingBoxLaunch {
         &self.config
     }
 
+    #[must_use]
+    pub const fn execution_config(&self) -> &File {
+        &self.execution_config
+    }
+
     fn revalidate(&self) -> Result<(), SingBoxProcessError> {
         validate_pinned_descriptor("binary", &self.binary)?;
         validate_pinned_executable_privilege(&self.binary)?;
-        validate_pinned_descriptor("config", &self.config)
+        validate_pinned_descriptor("config", &self.config)?;
+        validate_sealed_execution_config(&self.execution_config)
     }
 }
 
@@ -1204,8 +1220,10 @@ fn pinned_command(
     subcommand: &'static str,
 ) -> Result<PreparedCommand, SingBoxProcessError> {
     let mut prepared = pinned_base_command(pinned)?;
-    let config = descriptor_path(&pinned.config);
-    prepared.inherited_fds.push(pinned.config.as_raw_fd());
+    let config = descriptor_path(&pinned.execution_config);
+    prepared
+        .inherited_fds
+        .push(pinned.execution_config.as_raw_fd());
     prepared.inherited_fds.sort_unstable();
     prepared.inherited_fds.dedup();
     prepared
@@ -1291,6 +1309,132 @@ fn validate_pinned_descriptor(role: &'static str, file: &File) -> Result<(), Sin
         });
     }
     set_descriptor_close_on_exec(role, file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sealed_execution_config(config: &File) -> Result<File, SingBoxProcessError> {
+    let name = CString::new("flux-sing-box-config").expect("fixed memfd name contains no NUL");
+    // SAFETY: the name is NUL-terminated and flags are valid scalar memfd options.
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SingBoxProcessError::PinnedDescriptor {
+            role: "execution config",
+            source: io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful memfd_create returned one new owned descriptor.
+    let execution = unsafe { File::from_raw_fd(descriptor as i32) };
+    let length = config
+        .metadata()
+        .map_err(|source| SingBoxProcessError::PinnedDescriptor {
+            role: "config",
+            source,
+        })?
+        .len();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    while offset < length {
+        let remaining = length.saturating_sub(offset);
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = config
+            .read_at(&mut buffer[..limit], offset)
+            .map_err(|source| SingBoxProcessError::PinnedDescriptor {
+                role: "execution config",
+                source,
+            })?;
+        if read == 0 {
+            return Err(SingBoxProcessError::PinnedDescriptor {
+                role: "execution config",
+                source: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pinned configuration ended during execution copy",
+                ),
+            });
+        }
+        execution
+            .write_all_at(&buffer[..read], offset)
+            .map_err(|source| SingBoxProcessError::PinnedDescriptor {
+                role: "execution config",
+                source,
+            })?;
+        offset = offset.saturating_add(read as u64);
+    }
+    if execution
+        .metadata()
+        .map_err(|source| SingBoxProcessError::PinnedDescriptor {
+            role: "execution config",
+            source,
+        })?
+        .len()
+        != length
+    {
+        return Err(SingBoxProcessError::PinnedDescriptor {
+            role: "execution config",
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sealed execution configuration has the wrong length",
+            ),
+        });
+    }
+    execution
+        .sync_all()
+        .map_err(|source| SingBoxProcessError::PinnedDescriptor {
+            role: "execution config",
+            source,
+        })?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: execution owns a valid memfd descriptor and F_ADD_SEALS consumes scalar flags only.
+    if unsafe { libc::fcntl(execution.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(SingBoxProcessError::PinnedDescriptor {
+            role: "execution config",
+            source: io::Error::last_os_error(),
+        });
+    }
+    validate_sealed_execution_config(&execution)?;
+    Ok(execution)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_sealed_execution_config(file: &File) -> Result<(), SingBoxProcessError> {
+    validate_pinned_descriptor("execution config", file)?;
+    // SAFETY: file is a valid open descriptor and F_GET_SEALS has no pointer argument.
+    let observed = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    let expected = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(SingBoxProcessError::PinnedDescriptor {
+            role: "execution config",
+            source: if observed < 0 {
+                io::Error::last_os_error()
+            } else {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "execution configuration is not exactly sealed",
+                )
+            },
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn sealed_execution_config(_config: &File) -> Result<File, SingBoxProcessError> {
+    Err(SingBoxProcessError::UnsupportedPlatform {
+        platform: std::env::consts::OS,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn validate_sealed_execution_config(_file: &File) -> Result<(), SingBoxProcessError> {
+    Err(SingBoxProcessError::UnsupportedPlatform {
+        platform: std::env::consts::OS,
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -36,8 +36,14 @@ fn validation_uses_exact_arguments_and_reports_check_failure() {
     assert_exact_invocation(&fixture, &pinned, "check");
 
     fs::write(&fixture.spec.config, "fail").expect("write failing config mode");
-    let error = adapter
+    let retained = adapter
         .validate_pinned(&pinned, &fixture.spec)
+        .expect("pinned execution snapshot remains immutable");
+    assert_eq!(retained.exit, SingBoxExit::Code(0));
+
+    let failing = pin_launch(&fixture.spec);
+    let error = adapter
+        .validate_pinned(&failing, &fixture.spec)
         .expect_err("configuration check must fail");
     let SingBoxProcessError::CheckFailed { exit, diagnostics } = error else {
         panic!("unexpected check error: {error:?}");
@@ -47,6 +53,7 @@ fn validation_uses_exact_arguments_and_reports_check_failure() {
     assert!(diagnostics.stderr_tail().contains("invalid config stderr"));
     assert!(diagnostics.stdout_tail().len() <= 8 * 1024);
     assert!(diagnostics.stderr_tail().len() <= 8 * 1024);
+    assert_exact_invocation(&fixture, &failing, "check");
 }
 
 #[test]
@@ -745,7 +752,7 @@ fn assert_exact_invocation(fixture: &Fixture, pinned: &PinnedSingBoxLaunch, mode
     let expected = [
         mode.to_owned(),
         "-c".to_owned(),
-        format!("/proc/self/fd/{}", pinned.config().as_raw_fd()),
+        format!("/proc/self/fd/{}", pinned.execution_config().as_raw_fd()),
         "-D".to_owned(),
         fixture.spec.working_directory.display().to_string(),
     ]

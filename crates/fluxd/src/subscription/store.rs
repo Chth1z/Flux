@@ -47,6 +47,8 @@ pub(super) enum SnapshotValidationErrorKind {
     Artifact,
     ProcessSpawn,
     ProcessSpawnPermissionDenied,
+    ProcessCheckConfigDescriptorPermissionDenied,
+    ProcessCheckRuleSetPermissionDenied,
     ProcessCheckPermissionDenied,
     ProcessCheckPathUnavailable,
     ProcessCheckRejected,
@@ -100,6 +102,22 @@ fn classify_validation_error(error: &EngineCapabilityProbeError) -> SnapshotVali
             SnapshotValidationErrorKind::ProcessSpawnPermissionDenied
         }
         SingBoxProcessError::Spawn { .. } => SnapshotValidationErrorKind::ProcessSpawn,
+        SingBoxProcessError::CheckFailed { diagnostics, .. }
+            if diagnostics_contain(
+                diagnostics,
+                &["permission denied", "operation not permitted"],
+            ) && diagnostics_contain(diagnostics, &["/proc/self/fd/"]) =>
+        {
+            SnapshotValidationErrorKind::ProcessCheckConfigDescriptorPermissionDenied
+        }
+        SingBoxProcessError::CheckFailed { diagnostics, .. }
+            if diagnostics_contain(
+                diagnostics,
+                &["permission denied", "operation not permitted"],
+            ) && diagnostics_contain(diagnostics, &[".srs", "rule-set", "rule set"]) =>
+        {
+            SnapshotValidationErrorKind::ProcessCheckRuleSetPermissionDenied
+        }
         SingBoxProcessError::CheckFailed { diagnostics, .. }
             if diagnostics_contain(
                 diagnostics,

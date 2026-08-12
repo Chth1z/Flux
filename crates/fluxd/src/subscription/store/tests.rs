@@ -328,14 +328,14 @@ fn production_validator_runs_pinned_check_and_rejects_engine_identity_drift() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn production_validator_reports_only_a_fixed_permission_failure_class() {
+fn production_validator_reports_only_fixed_permission_failure_classes() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempdir().expect("temporary directory");
     let binary = directory.path().join("sing-box");
     fs::write(
         &binary,
-        b"#!/bin/sh\nprintf '%s\\n' 'open /private/provider/path: permission denied' >&2\nexit 1\n",
+        b"#!/bin/sh\nprintf '%s\\n' 'open /proc/self/fd/17: permission denied' >&2\nexit 1\n",
     )
     .expect("write rejecting fake Sing-Box");
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
@@ -377,13 +377,13 @@ fn production_validator_reports_only_a_fixed_permission_failure_class() {
     assert!(matches!(
         error,
         SubscriptionSnapshotStoreError::Validation {
-            kind: SnapshotValidationErrorKind::ProcessCheckPermissionDenied,
+            kind: SnapshotValidationErrorKind::ProcessCheckConfigDescriptorPermissionDenied,
             ..
         }
     ));
     let display = error.to_string();
-    assert!(display.contains("ProcessCheckPermissionDenied"));
-    assert!(!display.contains("/private/provider/path"));
+    assert!(display.contains("ProcessCheckConfigDescriptorPermissionDenied"));
+    assert!(!display.contains("/proc/self/fd/17"));
 }
 
 #[test]

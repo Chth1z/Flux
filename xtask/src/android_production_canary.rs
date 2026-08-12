@@ -68,6 +68,7 @@ const TRUSTED_ANDROID_PATH: &str = concat!(
 );
 
 const MAX_SUBSCRIPTION_URL_BYTES: usize = 8 * 1024;
+const QUALIFICATION_DOWNLOAD_TIMEOUT_SECS: i64 = 60;
 const MAX_CARGO_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -485,6 +486,12 @@ fn render_qualification_config(
         "subscription",
         "url_file",
         Value::String(format!("{remote_root}/{REMOTE_SUBSCRIPTION_NAME}")),
+    )?;
+    set_config_value(
+        &mut document,
+        "subscription",
+        "download_timeout_secs",
+        Value::Integer(QUALIFICATION_DOWNLOAD_TIMEOUT_SECS),
     )?;
     set_config_value(
         &mut document,
@@ -1364,6 +1371,10 @@ mod tests {
         assert_eq!(main["capture"]["ipv6"].as_bool(), Some(true));
         assert_eq!(main["subscription"]["enabled"].as_bool(), Some(true));
         assert_eq!(
+            main["subscription"]["download_timeout_secs"].as_integer(),
+            Some(QUALIFICATION_DOWNLOAD_TIMEOUT_SECS)
+        );
+        assert_eq!(
             main["subscription"]["url_file"].as_str(),
             Some("/data/local/tmp/flux-q11.test/subscription-q11.url")
         );
@@ -1373,6 +1384,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(recovery["subscription"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            recovery["subscription"]["download_timeout_secs"].as_integer(),
+            Some(QUALIFICATION_DOWNLOAD_TIMEOUT_SECS)
+        );
         assert_eq!(
             recovery["safety"]["require_functional_canary"].as_bool(),
             Some(false)

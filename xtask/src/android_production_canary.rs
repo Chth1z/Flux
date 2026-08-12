@@ -19,7 +19,7 @@ use super::android_canary::{
 };
 use super::android_remote::{
     FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec, normalize_adb_shell_output,
-    owned_root_functions, parse_directory_identity, path_absence_function,
+    owned_root_functions_with_engine_group, parse_directory_identity, path_absence_function,
     process_absence_function, run_owned_remote_transaction, shell_single_quote,
 };
 use super::{
@@ -55,6 +55,8 @@ const REMOTE_RECOVERY_CONFIG_NAME: &str = "flux-q11-recovery.toml";
 const REMOTE_TEMPLATE_NAME: &str = "template-q11.json";
 const REMOTE_SUBSCRIPTION_NAME: &str = "subscription-q11.url";
 const REMOTE_PROCESS_NAMES: [&str; 2] = [REMOTE_FLUXD_NAME, REMOTE_PRODUCER_NAME];
+const QUALIFICATION_ENGINE_UID: u32 = 2_900_002;
+const QUALIFICATION_ENGINE_GID: u32 = 2_900_002;
 const TRUSTED_ANDROID_PATH: &str = concat!(
     "/product/bin:",
     "/apex/com.android.runtime/bin:",
@@ -466,13 +468,13 @@ fn render_qualification_config(
         &mut document,
         "engine",
         "runtime_uid",
-        Value::Integer(2_900_002),
+        Value::Integer(i64::from(QUALIFICATION_ENGINE_UID)),
     )?;
     set_config_value(
         &mut document,
         "engine",
         "runtime_gid",
-        Value::Integer(2_900_002),
+        Value::Integer(i64::from(QUALIFICATION_ENGINE_GID)),
     )?;
     set_config_value(&mut document, "capture", "ipv6", Value::Boolean(true))?;
     set_config_value(
@@ -998,8 +1000,10 @@ fn qualification_execution_script(
          probe_process_absent\n\
          owned_root_matches\n\
          {}\
-         /system/bin/chown 0:0 \"$ROOT\" \"$FLUXD\" \"$PRODUCER\" \"$CONFIG\" \"$RECOVERY_CONFIG\" \"$TEMPLATE\" \"$SUBSCRIPTION\"\n\
-         /system/bin/chmod 700 \"$ROOT\" \"$FLUXD\" \"$PRODUCER\"\n\
+         /system/bin/chown 0:0 \"$ROOT\" \"$FLUXD\" \"$CONFIG\" \"$RECOVERY_CONFIG\" \"$TEMPLATE\" \"$SUBSCRIPTION\"\n\
+         /system/bin/chown 0:2900002 \"$PRODUCER\"\n\
+         /system/bin/chmod 700 \"$ROOT\" \"$FLUXD\"\n\
+         /system/bin/chmod 710 \"$PRODUCER\"\n\
          /system/bin/chmod 600 \"$CONFIG\" \"$RECOVERY_CONFIG\" \"$TEMPLATE\" \"$SUBSCRIPTION\"\n\
          run_flux() {{\n\
            FLUX_ROOT=\"$ROOT\" FLUXD_SOCKET=\"$SOCKET\" FLUXD_LEASE_PATH=\"$ROOT/run/fluxd.lease\" FLUXD_CONFIG_PATH=\"$CONFIG\" FLUXD_INTENT_PATH=\"$ROOT/state/administrative-intent.json\" FLUX_DISABLE_PATH=\"$ROOT/disable\" \"$@\"\n\
@@ -1037,7 +1041,7 @@ fn qualification_execution_script(
         remote.shell_variables(device.shell_uid(), device.shell_gid()),
         device_identity_function(device),
         process_absence_function(&REMOTE_PROCESS_NAMES),
-        owned_root_functions(),
+        owned_root_functions_with_engine_group(QUALIFICATION_ENGINE_GID),
         exact_flux_absence_function(),
         remote_artifact_verification(artifacts),
     )
@@ -1201,7 +1205,7 @@ fn qualification_cleanup_script(
         remote.shell_variables(device.shell_uid(), device.shell_gid()),
         device_identity_function(device),
         process_absence_function(&REMOTE_PROCESS_NAMES),
-        owned_root_functions(),
+        owned_root_functions_with_engine_group(QUALIFICATION_ENGINE_GID),
         exact_flux_absence_function(),
     )
 }
@@ -1392,6 +1396,28 @@ mod tests {
             recovery["safety"]["require_functional_canary"].as_bool(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn qualification_script_grants_only_the_producer_engine_execute_role() {
+        let remote = test_remote_directory();
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let artifacts = test_artifacts();
+        let execution = qualification_execution_script(&remote, &device, &artifacts);
+        let cleanup = qualification_cleanup_script(&remote, &device, &artifacts);
+
+        assert!(execution.contains("/system/bin/chown 0:2900002 \"$PRODUCER\""));
+        assert!(execution.contains("/system/bin/chmod 710 \"$PRODUCER\""));
+        assert!(execution.contains(
+            "/system/bin/chown 0:0 \"$ROOT\" \"$FLUXD\" \"$CONFIG\" \"$RECOVERY_CONFIG\" \"$TEMPLATE\" \"$SUBSCRIPTION\""
+        ));
+        assert!(execution.contains(
+            "/system/bin/chmod 600 \"$CONFIG\" \"$RECOVERY_CONFIG\" \"$TEMPLATE\" \"$SUBSCRIPTION\""
+        ));
+        assert!(!execution.contains("chown 0:2900002 \"$CONFIG\""));
+        assert!(!execution.contains("chown 0:2900002 \"$SUBSCRIPTION\""));
+        assert!(execution.contains("710:0:2900002"));
+        assert!(cleanup.contains("710:0:2900002"));
     }
 
     #[test]

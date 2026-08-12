@@ -5,6 +5,9 @@ use std::num::NonZeroU16;
 use std::rc::Rc;
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 use serde_json::Value;
 use tempfile::tempdir;
 use url::Url;
@@ -167,6 +170,89 @@ fn publication_validates_final_paths_and_recovery_rehashes_every_object() {
         1,
         "recovery does not manufacture a new check"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn reviewed_engine_asset_access_is_read_only_private_and_rejects_metadata_drift() {
+    let directory = tempdir().expect("temporary directory");
+    // SAFETY: this call reads only the current test-process identity.
+    let gid = unsafe { libc::getegid() };
+    assert_ne!(gid, 0, "test fixture requires a non-root group");
+    let access = SubscriptionAssetAccess::reviewed_engine(gid).expect("reviewed engine access");
+    let validator = DeterministicValidator::default();
+    let mut store = SubscriptionSnapshotStore::new_with_asset_access(
+        directory.path().join("subscriptions"),
+        validator,
+        Some(access),
+    )
+    .expect("credential-bound subscription store");
+    let candidate = prepared(&store, "one", b"asset-one");
+    let asset_path = candidate.assets()[0].path().to_owned();
+
+    store.publish(candidate).expect("publish bound asset");
+
+    let asset_root = store.asset_root();
+    for path in [store.root.as_path(), asset_root.as_path()] {
+        let metadata = fs::metadata(path).expect("asset corridor metadata");
+        assert_eq!(metadata.gid(), gid);
+        assert_eq!(metadata.mode() & 0o777, 0o710);
+    }
+    let asset_metadata = fs::metadata(&asset_path).expect("bound asset metadata");
+    assert_eq!(asset_metadata.gid(), gid);
+    assert_eq!(asset_metadata.mode() & 0o777, 0o440);
+    assert_eq!(
+        fs::metadata(store.index_path()).unwrap().mode() & 0o777,
+        0o600,
+        "the snapshot index remains private"
+    );
+    let config_digest = *store.recover().unwrap().active().unwrap().content_sha256();
+    let config_path = store.config_path(config_digest);
+    assert_eq!(fs::metadata(config_path).unwrap().mode() & 0o777, 0o600);
+
+    for path in [store.root.clone(), asset_root.clone(), asset_path.clone()] {
+        let canonical = fs::metadata(&path).expect("canonical engine access metadata");
+        let canonical_mode = canonical.mode() & 0o777;
+        let drift_mode = if canonical.is_dir() { 0o700 } else { 0o640 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(drift_mode))
+            .expect("inject engine access mode drift");
+        assert_eq!(
+            store
+                .recover()
+                .expect_err("engine access mode drift must fail closed")
+                .kind(),
+            SubscriptionSnapshotStoreErrorKind::Storage
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(canonical_mode))
+            .expect("restore canonical engine access mode");
+    }
+
+    let other_gid = if gid == 1 { 2 } else { 1 };
+    let wrong_access = SubscriptionAssetAccess::reviewed_engine(other_gid)
+        .expect("different reviewed engine group");
+    assert_eq!(
+        SubscriptionSnapshotStore::new_with_asset_access(
+            store.root.clone(),
+            DeterministicValidator::default(),
+            Some(wrong_access),
+        )
+        .expect_err("wrong engine group must not rewrite an existing asset corridor")
+        .kind(),
+        SubscriptionSnapshotStoreErrorKind::Storage
+    );
+
+    let candidate = prepared(&store, "two", b"asset-two");
+    let next_asset = candidate.assets()[0].path().to_owned();
+    fs::set_permissions(&asset_root, fs::Permissions::from_mode(0o700))
+        .expect("inject asset directory drift before publication");
+    assert_eq!(
+        store
+            .publish(candidate)
+            .expect_err("publication must reject asset directory drift")
+            .kind(),
+        SubscriptionSnapshotStoreErrorKind::Storage
+    );
+    assert!(!next_asset.exists());
 }
 
 #[cfg(target_os = "linux")]

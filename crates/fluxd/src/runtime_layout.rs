@@ -9,7 +9,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use flux_core::EngineCredentials;
+
 const RUNTIME_DIRECTORY_MODE: libc::mode_t = 0o700;
+const ENGINE_TRAVERSAL_DIRECTORY_MODE: libc::mode_t = 0o710;
+const ENGINE_WORK_DIRECTORY_NAME: &str = "engine";
 const MAX_RUNTIME_ROOT_BYTES: usize = 4_096;
 const MAX_RUNTIME_ROOT_COMPONENTS: usize = 64;
 const MAX_RUNTIME_COMPONENT_BYTES: usize = 255;
@@ -125,9 +129,9 @@ pub(crate) struct RuntimeLayout {
     root_path: PathBuf,
     run_path: PathBuf,
     state_path: PathBuf,
-    _root_directory: File,
+    root_directory: File,
     run_directory: File,
-    _state_directory: File,
+    state_directory: File,
 }
 
 impl RuntimeLayout {
@@ -146,9 +150,9 @@ impl RuntimeLayout {
             root_path: root_path.to_owned(),
             run_path,
             state_path,
-            _root_directory: root_directory,
+            root_directory,
             run_directory,
-            _state_directory: state_directory,
+            state_directory,
         })
     }
 
@@ -181,6 +185,59 @@ impl RuntimeLayout {
         self.run_directory
             .try_clone()
             .map_err(|source| Self::clone_directory_error(&self.run_path, source))
+    }
+
+    /// Grants one exact reviewed engine credential a search-only corridor to its private working
+    /// directory and to the subscription asset store. No shared daemon directory becomes writable.
+    pub(crate) fn bind_reviewed_engine_runtime(
+        &self,
+        credentials: EngineCredentials,
+    ) -> Result<PathBuf, RuntimeLayoutError> {
+        let uid = credentials.uid().get();
+        let gid = credentials.gid().get();
+        if uid == 0 || gid == 0 {
+            return Err(RuntimeLayoutError::UnsafeMetadata {
+                path: self.root_path.clone(),
+                reason: "reviewed engine runtime credentials must be non-root",
+            });
+        }
+        require_engine_traversal_prebinding(
+            &self.root_directory,
+            &self.root_path,
+            gid,
+            TraversalPrebinding::SecureRoot,
+        )?;
+        for (directory, directory_path) in [
+            (&self.run_directory, self.run_path.as_path()),
+            (&self.state_directory, self.state_path.as_path()),
+        ] {
+            require_engine_traversal_prebinding(
+                directory,
+                directory_path,
+                gid,
+                TraversalPrebinding::PrivateDirectory,
+            )?;
+        }
+        let path = self.run_path.join(ENGINE_WORK_DIRECTORY_NAME);
+        open_or_create_engine_work_directory(&self.run_directory, &path, uid, gid)?;
+        bind_engine_traversal(
+            &self.root_directory,
+            &self.root_path,
+            gid,
+            TraversalPrebinding::SecureRoot,
+        )?;
+        for (directory, directory_path) in [
+            (&self.run_directory, self.run_path.as_path()),
+            (&self.state_directory, self.state_path.as_path()),
+        ] {
+            bind_engine_traversal(
+                directory,
+                directory_path,
+                gid,
+                TraversalPrebinding::PrivateDirectory,
+            )?;
+        }
+        Ok(path)
     }
 
     pub(crate) fn require_run_child(
@@ -356,6 +413,209 @@ fn require_owned_secure_directory(
         });
     }
     Ok(())
+}
+
+fn bind_engine_traversal(
+    directory: &File,
+    path: &Path,
+    engine_gid: libc::gid_t,
+    prebinding: TraversalPrebinding,
+) -> Result<(), RuntimeLayoutError> {
+    require_engine_traversal_prebinding(directory, path, engine_gid, prebinding)?;
+    let metadata = directory.metadata().map_err(|source| {
+        RuntimeLayoutError::io("inspect engine traversal directory", path, source)
+    })?;
+    if metadata.gid() == engine_gid && metadata.mode() & 0o777 == ENGINE_TRAVERSAL_DIRECTORY_MODE {
+        return Ok(());
+    }
+    if metadata.gid() != engine_gid {
+        // SAFETY: the descriptor denotes the exact no-follow directory inspected above; uid -1
+        // preserves root/daemon ownership while binding only its group to the reviewed engine.
+        if unsafe { libc::fchown(directory.as_raw_fd(), u32::MAX, engine_gid) } != 0 {
+            return Err(RuntimeLayoutError::io(
+                "bind engine traversal directory group",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    if metadata.mode() & 0o777 != ENGINE_TRAVERSAL_DIRECTORY_MODE {
+        // SAFETY: the descriptor denotes the exact directory and `fchmod` retains no pointer.
+        if unsafe { libc::fchmod(directory.as_raw_fd(), ENGINE_TRAVERSAL_DIRECTORY_MODE) } != 0 {
+            return Err(RuntimeLayoutError::io(
+                "set engine traversal directory mode",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    directory.sync_all().map_err(|source| {
+        RuntimeLayoutError::io("sync engine traversal directory", path, source)
+    })?;
+    let metadata = directory.metadata().map_err(|source| {
+        RuntimeLayoutError::io("reinspect engine traversal directory", path, source)
+    })?;
+    // SAFETY: `geteuid` has no preconditions and reads only the caller identity.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid
+        || metadata.gid() != engine_gid
+        || metadata.mode() & 0o777 != ENGINE_TRAVERSAL_DIRECTORY_MODE
+    {
+        return Err(RuntimeLayoutError::UnsafeMetadata {
+            path: path.to_owned(),
+            reason: "engine traversal directory metadata changed during binding",
+        });
+    }
+    Ok(())
+}
+
+fn require_engine_traversal_prebinding(
+    directory: &File,
+    path: &Path,
+    engine_gid: libc::gid_t,
+    prebinding: TraversalPrebinding,
+) -> Result<(), RuntimeLayoutError> {
+    let metadata = directory.metadata().map_err(|source| {
+        RuntimeLayoutError::io("inspect engine traversal directory", path, source)
+    })?;
+    // SAFETY: `geteuid` has no preconditions and reads only the caller identity.
+    let effective_uid = unsafe { libc::geteuid() };
+    // SAFETY: `getegid` has no preconditions and reads only the caller identity.
+    let effective_gid = unsafe { libc::getegid() };
+    if !metadata.is_dir() || metadata.uid() != effective_uid {
+        return Err(RuntimeLayoutError::UnsafeMetadata {
+            path: path.to_owned(),
+            reason: "engine traversal directory is not owned by the daemon effective user",
+        });
+    }
+    if metadata.gid() == engine_gid && metadata.mode() & 0o777 == ENGINE_TRAVERSAL_DIRECTORY_MODE {
+        return Ok(());
+    }
+    let mode = metadata.mode() & 0o777;
+    let prebinding_mode_is_safe = match prebinding {
+        TraversalPrebinding::SecureRoot => {
+            mode != ENGINE_TRAVERSAL_DIRECTORY_MODE && mode & 0o022 == 0
+        }
+        TraversalPrebinding::PrivateDirectory => mode == RUNTIME_DIRECTORY_MODE,
+    };
+    if !prebinding_mode_is_safe
+        || (metadata.gid() != effective_gid && metadata.gid() != engine_gid && metadata.gid() != 0)
+    {
+        return Err(RuntimeLayoutError::UnsafeMetadata {
+            path: path.to_owned(),
+            reason: "engine traversal directory has noncanonical pre-binding metadata",
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TraversalPrebinding {
+    SecureRoot,
+    PrivateDirectory,
+}
+
+fn open_or_create_engine_work_directory(
+    run: &File,
+    path: &Path,
+    engine_uid: libc::uid_t,
+    engine_gid: libc::gid_t,
+) -> Result<File, RuntimeLayoutError> {
+    let name = component_name(OsStr::new(ENGINE_WORK_DIRECTORY_NAME), path)?;
+    let mut created = false;
+    match entry_kind(run.as_raw_fd(), &name)
+        .map_err(|source| RuntimeLayoutError::io("inspect engine work directory", path, source))?
+    {
+        Some(EntryKind::Directory) => {}
+        Some(EntryKind::Symlink) => return Err(RuntimeLayoutError::Symlink(path.to_owned())),
+        Some(EntryKind::Other) => {
+            return Err(RuntimeLayoutError::UnexpectedFileType(path.to_owned()));
+        }
+        None => {
+            // SAFETY: `run` and `name` are validated no-follow directory/name anchors.
+            if unsafe { libc::mkdirat(run.as_raw_fd(), name.as_ptr(), RUNTIME_DIRECTORY_MODE) } != 0
+            {
+                let source = io::Error::last_os_error();
+                if source.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(RuntimeLayoutError::io(
+                        "create engine work directory",
+                        path,
+                        source,
+                    ));
+                }
+            } else {
+                created = true;
+            }
+        }
+    }
+    let directory = open_directory_at(run.as_raw_fd(), &name)
+        .map_err(|source| classify_component_error(run.as_raw_fd(), &name, path, source))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|source| RuntimeLayoutError::io("inspect engine work directory", path, source))?;
+    if !metadata.is_dir() {
+        return Err(RuntimeLayoutError::UnexpectedFileType(path.to_owned()));
+    }
+    // SAFETY: `geteuid` reads only the current process identity.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !created
+        && (metadata.uid() != engine_uid
+            || metadata.gid() != engine_gid
+            || metadata.mode() & 0o777 != RUNTIME_DIRECTORY_MODE)
+    {
+        return Err(RuntimeLayoutError::UnsafeMetadata {
+            path: path.to_owned(),
+            reason: "existing engine work directory has noncanonical metadata",
+        });
+    }
+    if created && metadata.uid() != effective_uid {
+        return Err(RuntimeLayoutError::UnsafeMetadata {
+            path: path.to_owned(),
+            reason: "new engine work directory is not owned by the daemon effective user",
+        });
+    }
+    // SAFETY: the exact directory descriptor is owned here and both scalar IDs were admitted by
+    // Flux's reviewed credential authority.
+    if created
+        && (metadata.uid() != engine_uid || metadata.gid() != engine_gid)
+        // SAFETY: `directory` is the exact newly created no-follow directory descriptor.
+        && unsafe { libc::fchown(directory.as_raw_fd(), engine_uid, engine_gid) } != 0
+    {
+        return Err(RuntimeLayoutError::io(
+            "assign engine work directory ownership",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    if created
+        && metadata.mode() & 0o777 != RUNTIME_DIRECTORY_MODE
+        // SAFETY: `directory` is the exact newly created no-follow directory descriptor.
+        && unsafe { libc::fchmod(directory.as_raw_fd(), RUNTIME_DIRECTORY_MODE) } != 0
+    {
+        return Err(RuntimeLayoutError::io(
+            "set engine work directory mode",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    let metadata = directory.metadata().map_err(|source| {
+        RuntimeLayoutError::io("reinspect engine work directory", path, source)
+    })?;
+    if metadata.uid() != engine_uid
+        || metadata.gid() != engine_gid
+        || metadata.mode() & 0o777 != RUNTIME_DIRECTORY_MODE
+    {
+        return Err(RuntimeLayoutError::UnsafeMetadata {
+            path: path.to_owned(),
+            reason: "engine work directory metadata changed during binding",
+        });
+    }
+    directory
+        .sync_all()
+        .map_err(|source| RuntimeLayoutError::io("sync engine work directory", path, source))?;
+    run.sync_all()
+        .map_err(|source| RuntimeLayoutError::io("sync runtime directory", path, source))?;
+    Ok(directory)
 }
 
 fn component_name(name: &OsStr, path: &Path) -> Result<CString, RuntimeLayoutError> {
@@ -552,5 +812,100 @@ mod tests {
                 .kind(),
             RuntimeLayoutErrorKind::UnexpectedOwnedPath
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn reviewed_engine_binding_opens_only_a_search_corridor_and_private_work_directory() {
+        use flux_core::{CaptureGroupId, CaptureUserId};
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("runtime layout fixture");
+        let root = directory.path().join("flux");
+        std::fs::create_dir(&root).expect("create runtime root");
+        let layout = RuntimeLayout::bootstrap(&root).expect("bootstrap runtime layout");
+        // The current unprivileged test identity is a safe stand-in for the reviewed engine role;
+        // this test verifies exact metadata shape, while the Android qualification exercises the
+        // distinct UID/GID transition.
+        // SAFETY: these calls read only the current test-process identity.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: this call reads only the current test-process identity.
+        let gid = unsafe { libc::getegid() };
+        let credentials = EngineCredentials::new(
+            CaptureUserId::new(uid).expect("non-root fixture UID"),
+            CaptureGroupId::new(gid).expect("non-root fixture GID"),
+        );
+
+        let work = layout
+            .bind_reviewed_engine_runtime(credentials)
+            .expect("bind reviewed engine runtime");
+
+        let run = root.join("run");
+        let state = root.join("state");
+        for path in [&root, &run, &state] {
+            let metadata = std::fs::metadata(path).expect("traversal metadata");
+            assert_eq!(metadata.uid(), uid);
+            assert_eq!(metadata.gid(), gid);
+            assert_eq!(metadata.mode() & 0o777, 0o710);
+        }
+        let work_metadata = std::fs::metadata(&work).expect("engine work metadata");
+        assert_eq!(work, root.join("run/engine"));
+        assert_eq!(work_metadata.uid(), uid);
+        assert_eq!(work_metadata.gid(), gid);
+        assert_eq!(work_metadata.mode() & 0o777, 0o700);
+
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o710))
+            .expect("inject engine work mode drift");
+        assert_eq!(
+            layout
+                .bind_reviewed_engine_runtime(credentials)
+                .expect_err("existing engine work metadata drift must fail closed")
+                .kind(),
+            RuntimeLayoutErrorKind::UnsafeMetadata
+        );
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))
+            .expect("restore engine work mode");
+
+        let other_gid = if gid == 1 { 2 } else { 1 };
+        let wrong_group = EngineCredentials::new(
+            CaptureUserId::new(uid).expect("fixture UID"),
+            CaptureGroupId::new(other_gid).expect("different non-root fixture GID"),
+        );
+        assert_eq!(
+            layout
+                .bind_reviewed_engine_runtime(wrong_group)
+                .expect_err("wrong engine GID must not rewrite an existing work directory")
+                .kind(),
+            RuntimeLayoutErrorKind::UnsafeMetadata
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_engine_credentials_are_rejected_before_creating_a_work_directory() {
+        use flux_core::{CaptureGroupId, CaptureUserId};
+
+        let directory = tempfile::tempdir().expect("runtime layout fixture");
+        let root = directory.path().join("flux");
+        std::fs::create_dir(&root).expect("create runtime root");
+        let layout = RuntimeLayout::bootstrap(&root).expect("bootstrap runtime layout");
+        // SAFETY: this call reads only the current test-process identity.
+        let gid = unsafe { libc::getegid() };
+        let root_credentials = EngineCredentials::new(
+            CaptureUserId::new(0).expect("root UID is representable"),
+            CaptureGroupId::new(gid).expect("fixture GID"),
+        );
+
+        assert_eq!(
+            layout
+                .bind_reviewed_engine_runtime(root_credentials)
+                .expect_err("root credentials must be rejected")
+                .kind(),
+            RuntimeLayoutErrorKind::UnsafeMetadata
+        );
+        assert!(!root.join("run/engine").exists());
+        for path in [root.join("run"), root.join("state")] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
     }
 }

@@ -180,9 +180,13 @@ pub(crate) mod record_io {
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf};
 
     use super::{IntentStoreError, NEXT_TEMP_ID, Ordering};
+
+    const ENGINE_TRAVERSAL_DIRECTORY_MODE: libc::mode_t = 0o710;
+    const ENGINE_READ_ONLY_FILE_MODE: libc::mode_t = 0o440;
 
     struct ParentDirectory {
         directory: File,
@@ -334,6 +338,194 @@ pub(crate) mod record_io {
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
             Err(error) => Err(IntentStoreError::io("remove record", error)),
         }
+    }
+
+    pub(crate) fn bind_engine_traversal_directory(
+        directory_path: &Path,
+        engine_gid: libc::gid_t,
+    ) -> Result<(), IntentStoreError> {
+        let anchor = directory_path.join(".flux-engine-traversal");
+        let parent = open_parent_directory(&anchor, true)?.ok_or_else(|| {
+            IntentStoreError::io(
+                "create engine traversal directory",
+                io::Error::from_raw_os_error(libc::ENOENT),
+            )
+        })?;
+        require_engine_bound_metadata(
+            &parent.directory,
+            directory_path,
+            engine_gid,
+            ENGINE_TRAVERSAL_DIRECTORY_MODE,
+            true,
+        )
+    }
+
+    pub(crate) fn bind_engine_read_only_file(
+        path: &Path,
+        engine_gid: libc::gid_t,
+    ) -> Result<(), IntentStoreError> {
+        let parent = open_parent_directory(path, false)?.ok_or_else(|| {
+            IntentStoreError::io(
+                "open engine-readable record directory",
+                io::Error::from_raw_os_error(libc::ENOENT),
+            )
+        })?;
+        reject_symlink_at(parent.directory.as_raw_fd(), &parent.record_name, path)?;
+        let descriptor = open_at(
+            parent.directory.as_raw_fd(),
+            &parent.record_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+            None,
+        )
+        .map_err(|error| IntentStoreError::io("open engine-readable record", error))?;
+        // SAFETY: successful `openat` returned one new owned descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        require_regular_file(&file, path)?;
+        require_engine_bound_metadata(&file, path, engine_gid, ENGINE_READ_ONLY_FILE_MODE, false)
+    }
+
+    pub(crate) fn verify_engine_traversal_directory(
+        directory_path: &Path,
+        engine_gid: libc::gid_t,
+    ) -> Result<(), IntentStoreError> {
+        let anchor = directory_path.join(".flux-engine-traversal");
+        let parent = open_parent_directory(&anchor, false)?.ok_or_else(|| {
+            IntentStoreError::io(
+                "verify engine traversal directory",
+                io::Error::from_raw_os_error(libc::ENOENT),
+            )
+        })?;
+        verify_engine_bound_metadata(
+            &parent.directory,
+            directory_path,
+            engine_gid,
+            ENGINE_TRAVERSAL_DIRECTORY_MODE,
+            true,
+        )
+    }
+
+    pub(crate) fn verify_engine_read_only_file(
+        path: &Path,
+        engine_gid: libc::gid_t,
+    ) -> Result<(), IntentStoreError> {
+        let parent = open_parent_directory(path, false)?.ok_or_else(|| {
+            IntentStoreError::io(
+                "verify engine-readable record directory",
+                io::Error::from_raw_os_error(libc::ENOENT),
+            )
+        })?;
+        reject_symlink_at(parent.directory.as_raw_fd(), &parent.record_name, path)?;
+        let descriptor = open_at(
+            parent.directory.as_raw_fd(),
+            &parent.record_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+            None,
+        )
+        .map_err(|error| IntentStoreError::io("verify engine-readable record", error))?;
+        // SAFETY: successful `openat` returned one new owned descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        require_regular_file(&file, path)?;
+        verify_engine_bound_metadata(&file, path, engine_gid, ENGINE_READ_ONLY_FILE_MODE, false)
+    }
+
+    fn require_engine_bound_metadata(
+        file: &File,
+        path: &Path,
+        engine_gid: libc::gid_t,
+        mode: libc::mode_t,
+        directory: bool,
+    ) -> Result<(), IntentStoreError> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| IntentStoreError::io("inspect engine-bound record", error))?;
+        // SAFETY: `geteuid` reads only the current process identity.
+        let effective_uid = unsafe { libc::geteuid() };
+        // SAFETY: `getegid` reads only the current process identity.
+        let effective_gid = unsafe { libc::getegid() };
+        if metadata.uid() != effective_uid
+            || (directory && !metadata.is_dir())
+            || (!directory && !metadata.is_file())
+        {
+            return Err(IntentStoreError::io(
+                "bind engine-readable record metadata",
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is not a daemon-owned expected file type",
+                        path.display()
+                    ),
+                ),
+            ));
+        }
+        if engine_gid == 0 || engine_gid == u32::MAX {
+            return Err(noncanonical_engine_metadata(path));
+        }
+        if metadata.gid() == engine_gid && metadata.mode() & 0o777 == mode {
+            return Ok(());
+        }
+        let private_mode = if directory { 0o700 } else { 0o600 };
+        if metadata.mode() & 0o777 != private_mode
+            || (metadata.gid() != effective_gid
+                && metadata.gid() != engine_gid
+                && metadata.gid() != 0)
+        {
+            return Err(noncanonical_engine_metadata(path));
+        }
+        if metadata.gid() != engine_gid {
+            // SAFETY: the descriptor is the no-follow object inspected above; uid -1 preserves
+            // daemon ownership and only its group is bound to the reviewed engine.
+            if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, engine_gid) } != 0 {
+                return Err(IntentStoreError::io(
+                    "bind engine-readable record group",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        if metadata.mode() & 0o777 != mode {
+            // SAFETY: `file` owns the exact inspected descriptor and `fchmod` retains no pointer.
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+                return Err(IntentStoreError::io(
+                    "set engine-readable record mode",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        file.sync_all()
+            .map_err(|error| IntentStoreError::io("sync engine-readable record", error))?;
+        verify_engine_bound_metadata(file, path, engine_gid, mode, directory)
+    }
+
+    fn verify_engine_bound_metadata(
+        file: &File,
+        path: &Path,
+        engine_gid: libc::gid_t,
+        mode: libc::mode_t,
+        directory: bool,
+    ) -> Result<(), IntentStoreError> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| IntentStoreError::io("verify engine-bound record", error))?;
+        // SAFETY: `geteuid` reads only the current process identity.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() == effective_uid
+            && metadata.gid() == engine_gid
+            && metadata.mode() & 0o777 == mode
+            && ((directory && metadata.is_dir()) || (!directory && metadata.is_file()))
+        {
+            Ok(())
+        } else {
+            Err(noncanonical_engine_metadata(path))
+        }
+    }
+
+    fn noncanonical_engine_metadata(path: &Path) -> IntentStoreError {
+        IntentStoreError::io(
+            "verify engine-readable record metadata",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} has noncanonical engine access metadata", path.display()),
+            ),
+        )
     }
 
     fn open_parent_directory(
@@ -682,6 +874,47 @@ pub(crate) mod record_io {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(IntentStoreError::io("remove record", error)),
         }
+    }
+
+    pub(crate) fn bind_engine_traversal_directory(
+        directory_path: &Path,
+        _engine_gid: u32,
+    ) -> Result<(), IntentStoreError> {
+        Err(unsupported_engine_access(directory_path))
+    }
+
+    pub(crate) fn bind_engine_read_only_file(
+        path: &Path,
+        _engine_gid: u32,
+    ) -> Result<(), IntentStoreError> {
+        Err(unsupported_engine_access(path))
+    }
+
+    pub(crate) fn verify_engine_traversal_directory(
+        directory_path: &Path,
+        _engine_gid: u32,
+    ) -> Result<(), IntentStoreError> {
+        Err(unsupported_engine_access(directory_path))
+    }
+
+    pub(crate) fn verify_engine_read_only_file(
+        path: &Path,
+        _engine_gid: u32,
+    ) -> Result<(), IntentStoreError> {
+        Err(unsupported_engine_access(path))
+    }
+
+    fn unsupported_engine_access(path: &Path) -> IntentStoreError {
+        IntentStoreError::io(
+            "bind engine-readable record metadata",
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "reviewed engine filesystem access is unsupported for {} on this platform",
+                    path.display()
+                ),
+            ),
+        )
     }
 
     fn reject_symlink(path: &Path) -> Result<(), IntentStoreError> {

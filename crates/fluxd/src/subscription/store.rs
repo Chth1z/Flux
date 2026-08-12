@@ -26,6 +26,21 @@ const CONFIG_SUFFIX: &str = ".json";
 const ASSET_SUFFIX: &str = ".srs";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SubscriptionAssetAccess {
+    engine_gid: u32,
+}
+
+impl SubscriptionAssetAccess {
+    pub(super) const fn reviewed_engine(engine_gid: u32) -> Option<Self> {
+        if engine_gid == 0 || engine_gid == u32::MAX {
+            None
+        } else {
+            Some(Self { engine_gid })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotValidationErrorKind {
     Artifact,
     Process,
@@ -319,6 +334,7 @@ impl Error for SubscriptionSnapshotStoreError {
 pub(super) struct SubscriptionSnapshotStore<V> {
     root: PathBuf,
     validator: V,
+    asset_access: Option<SubscriptionAssetAccess>,
 }
 
 impl<V> fmt::Debug for SubscriptionSnapshotStore<V> {
@@ -331,16 +347,30 @@ impl<V> fmt::Debug for SubscriptionSnapshotStore<V> {
 }
 
 impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
+    #[cfg(test)]
     pub(super) fn new(
         root: impl AsRef<Path>,
         validator: V,
     ) -> Result<Self, SubscriptionSnapshotStoreError> {
+        Self::new_with_asset_access(root, validator, None)
+    }
+
+    pub(super) fn new_with_asset_access(
+        root: impl AsRef<Path>,
+        validator: V,
+        asset_access: Option<SubscriptionAssetAccess>,
+    ) -> Result<Self, SubscriptionSnapshotStoreError> {
         let root = root.as_ref();
         validate_store_root(root)?;
-        Ok(Self {
+        let store = Self {
             root: root.to_owned(),
             validator,
-        })
+            asset_access,
+        };
+        if let Some(access) = asset_access {
+            store.bind_asset_directory_access(access)?;
+        }
+        Ok(store)
     }
 
     pub(super) fn asset_root(&self) -> PathBuf {
@@ -350,6 +380,7 @@ impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
     pub(super) fn recover(
         &mut self,
     ) -> Result<SubscriptionSnapshotStoreReport, SubscriptionSnapshotStoreError> {
+        self.require_asset_access()?;
         let recovered = self.recover_index()?;
         Ok(self.report(recovered, SnapshotPublicationDisposition::Recovered))
     }
@@ -358,6 +389,7 @@ impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
         &mut self,
         prepared: PreparedSubscriptionRefresh,
     ) -> Result<SubscriptionSnapshotStoreReport, SubscriptionSnapshotStoreError> {
+        self.require_asset_access()?;
         self.validate_candidate(&prepared)?;
         let recovered = self.recover_index()?;
         let candidate_record = SnapshotRecord::from_prepared(&prepared);
@@ -455,6 +487,7 @@ impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
         &mut self,
         rejected_digest: [u8; 32],
     ) -> Result<SubscriptionSnapshotStoreReport, SubscriptionSnapshotStoreError> {
+        self.require_asset_access()?;
         let recovered = self.recover_index()?;
         let Some(active_record) = recovered.index.active.as_ref() else {
             return Err(SubscriptionSnapshotStoreError::RejectionConflict);
@@ -641,6 +674,10 @@ impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
         for asset in prepared.assets() {
             record_io::write(asset.path(), asset.bytes())
                 .map_err(SubscriptionSnapshotStoreError::storage)?;
+            if let Some(access) = self.asset_access {
+                record_io::bind_engine_read_only_file(asset.path(), access.engine_gid)
+                    .map_err(SubscriptionSnapshotStoreError::storage)?;
+            }
         }
         record_io::write(
             &self.config_path(*prepared.content_sha256()),
@@ -665,6 +702,10 @@ impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
         let mut remaining = MAX_PERSISTED_ASSET_BYTES;
         for content_sha256 in &record.assets {
             let path = self.asset_path(*content_sha256);
+            if let Some(access) = self.asset_access {
+                record_io::verify_engine_read_only_file(&path, access.engine_gid)
+                    .map_err(SnapshotLoadError::Storage)?;
+            }
             let bytes = read_snapshot_object(&path, remaining)?;
             if bytes.is_empty() {
                 return Err(SnapshotLoadError::Corrupt);
@@ -787,6 +828,37 @@ impl<V: SubscriptionSnapshotValidator> SubscriptionSnapshotStore<V> {
 
     fn asset_path(&self, digest: [u8; 32]) -> PathBuf {
         self.asset_root().join(object_name(digest, ASSET_SUFFIX))
+    }
+
+    fn bind_asset_directory_access(
+        &self,
+        access: SubscriptionAssetAccess,
+    ) -> Result<(), SubscriptionSnapshotStoreError> {
+        let asset_root = self.asset_root();
+        for directory in [self.root.as_path(), asset_root.as_path()] {
+            record_io::bind_engine_traversal_directory(directory, access.engine_gid)
+                .map_err(SubscriptionSnapshotStoreError::storage)?;
+        }
+        Ok(())
+    }
+
+    fn verify_asset_directory_access(
+        &self,
+        access: SubscriptionAssetAccess,
+    ) -> Result<(), SubscriptionSnapshotStoreError> {
+        let asset_root = self.asset_root();
+        for directory in [self.root.as_path(), asset_root.as_path()] {
+            record_io::verify_engine_traversal_directory(directory, access.engine_gid)
+                .map_err(SubscriptionSnapshotStoreError::storage)?;
+        }
+        Ok(())
+    }
+
+    fn require_asset_access(&self) -> Result<(), SubscriptionSnapshotStoreError> {
+        if let Some(access) = self.asset_access {
+            self.verify_asset_directory_access(access)?;
+        }
+        Ok(())
     }
 }
 

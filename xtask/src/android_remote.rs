@@ -267,27 +267,39 @@ pub(super) const fn path_absence_function() -> &'static str {
 }
 
 pub(super) fn owned_root_functions() -> String {
+    owned_root_functions_with_extra_owner(None)
+}
+
+pub(super) fn owned_root_functions_with_engine_group(engine_gid: u32) -> String {
+    assert!(engine_gid != 0 && engine_gid != u32::MAX);
+    owned_root_functions_with_extra_owner(Some(format!("710:0:{engine_gid}")))
+}
+
+fn owned_root_functions_with_extra_owner(extra_owner: Option<String>) -> String {
     let mut functions = String::from(path_absence_function());
-    functions.push_str(
-        "owned_root_matches() {\n\
+    let extra_owner = extra_owner
+        .map(|owner| format!(" || [ \"$ROOT_OWNER\" = '{owner}' ]"))
+        .unwrap_or_default();
+    functions.push_str(&format!(
+        "owned_root_matches() {{\n\
        [ -d \"$ROOT\" ] && [ ! -L \"$ROOT\" ] || return 1\n\
        CURRENT_DIRECTORY_ID=$(/system/bin/stat -Lc '%d:%i' \"$ROOT\") || return 1\n\
        [ -z \"$EXPECTED_DIRECTORY_ID\" ] || [ \"$CURRENT_DIRECTORY_ID\" = \"$EXPECTED_DIRECTORY_ID\" ] || return 1\n\
        ROOT_OWNER=$(/system/bin/stat -c '%a:%u:%g' \"$ROOT\") || return 1\n\
-       [ \"$ROOT_OWNER\" = '700:0:0' ] || [ \"$ROOT_OWNER\" = \"$EXPECTED_SHELL_OWNER\" ] || return 1\n\
+       [ \"$ROOT_OWNER\" = '700:0:0' ] || [ \"$ROOT_OWNER\" = \"$EXPECTED_SHELL_OWNER\" ]{extra_owner} || return 1\n\
        [ -f \"$OWNER\" ] && [ ! -L \"$OWNER\" ] || return 1\n\
        [ \"$(/system/bin/stat -c '%a:%u:%g' \"$OWNER\")\" = '600:0:0' ] || return 1\n\
        [ \"$(/system/bin/cat \"$OWNER\")\" = \"$EXPECTED_OWNER_RECORD\" ]\n\
-     }\n\
-     remove_owned_root() {\n\
+     }}\n\
+     remove_owned_root() {{\n\
        identity_matches || return 70\n\
        probe_process_absent\n\
        if path_absent \"$ROOT\"; then return 0; fi\n\
        owned_root_matches || return 73\n\
        /system/bin/rm -rf \"$ROOT\"\n\
        path_absent \"$ROOT\"\n\
-     }\n",
-    );
+     }}\n"
+    ));
     functions
 }
 
@@ -476,6 +488,20 @@ mod tests {
         assert!(function.contains("return 72"));
         assert!(function.contains("[ ! -e \"$COMM\" ] && continue"));
         assert!(!function.contains("pidof"));
+    }
+
+    #[test]
+    fn engine_group_cleanup_owner_is_explicit_and_does_not_widen_ordinary_runners() {
+        let ordinary = owned_root_functions();
+        let qualified = owned_root_functions_with_engine_group(2_900_002);
+
+        assert!(!ordinary.contains("710:0:2900002"));
+        assert!(qualified.contains("710:0:2900002"));
+        for original in ["700:0:0", "$EXPECTED_SHELL_OWNER"] {
+            assert!(ordinary.contains(original));
+            assert!(qualified.contains(original));
+        }
+        assert_eq!(qualified.matches("710:0:2900002").count(), 1);
     }
 
     #[cfg(target_os = "linux")]

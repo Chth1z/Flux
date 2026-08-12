@@ -25,8 +25,8 @@ use super::assets::{
 use super::fetch::{FetchAdapter, UreqFetchAdapter};
 use super::store::{
     SingBoxSnapshotValidator, SnapshotPublicationDisposition, SnapshotValidationErrorKind,
-    SubscriptionSnapshotStore, SubscriptionSnapshotStoreError, SubscriptionSnapshotValidator,
-    ValidatedSubscriptionSnapshot,
+    SubscriptionAssetAccess, SubscriptionSnapshotStore, SubscriptionSnapshotStoreError,
+    SubscriptionSnapshotValidator, ValidatedSubscriptionSnapshot,
 };
 
 const REFRESH_CHANNEL_CAPACITY: usize = 1;
@@ -427,8 +427,14 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
         engine_validator: Arc<dyn RefreshEngineValidator>,
     ) -> Result<Self, SubscriptionRefreshError> {
         let validator = RefreshSnapshotValidator::new(engine_validator);
-        let store = SubscriptionSnapshotStore::new(&paths.store_root, validator.clone())
-            .map_err(store_error)?;
+        let asset_access = reviewed_engine_credentials
+            .and_then(|credentials| SubscriptionAssetAccess::reviewed_engine(credentials.gid));
+        let store = SubscriptionSnapshotStore::new_with_asset_access(
+            &paths.store_root,
+            validator.clone(),
+            asset_access,
+        )
+        .map_err(store_error)?;
         Ok(Self {
             paths,
             adapter,

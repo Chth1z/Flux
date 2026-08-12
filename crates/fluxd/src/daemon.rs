@@ -744,11 +744,27 @@ where
     let reviewed_engine_credentials = reviewed_canary_facility_planning
         .as_ref()
         .map(|(policy, _)| policy.credentials());
+    let engine_working_directory = match reviewed_engine_credentials {
+        Some(reviewed)
+            if config.engine().credentials().uid().get() == reviewed.engine_uid().get()
+                && config.engine().credentials().gid().get() == reviewed.engine_gid().get() =>
+        {
+            runtime_layout
+                .bind_reviewed_engine_runtime(config.engine().credentials())
+                .map_err(DaemonError::RuntimeLayout)?
+        }
+        Some(_) => {
+            return Err(DaemonError::Invariant(
+                "reviewed engine credential authority differs from Desired State",
+            ));
+        }
+        None => options.runtime_root.clone(),
+    };
     let subscription = SubscriptionRefreshRuntime::start(
         SubscriptionRuntimePaths::new(
             &options.config_path,
             &options.subscription_store_path,
-            runtime_layout.run_path(),
+            &engine_working_directory,
             runtime_layout.run_path().join("subscription-check.log"),
         ),
         reviewed_engine_credentials,
@@ -762,7 +778,7 @@ where
     let source_paths = NativeGenerationSourcePaths::from_runtime_layout(
         &options.config_path,
         runtime_layout,
-        &options.runtime_root,
+        &engine_working_directory,
         runtime_layout.run_path().join("sing-box.log"),
     );
     let source = match engine_execution {

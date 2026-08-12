@@ -660,7 +660,41 @@ fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
         .mark_policy()
         .positive_grant()
         .expect("qualification mark grant");
-    assert_eq!(grant.ordered_late_writes().len(), 12);
+    assert_eq!(bound.mark_policy().revision().get(), 3);
+    assert_eq!(grant.ordered_late_writes().len(), 10);
+    let mut live_projection = format!("ordered_count={}\n", grant.ordered_late_writes().len());
+    for record in grant.ordered_late_writes() {
+        use std::fmt::Write as _;
+        let selector = record
+            .selector_digest()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        writeln!(
+            live_projection,
+            "source={:?} plane={:?} operation={:?} mask=0x{:08x} family={:?} hook={:?} chain={} hook_ordinal={} rule_ordinal={} placement={:?} selector={selector}",
+            record.mark_use().source(),
+            record.mark_use().plane(),
+            record.mark_use().operation(),
+            record.mark_use().mask(),
+            record.family(),
+            record.hook(),
+            record.child_chain().as_str(),
+            record.hook_ordinal(),
+            record.rule_ordinal(),
+            record.placement(),
+        )
+        .expect("write in-memory qualification projection");
+    }
+    assert_eq!(
+        Sha256::digest(live_projection.trim_end()).as_slice(),
+        &[
+            0xd0, 0x61, 0x2c, 0xb2, 0x9f, 0x59, 0x62, 0x75, 0xf9, 0x42, 0x10, 0xd7, 0x7a, 0x9d,
+            0x6a, 0x0b, 0x6a, 0xa4, 0x44, 0x4b, 0x85, 0xca, 0x26, 0xc3, 0xca, 0x56, 0x42, 0x07,
+            0x30, 0x0e, 0xec, 0xfd,
+        ]
+    );
     assert_eq!(grant.exact_mark_sentinels().len(), 2);
 }
 

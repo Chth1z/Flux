@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -20,6 +20,7 @@ const MAX_JSON_STRING_BYTES: usize = 16 * 1024;
 const MAX_TAG_CHARS: usize = 32;
 
 const INFRASTRUCTURE_TYPES: &[&str] = &["selector", "urltest", "direct", "block", "dns"];
+const SELECTION_TYPES: &[&str] = &["selector", "urltest"];
 const EXCLUDED_ASCII_TAG_FRAGMENTS: &[&str] = &[
     "expire", "traffic", "reset", "contact", "group", "notice", "platform", "website", "time",
     "suggest", "feedback", "version", "update",
@@ -816,37 +817,226 @@ fn merge_nodes(
         .filter_map(|node| node.get("tag").and_then(Value::as_str).map(str::to_owned))
         .collect();
     for outbound in outbounds.iter_mut() {
-        let Some(selector) = outbound.as_object_mut() else {
+        let Some(group) = outbound.as_object_mut() else {
             return Err(SubscriptionCompileError::InvalidShape(
                 "engine template outbound must be an object",
             ));
         };
-        if selector.get("type").and_then(Value::as_str) != Some("selector") {
+        if !group
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| SELECTION_TYPES.contains(&kind))
+        {
             continue;
         }
-        let selector_tag = selector
-            .get("tag")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let Some(members) = selector.get_mut("outbounds").and_then(Value::as_array_mut) else {
-            continue;
-        };
+        let group_tag = required_string(
+            group,
+            "tag",
+            "selection-group tag must be a nonempty string",
+        )?
+        .to_owned();
+        let members = group
+            .get_mut("outbounds")
+            .and_then(Value::as_array_mut)
+            .ok_or(SubscriptionCompileError::InvalidShape(
+                "selection-group outbounds must be an array",
+            ))?;
         if !members.is_empty() {
             continue;
         }
-        let selected = if matches!(selector_tag.as_str(), "PROXY" | "GLOBAL" | "AUTO") {
+        let selected = if matches!(group_tag.as_str(), "PROXY" | "AUTO") {
             all_tags.clone()
         } else {
             all_tags
                 .iter()
-                .filter(|tag| tag_matches_country(tag, &selector_tag))
+                .filter(|tag| tag_matches_country(tag, &group_tag))
                 .cloned()
                 .collect()
         };
         *members = selected.into_iter().map(Value::String).collect();
     }
+
+    prune_empty_country_groups(outbounds, &all_tags);
     outbounds.extend(nodes.into_iter().map(Value::Object));
+    validate_selection_graph(outbounds)?;
+    Ok(())
+}
+
+fn prune_empty_country_groups(outbounds: &mut Vec<Value>, proxy_tags: &[String]) {
+    let empty_country_tags: BTreeSet<String> = outbounds
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|object| {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| SELECTION_TYPES.contains(&kind))
+        })
+        .filter_map(|object| {
+            object
+                .get("outbounds")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+                .then(|| object.get("tag").and_then(Value::as_str))
+                .flatten()
+                .filter(|tag| !country_aliases(tag).is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+
+    outbounds.retain(|outbound| {
+        outbound
+            .as_object()
+            .and_then(|object| object.get("tag"))
+            .and_then(Value::as_str)
+            .is_none_or(|tag| !empty_country_tags.contains(tag))
+    });
+    for outbound in outbounds.iter_mut() {
+        let Some(object) = outbound.as_object_mut() else {
+            continue;
+        };
+        if !object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| SELECTION_TYPES.contains(&kind))
+        {
+            continue;
+        }
+        let tag = object
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(members) = object.get_mut("outbounds").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        members.retain(|member| {
+            member
+                .as_str()
+                .is_none_or(|tag| !empty_country_tags.contains(tag))
+        });
+        if members.is_empty() && matches!(tag.as_str(), "PROXY" | "AUTO") {
+            members.extend(proxy_tags.iter().cloned().map(Value::String));
+        }
+    }
+}
+
+fn validate_selection_graph(outbounds: &[Value]) -> Result<(), SubscriptionCompileError> {
+    let mut known_tags = BTreeSet::new();
+    let mut proxy_tags = BTreeSet::new();
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+
+    for outbound in outbounds {
+        let object = outbound
+            .as_object()
+            .ok_or(SubscriptionCompileError::InvalidShape(
+                "compiled outbound must be an object",
+            ))?;
+        let kind = required_string(
+            object,
+            "type",
+            "compiled outbound type must be a nonempty string",
+        )?;
+        let tag = required_string(
+            object,
+            "tag",
+            "compiled outbound tag must be a nonempty string",
+        )?;
+        if !known_tags.insert(tag.to_owned()) {
+            return Err(SubscriptionCompileError::InvalidShape(
+                "compiled outbound tags must be unique",
+            ));
+        }
+        if !INFRASTRUCTURE_TYPES.contains(&kind) {
+            proxy_tags.insert(tag.to_owned());
+        }
+        if SELECTION_TYPES.contains(&kind) {
+            let members = object.get("outbounds").and_then(Value::as_array).ok_or(
+                SubscriptionCompileError::InvalidShape(
+                    "selection-group outbounds must be an array",
+                ),
+            )?;
+            let mut unique_members = BTreeSet::new();
+            let members = members
+                .iter()
+                .map(|member| {
+                    member.as_str().filter(|member| !member.is_empty()).ok_or(
+                        SubscriptionCompileError::InvalidShape(
+                            "selection-group member must be a nonempty string",
+                        ),
+                    )
+                })
+                .map(|member| {
+                    let member = member?;
+                    if !unique_members.insert(member) {
+                        return Err(SubscriptionCompileError::InvalidShape(
+                            "selection-group members must be unique",
+                        ));
+                    }
+                    Ok(member.to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            groups.insert(tag.to_owned(), members);
+        }
+    }
+
+    let mut parents_by_member = BTreeMap::<String, Vec<String>>::new();
+    let mut group_indegrees: BTreeMap<String, usize> =
+        groups.keys().map(|tag| (tag.clone(), 0)).collect();
+    for (group, members) in &groups {
+        for member in members {
+            if !known_tags.contains(member) {
+                return Err(SubscriptionCompileError::InvalidShape(
+                    "selection-group member references a missing outbound",
+                ));
+            }
+            parents_by_member
+                .entry(member.clone())
+                .or_default()
+                .push(group.clone());
+            if let Some(indegree) = group_indegrees.get_mut(member) {
+                *indegree += 1;
+            }
+        }
+    }
+
+    let mut acyclic = group_indegrees
+        .iter()
+        .filter_map(|(tag, indegree)| (*indegree == 0).then_some(tag.clone()))
+        .collect::<Vec<_>>();
+    let mut visited_groups = 0usize;
+    while let Some(group) = acyclic.pop() {
+        visited_groups += 1;
+        for member in groups.get(&group).into_iter().flatten() {
+            let Some(indegree) = group_indegrees.get_mut(member) else {
+                continue;
+            };
+            *indegree -= 1;
+            if *indegree == 0 {
+                acyclic.push(member.clone());
+            }
+        }
+    }
+    if visited_groups != groups.len() {
+        return Err(SubscriptionCompileError::InvalidShape(
+            "selection-group graph must be acyclic",
+        ));
+    }
+
+    let mut reaches_proxy = proxy_tags.clone();
+    let mut reachable = proxy_tags.into_iter().collect::<Vec<_>>();
+    while let Some(tag) = reachable.pop() {
+        for group in parents_by_member.get(&tag).into_iter().flatten() {
+            if reaches_proxy.insert(group.clone()) {
+                reachable.push(group.clone());
+            }
+        }
+    }
+    if groups.keys().any(|group| !reaches_proxy.contains(group)) {
+        return Err(SubscriptionCompileError::InvalidShape(
+            "selection group cannot reach a usable proxy outbound",
+        ));
+    }
     Ok(())
 }
 
@@ -1336,6 +1526,159 @@ mod tests {
             outbounds[2]["outbounds"],
             serde_json::json!(["HK One", "HK One #2"])
         );
+    }
+
+    #[test]
+    fn absent_region_leaf_is_pruned_from_its_parent() {
+        let template = br#"{
+            "outbounds": [
+                {"type":"direct","tag":"DIRECT"},
+                {"type":"selector","tag":"PROXY","outbounds":["HK","TW","US"]},
+                {"type":"selector","tag":"GLOBAL","outbounds":["PROXY"]},
+                {"type":"selector","tag":"HK","outbounds":[]},
+                {"type":"selector","tag":"TW","outbounds":[]},
+                {"type":"selector","tag":"US","outbounds":[]}
+            ]
+        }"#;
+        let source = br#"[
+            {"type":"vless","tag":"HK One","server":"hk.example","server_port":443,"uuid":"hk"},
+            {"type":"vless","tag":"US One","server":"us.example","server_port":443,"uuid":"us"}
+        ]"#;
+
+        let artifact = compile_subscription_template(SubscriptionCompileRequest::new(
+            template,
+            source,
+            10,
+            TEST_DECODED_LIMIT,
+        ))
+        .expect("partially populated region graph compiles");
+        let value: Value = serde_json::from_slice(artifact.bytes()).expect("merged JSON parses");
+        let outbounds = value["outbounds"].as_array().expect("outbounds array");
+        let tags: Vec<_> = outbounds
+            .iter()
+            .filter_map(|outbound| outbound["tag"].as_str())
+            .collect();
+
+        assert_eq!(outbound_members(outbounds, "PROXY"), &["HK", "US"]);
+        assert_eq!(outbound_members(outbounds, "GLOBAL"), &["PROXY"]);
+        assert_eq!(outbound_members(outbounds, "HK"), &["HK One"]);
+        assert_eq!(outbound_members(outbounds, "US"), &["US One"]);
+        assert!(!tags.contains(&"TW"));
+    }
+
+    #[test]
+    fn empty_proxy_and_auto_roots_use_all_proxy_nodes_without_direct() {
+        let template = br#"{
+            "outbounds": [
+                {"type":"direct","tag":"DIRECT"},
+                {"type":"selector","tag":"PROXY","outbounds":["HK","TW"]},
+                {"type":"urltest","tag":"AUTO","outbounds":["HK","TW"]},
+                {"type":"selector","tag":"HK","outbounds":[]},
+                {"type":"selector","tag":"TW","outbounds":[]}
+            ]
+        }"#;
+        let source = br#"[
+            {"type":"vless","tag":"Alpha","server":"alpha.example","server_port":443,"uuid":"alpha"},
+            {"type":"vless","tag":"Beta","server":"beta.example","server_port":443,"uuid":"beta"}
+        ]"#;
+
+        let artifact = compile_subscription_template(SubscriptionCompileRequest::new(
+            template,
+            source,
+            10,
+            TEST_DECODED_LIMIT,
+        ))
+        .expect("unmatched regional roots compile through proxy nodes");
+        let value: Value = serde_json::from_slice(artifact.bytes()).expect("merged JSON parses");
+        let outbounds = value["outbounds"].as_array().expect("outbounds array");
+        let expected = ["Alpha", "Beta"];
+
+        assert_eq!(outbound_members(outbounds, "PROXY"), &expected);
+        assert_eq!(outbound_members(outbounds, "AUTO"), &expected);
+        assert!(!outbound_members(outbounds, "PROXY").contains(&"DIRECT"));
+        assert!(!outbound_members(outbounds, "AUTO").contains(&"DIRECT"));
+        assert!(
+            outbounds
+                .iter()
+                .all(|outbound| { !matches!(outbound["tag"].as_str(), Some("HK" | "TW")) })
+        );
+    }
+
+    #[test]
+    fn dangling_and_unusable_selection_graphs_fail_closed() {
+        for template in [
+            br#"{"outbounds":[{"type":"selector","tag":"PROXY","outbounds":["MISSING"]}]}"#
+                .as_slice(),
+            br#"{"outbounds":[
+                {"type":"selector","tag":"PROXY","outbounds":["LOOP"]},
+                {"type":"selector","tag":"LOOP","outbounds":["PROXY"]}
+            ]}"#
+            .as_slice(),
+            br#"{"outbounds":[
+                {"type":"direct","tag":"DIRECT"},
+                {"type":"selector","tag":"PROXY","outbounds":["DIRECT"]}
+            ]}"#
+            .as_slice(),
+            br#"{"outbounds":[
+                {"type":"direct","tag":"DIRECT"},
+                {"type":"selector","tag":"GLOBAL","outbounds":[]}
+            ]}"#
+            .as_slice(),
+            br#"{"outbounds":[
+                {"type":"direct","tag":"DIRECT"},
+                {"type":"selector","tag":"UNREVIEWED","outbounds":[]}
+            ]}"#
+            .as_slice(),
+        ] {
+            let error = compile_subscription_template(SubscriptionCompileRequest::new(
+                template,
+                br#"[{"type":"vless","tag":"Node","server":"node.example","server_port":443,"uuid":"node"}]"#,
+                10,
+                TEST_DECODED_LIMIT,
+            ))
+            .expect_err("invalid selection graph rejects before publication");
+            assert_eq!(error.kind(), SubscriptionCompileErrorKind::InvalidShape);
+        }
+    }
+
+    #[test]
+    fn valid_nonempty_groups_keep_their_order_and_membership() {
+        let template = br#"{
+            "outbounds": [
+                {"type":"selector","tag":"PROXY","outbounds":["MANUAL"]},
+                {"type":"selector","tag":"MANUAL","outbounds":["Beta","Alpha"]}
+            ]
+        }"#;
+        let source = br#"[
+            {"type":"vless","tag":"Alpha","server":"alpha.example","server_port":443,"uuid":"alpha"},
+            {"type":"vless","tag":"Beta","server":"beta.example","server_port":443,"uuid":"beta"}
+        ]"#;
+
+        let artifact = compile_subscription_template(SubscriptionCompileRequest::new(
+            template,
+            source,
+            10,
+            TEST_DECODED_LIMIT,
+        ))
+        .expect("valid custom selection graph compiles unchanged");
+        let value: Value = serde_json::from_slice(artifact.bytes()).expect("merged JSON parses");
+        let outbounds = value["outbounds"].as_array().expect("outbounds array");
+
+        assert_eq!(outbound_members(outbounds, "PROXY"), &["MANUAL"]);
+        assert_eq!(outbound_members(outbounds, "MANUAL"), &["Beta", "Alpha"]);
+    }
+
+    fn outbound_members<'a>(outbounds: &'a [Value], tag: &str) -> Vec<&'a str> {
+        outbounds
+            .iter()
+            .find(|outbound| outbound["tag"] == tag)
+            .expect("tagged outbound")
+            .get("outbounds")
+            .and_then(Value::as_array)
+            .expect("outbound member array")
+            .iter()
+            .map(|member| member.as_str().expect("string outbound member"))
+            .collect()
     }
 
     #[test]

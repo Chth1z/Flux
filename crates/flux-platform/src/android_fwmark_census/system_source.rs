@@ -75,6 +75,21 @@ pub enum SystemAndroidNftablesObservationErrorClass {
     LimitExceeded,
 }
 
+/// Stable privacy-safe class for TC/BPF observation failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemAndroidTrafficControlBpfObservationErrorClass {
+    InvalidBound,
+    PermissionDenied,
+    Unsupported,
+    Timeout,
+    SystemCall,
+    SnapshotDrift,
+    InvalidTrafficControlInfo,
+    InvalidLinkInfo,
+    InvalidProgramInfo,
+    LimitExceeded,
+}
+
 /// Sanitized production-source error.
 ///
 /// Display and Debug expose only the stable class. The concrete source remains available through
@@ -83,6 +98,7 @@ pub struct SystemAndroidFwmarkCensusSourceError {
     kind: SystemAndroidFwmarkCensusSourceErrorKind,
     kernel_config_class: Option<SystemAndroidKernelConfigErrorClass>,
     nftables_class: Option<SystemAndroidNftablesObservationErrorClass>,
+    traffic_control_bpf_class: Option<SystemAndroidTrafficControlBpfObservationErrorClass>,
     existing_flux_kind: Option<AndroidExistingFluxOwnershipErrorKind>,
     existing_flux_process_class: Option<AndroidExistingFluxProcessObservationErrorClass>,
     source: Option<Box<dyn Error + 'static>>,
@@ -108,6 +124,13 @@ impl SystemAndroidFwmarkCensusSourceError {
     }
 
     #[must_use]
+    pub const fn traffic_control_bpf_class(
+        &self,
+    ) -> Option<SystemAndroidTrafficControlBpfObservationErrorClass> {
+        self.traffic_control_bpf_class
+    }
+
+    #[must_use]
     pub const fn kernel_config_class(&self) -> Option<SystemAndroidKernelConfigErrorClass> {
         self.kernel_config_class
     }
@@ -129,6 +152,7 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind,
             kernel_config_class: None,
             nftables_class: None,
+            traffic_control_bpf_class: None,
             existing_flux_kind: None,
             existing_flux_process_class: None,
             source: None,
@@ -143,6 +167,7 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind,
             kernel_config_class: None,
             nftables_class: None,
+            traffic_control_bpf_class: None,
             existing_flux_kind: None,
             existing_flux_process_class: None,
             source: Some(Box::new(source)),
@@ -154,6 +179,7 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind: SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig,
             kernel_config_class: Some(source.class()),
             nftables_class: None,
+            traffic_control_bpf_class: None,
             existing_flux_kind: None,
             existing_flux_process_class: None,
             source: Some(Box::new(source)),
@@ -169,6 +195,7 @@ impl SystemAndroidFwmarkCensusSourceError {
                 source.transport_kind(),
                 source.raw_os_error(),
             )),
+            traffic_control_bpf_class: None,
             existing_flux_kind: None,
             existing_flux_process_class: None,
             source: Some(Box::new(source)),
@@ -180,8 +207,25 @@ impl SystemAndroidFwmarkCensusSourceError {
             kind: SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership,
             kernel_config_class: None,
             nftables_class: None,
+            traffic_control_bpf_class: None,
             existing_flux_kind: Some(source.kind()),
             existing_flux_process_class: source.process_observation_class(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn with_traffic_control_bpf_source(
+        source: AndroidTrafficControlBpfFwmarkObservationError,
+    ) -> Self {
+        Self {
+            kind: SystemAndroidFwmarkCensusSourceErrorKind::TrafficControlBpfObservation,
+            kernel_config_class: None,
+            nftables_class: None,
+            traffic_control_bpf_class: Some(classify_traffic_control_bpf_observation_error(
+                source.kind(),
+            )),
+            existing_flux_kind: None,
+            existing_flux_process_class: None,
             source: Some(Box::new(source)),
         }
     }
@@ -202,7 +246,11 @@ impl fmt::Display for SystemAndroidFwmarkCensusSourceError {
             formatter,
             "system Android fwmark census source failed: {:?}",
             self.kind
-        )
+        )?;
+        if let Some(class) = self.traffic_control_bpf_class {
+            write!(formatter, " ({class:?})")?;
+        }
+        Ok(())
     }
 }
 
@@ -514,10 +562,26 @@ const fn classify_nftables_kernel_rejection(
 fn map_traffic_control_bpf_observation(
     source: AndroidTrafficControlBpfFwmarkObservationError,
 ) -> SystemAndroidFwmarkCensusSourceError {
-    SystemAndroidFwmarkCensusSourceError::with_source(
-        SystemAndroidFwmarkCensusSourceErrorKind::TrafficControlBpfObservation,
-        source,
-    )
+    SystemAndroidFwmarkCensusSourceError::with_traffic_control_bpf_source(source)
+}
+
+const fn classify_traffic_control_bpf_observation_error(
+    kind: super::AndroidTrafficControlBpfFwmarkObservationErrorKind,
+) -> SystemAndroidTrafficControlBpfObservationErrorClass {
+    use super::AndroidTrafficControlBpfFwmarkObservationErrorKind as Source;
+    use SystemAndroidTrafficControlBpfObservationErrorClass as Class;
+    match kind {
+        Source::InvalidBound => Class::InvalidBound,
+        Source::Denied => Class::PermissionDenied,
+        Source::Unsupported => Class::Unsupported,
+        Source::Timeout => Class::Timeout,
+        Source::SystemCall => Class::SystemCall,
+        Source::SnapshotDrift => Class::SnapshotDrift,
+        Source::InvalidTrafficControlInfo => Class::InvalidTrafficControlInfo,
+        Source::InvalidLinkInfo => Class::InvalidLinkInfo,
+        Source::InvalidProgramInfo => Class::InvalidProgramInfo,
+        Source::LimitExceeded => Class::LimitExceeded,
+    }
 }
 
 fn map_xfrm_observation(
@@ -645,6 +709,55 @@ mod tests {
                 None,
             ),
             SystemAndroidNftablesObservationErrorClass::InvalidExpression
+        );
+    }
+
+    #[test]
+    fn traffic_control_bpf_error_class_preserves_semantics_without_raw_errno() {
+        use super::super::AndroidTrafficControlBpfFwmarkObservationErrorKind as Kind;
+
+        for (kind, expected) in [
+            (
+                Kind::Denied,
+                SystemAndroidTrafficControlBpfObservationErrorClass::PermissionDenied,
+            ),
+            (
+                Kind::Unsupported,
+                SystemAndroidTrafficControlBpfObservationErrorClass::Unsupported,
+            ),
+            (
+                Kind::Timeout,
+                SystemAndroidTrafficControlBpfObservationErrorClass::Timeout,
+            ),
+            (
+                Kind::SnapshotDrift,
+                SystemAndroidTrafficControlBpfObservationErrorClass::SnapshotDrift,
+            ),
+        ] {
+            assert_eq!(
+                classify_traffic_control_bpf_observation_error(kind),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_control_bpf_display_exposes_only_the_fixed_class() {
+        let error = SystemAndroidFwmarkCensusSourceError {
+            kind: SystemAndroidFwmarkCensusSourceErrorKind::TrafficControlBpfObservation,
+            kernel_config_class: None,
+            nftables_class: None,
+            traffic_control_bpf_class: Some(
+                SystemAndroidTrafficControlBpfObservationErrorClass::PermissionDenied,
+            ),
+            existing_flux_kind: None,
+            existing_flux_process_class: None,
+            source: None,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "system Android fwmark census source failed: TrafficControlBpfObservation (PermissionDenied)"
         );
     }
 }

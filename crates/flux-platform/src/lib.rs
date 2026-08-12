@@ -60,8 +60,8 @@ pub use android_fwmark_census::{
 pub use android_fwmark_census::{
     SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
     SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
-    collect_android_existing_flux_ownership, collect_android_traffic_control_bpf_fwmarks,
-    collect_android_xfrm_fwmarks,
+    SystemAndroidTrafficControlBpfObservationErrorClass, collect_android_existing_flux_ownership,
+    collect_android_traffic_control_bpf_fwmarks, collect_android_xfrm_fwmarks,
 };
 pub use android_kernel_capabilities::{
     ALL_ANDROID_KERNEL_FEATURES, ANDROID_KERNEL_CONFIG_DIGEST_BYTES, AndroidCapturePathCandidate,

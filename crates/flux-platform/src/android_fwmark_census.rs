@@ -70,6 +70,7 @@ pub use xfrm::{
 pub use system_source::{
     SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
     SystemAndroidFwmarkCensusSourceErrorKind, SystemAndroidNftablesObservationErrorClass,
+    SystemAndroidTrafficControlBpfObservationErrorClass,
 };
 
 const MAX_XTABLES_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;

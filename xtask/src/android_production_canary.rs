@@ -92,6 +92,8 @@ const PEER_NAMESPACE_REPORT_PAYLOAD_BYTES: u16 = 16;
 const PEER_NAMESPACE_REPORT_FRAME_BYTES: usize = 28;
 const QUALIFICATION_PASS_RECEIPT: &str = "FLUX_ANDROID_Q11_PASS";
 const QUALIFICATION_PASS_RECEIPT_LINE: &[u8] = b"FLUX_ANDROID_Q11_PASS\n";
+const QUALIFICATION_DAEMON_EXITED_STATUS: i32 = 74;
+const QUALIFICATION_READINESS_DEADLINE_STATUS: i32 = 75;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Options {
@@ -866,11 +868,34 @@ fn execute_qualification(
         // Never combine the peer namespace identity with status, stderr, or any other
         // diagnostic text. The independent audit receives it only through its private stdin
         // script after cleanup.
-        let diagnostic = "diagnostic=qualification-receipt-boundary";
+        let diagnostic = qualification_failure_diagnostic(
+            output.status.code(),
+            passed,
+            output.stderr.as_slice(),
+        );
         Err(format!(
             "Android production-canary qualification transaction failed at remote status {}; {diagnostic}",
             output.status.code().unwrap_or(-1),
         ))
+    }
+}
+
+fn qualification_failure_diagnostic(
+    status: Option<i32>,
+    passed: Option<bool>,
+    stderr: &[u8],
+) -> &'static str {
+    if !stderr.is_empty() || passed == Some(true) {
+        return "diagnostic=qualification-receipt-boundary";
+    }
+    match status {
+        Some(QUALIFICATION_DAEMON_EXITED_STATUS) => {
+            "diagnostic=qualification-daemon-exited-before-readiness"
+        }
+        Some(QUALIFICATION_READINESS_DEADLINE_STATUS) => {
+            "diagnostic=qualification-readiness-deadline-exceeded"
+        }
+        _ => "diagnostic=qualification-receipt-boundary",
     }
 }
 
@@ -1107,9 +1132,13 @@ fn qualification_execution_script(
          printf '%s\\n' \"$DAEMON_PID\" >\"$PID_FILE\"\n\
          /system/bin/chmod 600 \"$PID_FILE\"\n\
          READY=0\n\
+         DAEMON_EXITED_BEFORE_READY=0\n\
          N=0\n\
          while [ \"$N\" -lt 120 ]; do\n\
-           /system/bin/kill -0 \"$DAEMON_PID\" 2>/dev/null || break\n\
+           if ! /system/bin/kill -0 \"$DAEMON_PID\" 2>/dev/null; then\n\
+             DAEMON_EXITED_BEFORE_READY=1\n\
+             break\n\
+           fi\n\
            if run_flux \"$FLUXD\" status --json >\"$ROOT/status.json.tmp\" 2>/dev/null &&\n\
               /system/bin/grep -F '\"state\":\"admitted\"' \"$ROOT/status.json.tmp\" >/dev/null &&\n\
               /system/bin/grep -F '\"phase\":\"running\"' \"$ROOT/status.json.tmp\" >/dev/null &&\n\
@@ -1121,7 +1150,8 @@ fn qualification_execution_script(
            N=$((N + 1))\n\
            /system/bin/sleep 1\n\
          done\n\
-         [ \"$READY\" = '1' ] || exit 75\n\
+         [ \"$DAEMON_EXITED_BEFORE_READY\" = '0' ] || exit {QUALIFICATION_DAEMON_EXITED_STATUS}\n\
+         [ \"$READY\" = '1' ] || exit {QUALIFICATION_READINESS_DEADLINE_STATUS}\n\
          run_flux \"$FLUXD\" stop >/dev/null 2>&1 || exit 76\n\
          run_flux \"$FLUXD\" status --json >\"$ROOT/status.stopped.json\" 2>/dev/null\n\
          /system/bin/grep -F '\"phase\":\"stopped\"' \"$ROOT/status.stopped.json\" >/dev/null\n\
@@ -1927,6 +1957,57 @@ mod tests {
         ));
         assert_eq!(execution.matches("FLUX_Q11_NETNS_REPORT_FD=3").count(), 1);
         assert!(!execution.contains("peer_network_namespace="));
+    }
+
+    #[test]
+    fn qualification_runner_distinguishes_early_daemon_exit_from_readiness_deadline() {
+        let remote = test_remote_directory();
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let artifacts = test_artifacts();
+        let execution = qualification_execution_script(&remote, &device, &artifacts);
+
+        assert!(execution.contains("DAEMON_EXITED_BEFORE_READY=0"));
+        assert!(execution.contains("DAEMON_EXITED_BEFORE_READY=1"));
+        assert!(execution.contains("[ \"$DAEMON_EXITED_BEFORE_READY\" = '0' ] || exit 74"));
+        assert!(execution.contains("[ \"$READY\" = '1' ] || exit 75"));
+    }
+
+    #[test]
+    fn qualification_failure_classes_are_fixed_and_require_a_clean_failure_boundary() {
+        assert_eq!(
+            qualification_failure_diagnostic(
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"",
+            ),
+            "diagnostic=qualification-daemon-exited-before-readiness"
+        );
+        assert_eq!(
+            qualification_failure_diagnostic(
+                Some(QUALIFICATION_READINESS_DEADLINE_STATUS),
+                Some(false),
+                b"",
+            ),
+            "diagnostic=qualification-readiness-deadline-exceeded"
+        );
+        for (status, passed, stderr) in [
+            (Some(73), Some(false), b"".as_slice()),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(true),
+                b"".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"unexpected".as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                qualification_failure_diagnostic(status, passed, stderr),
+                "diagnostic=qualification-receipt-boundary"
+            );
+        }
     }
 
     #[test]

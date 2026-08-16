@@ -57,6 +57,15 @@ const FACILITY_ATTEMPT_COUNTER_MAXIMUM: u64 = 128;
 const FACILITY_JOURNAL_SCHEMA_VERSION: u16 = 1;
 const FACILITY_JOURNAL_MAX_BYTES: usize = 16 * 1024;
 
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_MAGIC: &[u8; 8] = b"FLXQ11NS";
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_VERSION: u16 = 1;
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_PAYLOAD_LENGTH: u16 = 16;
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_FRAME_LENGTH: usize = 28;
+
 const FACILITY_POOL_DIGEST_DOMAIN: &[u8] =
     b"Flux reviewed boot canary facility pool\0canonical-v1\0sha256-v1\0";
 const FACILITY_AUDIT_DIGEST_DOMAIN: &[u8] =
@@ -170,6 +179,14 @@ pub(crate) struct NativeBootCanaryFacility {
 }
 
 impl NativeBootCanaryFacility {
+    #[cfg(flux_android_qualification)]
+    pub(crate) fn report_qualification_peer_network_namespace(
+        &self,
+        descriptor: OwnedFd,
+    ) -> Result<(), NativeCanaryFacilityError> {
+        write_qualification_peer_netns_report(descriptor, self.peer_network_namespace)
+    }
+
     pub(crate) fn into_runtime_authorities(
         self,
         inventory: NetworkInventorySource,
@@ -1567,6 +1584,34 @@ fn network_namespace_identity(
     )
 }
 
+#[cfg(any(test, flux_android_qualification))]
+fn encode_qualification_peer_netns_report(
+    identity: NetworkNamespaceIdentity,
+) -> [u8; QUALIFICATION_PEER_NETNS_REPORT_FRAME_LENGTH] {
+    let mut encoded = [0_u8; QUALIFICATION_PEER_NETNS_REPORT_FRAME_LENGTH];
+    encoded[..8].copy_from_slice(QUALIFICATION_PEER_NETNS_REPORT_MAGIC);
+    encoded[8..10].copy_from_slice(&QUALIFICATION_PEER_NETNS_REPORT_VERSION.to_be_bytes());
+    encoded[10..12].copy_from_slice(&QUALIFICATION_PEER_NETNS_REPORT_PAYLOAD_LENGTH.to_be_bytes());
+    encoded[12..20].copy_from_slice(&identity.device().to_be_bytes());
+    encoded[20..28].copy_from_slice(&identity.inode().to_be_bytes());
+    encoded
+}
+
+#[cfg(any(test, flux_android_qualification))]
+fn write_qualification_peer_netns_report(
+    descriptor: OwnedFd,
+    identity: NetworkNamespaceIdentity,
+) -> Result<(), NativeCanaryFacilityError> {
+    let encoded = encode_qualification_peer_netns_report(identity);
+    let mut report = File::from(descriptor);
+    io::Write::write_all(&mut report, &encoded).map_err(|source| {
+        NativeCanaryFacilityError::system(
+            "write qualification peer network namespace report",
+            source,
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FacilityHostRoute {
     destination: IpAddr,
@@ -1961,6 +2006,11 @@ fn unique_interface_index(
 }
 
 fn create_peer_network_namespace() -> Result<File, NativeCanaryFacilityError> {
+    // Holder-domain invariant for the qualification-only anonymous-namespace audit: this
+    // facility uses ordinary Rust threads and never unshares CLONE_FILES or CLONE_NEWNS. Worker
+    // threads may change only their calling thread's CLONE_NEWNET, and `File::try_clone` keeps
+    // every retained nsfs descriptor in the daemon's one process file table. The independent
+    // audit therefore scans every task's network-namespace link plus the process FD/mount tables.
     std::thread::Builder::new()
         .name("flux-canary-netns-create".to_owned())
         .spawn(|| {
@@ -3057,7 +3107,9 @@ fn decode_netlink_ack(bytes: &[u8]) -> Result<(), NativeCanaryFacilityError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
     use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
 
     use super::*;
     use crate::functional_canary::CanaryUserNamespaceBinding;
@@ -3070,6 +3122,46 @@ mod tests {
             device,
             NonZeroU64::new(inode).expect("test namespace inode is nonzero"),
         )
+    }
+
+    #[test]
+    fn qualification_peer_netns_report_is_one_canonical_big_endian_frame() {
+        let identity = NetworkNamespaceIdentity::new(0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+            .expect("test peer namespace identity");
+
+        assert_eq!(
+            encode_qualification_peer_netns_report(identity),
+            *b"FLXQ11NS\x00\x01\x00\x10\x01\x02\x03\x04\x05\x06\x07\x08\x11\x12\x13\x14\x15\x16\x17\x18"
+        );
+    }
+
+    #[test]
+    fn qualification_peer_netns_report_writer_closes_the_transferred_descriptor() {
+        let identity = NetworkNamespaceIdentity::new(17, 19).expect("test namespace identity");
+        let (mut reader, writer) = UnixStream::pair().expect("report pipe");
+
+        write_qualification_peer_netns_report(writer.into(), identity)
+            .expect("write qualification report");
+
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .expect("read report through EOF");
+        assert_eq!(bytes, encode_qualification_peer_netns_report(identity));
+    }
+
+    #[test]
+    fn qualification_peer_netns_report_writer_keeps_errors_identity_free() {
+        let identity = NetworkNamespaceIdentity::new(0x0102_0304, 0x0506_0708)
+            .expect("test namespace identity");
+        let (reader, writer) = UnixStream::pair().expect("report pipe");
+        drop(reader);
+
+        let error = write_qualification_peer_netns_report(writer.into(), identity)
+            .expect_err("closed report reader must fail");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("16909060"));
+        assert!(!rendered.contains("84281096"));
     }
 
     #[test]

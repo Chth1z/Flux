@@ -18,7 +18,8 @@ use super::android_canary::{
     device_identity_function, push_artifact, revalidate_device, verify_device,
 };
 use super::android_remote::{
-    FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec, normalize_adb_shell_output,
+    FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec,
+    normalize_adb_shell_newlines, normalize_adb_shell_output,
     owned_root_functions_with_engine_group, parse_directory_identity, path_absence_function,
     process_absence_function, run_owned_remote_transaction, shell_single_quote,
 };
@@ -74,12 +75,23 @@ const QUALIFICATION_DOWNLOAD_TIMEOUT_SECS: i64 = 60;
 const MAX_CARGO_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+const PEER_NAMESPACE_ABSENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const ADB_EXECUTION_TIMEOUT: Duration = Duration::from_secs(180);
 const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(test)]
 const DIAGNOSTIC_STATUS_BEGIN: &str = "FLUX_ANDROID_Q11_STATUS_BEGIN";
+#[cfg(test)]
 const DIAGNOSTIC_STATUS_END: &str = "FLUX_ANDROID_Q11_STATUS_END";
+#[cfg(test)]
 const DIAGNOSTIC_STDERR_BEGIN: &str = "FLUX_ANDROID_Q11_STDERR_BEGIN";
+#[cfg(test)]
 const DIAGNOSTIC_STDERR_END: &str = "FLUX_ANDROID_Q11_STDERR_END";
+const PEER_NAMESPACE_REPORT_MAGIC: &[u8; 8] = b"FLXQ11NS";
+const PEER_NAMESPACE_REPORT_VERSION: u16 = 1;
+const PEER_NAMESPACE_REPORT_PAYLOAD_BYTES: u16 = 16;
+const PEER_NAMESPACE_REPORT_FRAME_BYTES: usize = 28;
+const QUALIFICATION_PASS_RECEIPT: &str = "FLUX_ANDROID_Q11_PASS";
+const QUALIFICATION_PASS_RECEIPT_LINE: &[u8] = b"FLUX_ANDROID_Q11_PASS\n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Options {
@@ -92,6 +104,37 @@ pub(super) struct Options {
 enum SubscriptionInput {
     File(PathBuf),
     Stdin,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PeerNetworkNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PeerNetworkNamespaceIdentity {
+    fn new(device: u64, inode: u64) -> Option<Self> {
+        (inode != 0).then_some(Self { device, inode })
+    }
+
+    fn canonical(self) -> String {
+        format!("{}:{}", self.device, self.inode)
+    }
+
+    fn mount_device(self) -> String {
+        format!(
+            "{}:{}",
+            linux_device_major(self.device),
+            linux_device_minor(self.device)
+        )
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct QualificationExecutionReceipt {
+    peer_network_namespace: PeerNetworkNamespaceIdentity,
+    passed: bool,
 }
 
 pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
@@ -233,12 +276,30 @@ pub(super) fn run(options: Options) -> Result<(), String> {
 
     let mut remote = remote;
     preflight_remote_directory(&options.target, &device, &remote)?;
-    run_owned_remote_transaction(
+    let mut peer_network_namespace = None;
+    let mut peer_namespace_receipt_required = false;
+    let transaction = run_owned_remote_transaction(
         &mut remote,
         |remote| create_remote_directory(&options.target, &device, remote),
-        |remote| execute_qualification(&options.target, &device, remote, &artifacts),
+        |remote| {
+            execute_qualification(
+                &options.target,
+                &device,
+                remote,
+                &artifacts,
+                &mut peer_network_namespace,
+                &mut peer_namespace_receipt_required,
+            )
+        },
         |remote| cleanup_qualification(&options.target, &device, remote, &artifacts),
-    )?;
+    );
+    let peer_namespace_absence = match peer_network_namespace {
+        Some(identity) => prove_peer_network_namespace_absent(&options.target, &device, identity),
+        None => {
+            missing_peer_namespace_receipt_result(&transaction, peer_namespace_receipt_required)
+        }
+    };
+    combine_transaction_and_peer_namespace_absence(transaction, peer_namespace_absence)?;
     revalidate_device(
         &options.target,
         &device,
@@ -723,6 +784,8 @@ fn execute_qualification(
     device: &DeviceProfile,
     remote: &OwnedRemoteDirectory,
     artifacts: &QualificationArtifacts,
+    peer_network_namespace: &mut Option<PeerNetworkNamespaceIdentity>,
+    peer_namespace_receipt_required: &mut bool,
 ) -> Result<(), String> {
     artifacts.verify()?;
     revalidate_device(options, device, "before qualification artifact push")?;
@@ -774,20 +837,36 @@ fn execute_qualification(
     }
     revalidate_device(options, device, "after qualification artifact push")?;
     let script = qualification_execution_script(remote, device, artifacts);
-    let output = normalize_adb_shell_output(adb_root_shell_output(
+    *peer_namespace_receipt_required = true;
+    let mut output = adb_root_shell_output(
         options,
         script.as_bytes(),
         ADB_EXECUTION_TIMEOUT,
         "run Android production-canary qualification transaction",
-    )?)?;
-    if output.status.success()
-        && output.stdout == b"FLUX_ANDROID_Q11_PASS\n"
-        && output.stderr.is_empty()
-    {
+    )
+    .map_err(|_| "Android production-canary qualification transport failed".to_owned())?;
+    let passed = if output.stdout.is_empty() {
+        None
+    } else {
+        let (identity, suffix) = decode_qualification_peer_namespace_frame(&output.stdout)?;
+        if peer_network_namespace.is_some() {
+            return Err(
+                "qualification returned a duplicate peer network-namespace receipt".to_owned(),
+            );
+        }
+        // Bind the first complete binary frame before validating trailing shell output or
+        // stderr. A malformed suffix must still retain the exact identity for post-cleanup audit.
+        *peer_network_namespace = Some(identity);
+        Some(parse_qualification_receipt_suffix(suffix)?)
+    };
+    output.stderr = normalize_adb_shell_newlines(output.stderr, "stderr")?;
+    if output.status.success() && passed == Some(true) && output.stderr.is_empty() {
         Ok(())
     } else {
-        let diagnostic = collect_failure_diagnostic(options, device, remote, artifacts)
-            .unwrap_or_else(|_| "diagnostic=unavailable".to_owned());
+        // Never combine the peer namespace identity with status, stderr, or any other
+        // diagnostic text. The independent audit receives it only through its private stdin
+        // script after cleanup.
+        let diagnostic = "diagnostic=qualification-receipt-boundary";
         Err(format!(
             "Android production-canary qualification transaction failed at remote status {}; {diagnostic}",
             output.status.code().unwrap_or(-1),
@@ -795,37 +874,66 @@ fn execute_qualification(
     }
 }
 
-fn collect_failure_diagnostic(
-    options: &AndroidTargetOptions,
-    device: &DeviceProfile,
-    remote: &OwnedRemoteDirectory,
-    artifacts: &QualificationArtifacts,
-) -> Result<String, String> {
-    let script = qualification_failure_diagnostic_script(remote, device);
-    let output = normalize_adb_shell_output(adb_root_shell_output(
-        options,
-        script.as_bytes(),
-        ADB_QUERY_TIMEOUT,
-        "collect bounded Android qualification failure class",
-    )?)?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        return Err("bounded qualification diagnostic collection failed".to_owned());
+#[cfg(test)]
+fn parse_qualification_execution_receipt(
+    bytes: &[u8],
+) -> Result<QualificationExecutionReceipt, String> {
+    let (peer_network_namespace, suffix) = decode_qualification_peer_namespace_frame(bytes)?;
+    Ok(QualificationExecutionReceipt {
+        peer_network_namespace,
+        passed: parse_qualification_receipt_suffix(suffix)?,
+    })
+}
+
+fn decode_qualification_peer_namespace_frame(
+    bytes: &[u8],
+) -> Result<(PeerNetworkNamespaceIdentity, &[u8]), String> {
+    if bytes.len() < PEER_NAMESPACE_REPORT_FRAME_BYTES {
+        return Err("qualification peer network-namespace receipt is truncated".to_owned());
     }
-    let text = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "bounded qualification diagnostic is not UTF-8".to_owned())?;
-    let status = extract_diagnostic_section(text, DIAGNOSTIC_STATUS_BEGIN, DIAGNOSTIC_STATUS_END)?;
-    let stderr = extract_diagnostic_section(text, DIAGNOSTIC_STDERR_BEGIN, DIAGNOSTIC_STDERR_END)?;
-    let secret = fs::read_to_string(&artifacts.subscription)
-        .map_err(|error| format!("reopen runtime subscription only for redaction: {error}"))?;
-    Ok(summarize_qualification_diagnostic(
-        status,
-        stderr,
-        remote.path(),
-        secret.trim(),
-        device,
+    let frame = &bytes[..PEER_NAMESPACE_REPORT_FRAME_BYTES];
+    if &frame[..8] != PEER_NAMESPACE_REPORT_MAGIC
+        || u16::from_be_bytes([frame[8], frame[9]]) != PEER_NAMESPACE_REPORT_VERSION
+        || u16::from_be_bytes([frame[10], frame[11]]) != PEER_NAMESPACE_REPORT_PAYLOAD_BYTES
+    {
+        return Err(
+            "qualification peer network-namespace receipt has an invalid schema".to_owned(),
+        );
+    }
+    let device = u64::from_be_bytes(
+        frame[12..20]
+            .try_into()
+            .expect("fixed peer namespace device field"),
+    );
+    let inode = u64::from_be_bytes(
+        frame[20..28]
+            .try_into()
+            .expect("fixed peer namespace inode field"),
+    );
+    let peer_network_namespace = PeerNetworkNamespaceIdentity::new(device, inode)
+        .ok_or_else(|| "qualification peer network-namespace receipt is invalid".to_owned())?;
+    Ok((
+        peer_network_namespace,
+        &bytes[PEER_NAMESPACE_REPORT_FRAME_BYTES..],
     ))
 }
 
+fn parse_qualification_receipt_suffix(bytes: &[u8]) -> Result<bool, String> {
+    let suffix =
+        normalize_adb_shell_newlines(bytes.to_vec(), "qualification receipt").map_err(|_| {
+            "qualification peer network-namespace receipt has invalid framing".to_owned()
+        })?;
+    match suffix.as_slice() {
+        b"" => Ok(false),
+        value if value == QUALIFICATION_PASS_RECEIPT_LINE => Ok(true),
+        _ => Err(
+            "qualification peer network-namespace receipt has unexpected trailing output"
+                .to_owned(),
+        ),
+    }
+}
+
+#[cfg(test)]
 fn qualification_failure_diagnostic_script(
     remote: &OwnedRemoteDirectory,
     device: &DeviceProfile,
@@ -855,22 +963,7 @@ fn qualification_failure_diagnostic_script(
     )
 }
 
-fn extract_diagnostic_section<'a>(
-    text: &'a str,
-    begin: &str,
-    end: &str,
-) -> Result<&'a str, String> {
-    let start = text
-        .find(begin)
-        .map(|index| index + begin.len())
-        .ok_or_else(|| format!("qualification diagnostic omitted {begin}"))?;
-    let remaining = &text[start..];
-    let finish = remaining
-        .find(end)
-        .ok_or_else(|| format!("qualification diagnostic omitted {end}"))?;
-    Ok(remaining[..finish].trim())
-}
-
+#[cfg(test)]
 fn summarize_qualification_diagnostic(
     status: &str,
     stderr: &str,
@@ -918,6 +1011,7 @@ fn summarize_qualification_diagnostic(
     }
 }
 
+#[cfg(test)]
 fn qualification_selector_mismatch_summary(status: Option<&serde_json::Value>) -> String {
     const ALLOWED_FIELDS: [&str; 12] = [
         "android_product",
@@ -1008,7 +1102,7 @@ fn qualification_execution_script(
          run_flux() {{\n\
            FLUX_ROOT=\"$ROOT\" FLUXD_SOCKET=\"$SOCKET\" FLUXD_LEASE_PATH=\"$ROOT/run/fluxd.lease\" FLUXD_CONFIG_PATH=\"$CONFIG\" FLUXD_INTENT_PATH=\"$ROOT/state/administrative-intent.json\" FLUX_DISABLE_PATH=\"$ROOT/disable\" \"$@\"\n\
          }}\n\
-         run_flux \"$FLUXD\" daemon </dev/null >\"$ROOT/daemon.stdout\" 2>\"$ROOT/daemon.stderr\" &\n\
+         FLUX_Q11_NETNS_REPORT_FD=3 run_flux \"$FLUXD\" daemon 3>&1 </dev/null >\"$ROOT/daemon.stdout\" 2>\"$ROOT/daemon.stderr\" &\n\
          DAEMON_PID=$!\n\
          printf '%s\\n' \"$DAEMON_PID\" >\"$PID_FILE\"\n\
          /system/bin/chmod 600 \"$PID_FILE\"\n\
@@ -1036,7 +1130,7 @@ fn qualification_execution_script(
          shutdown_daemon\n\
          probe_process_absent\n\
          exact_flux_absence\n\
-         echo 'FLUX_ANDROID_Q11_PASS'\n\
+         echo '{QUALIFICATION_PASS_RECEIPT}'\n\
          trap - EXIT HUP INT TERM\n",
         remote.shell_variables(device.shell_uid(), device.shell_gid()),
         device_identity_function(device),
@@ -1248,6 +1342,303 @@ fn qualification_absence_script(remote: &OwnedRemoteDirectory, device: &DevicePr
     )
 }
 
+fn prove_peer_network_namespace_absent(
+    options: &AndroidTargetOptions,
+    device: &DeviceProfile,
+    identity: PeerNetworkNamespaceIdentity,
+) -> Result<(), String> {
+    let script = peer_network_namespace_absence_script(device, identity);
+    let output = adb_root_shell_output(
+        options,
+        script.as_bytes(),
+        PEER_NAMESPACE_ABSENCE_TIMEOUT,
+        "independently prove peer network-namespace absence",
+    )
+    .map_err(|_| "independent peer network-namespace audit transport failed".to_owned())?;
+    let output = normalize_adb_shell_output(output)?;
+    require_silent_success(output, "independent peer network-namespace absence proof")
+}
+
+fn peer_network_namespace_absence_script(
+    device: &DeviceProfile,
+    identity: PeerNetworkNamespaceIdentity,
+) -> String {
+    let expected_identity = shell_single_quote(&identity.canonical());
+    let expected_mount_device = shell_single_quote(&identity.mount_device());
+    let expected_inode = shell_single_quote(&identity.inode.to_string());
+    format!(
+        "set -eu\n\
+         EXPECTED_PEER_NAMESPACE={expected_identity}\n\
+         EXPECTED_PEER_MOUNT_DEVICE={expected_mount_device}\n\
+         EXPECTED_PEER_INODE={expected_inode}\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         scan_process_mountinfo() {{\n\
+           # Keep the private identity off argv. The shell builtin writes exactly two lines to\n\
+           # this one audit process. A vanished process, or a terminal zombie whose file table\n\
+           # and namespaces are already released, is the only admissible read-race outcome.\n\
+           MOUNT_SCAN_ATTEMPT=0\n\
+           while [ \"$MOUNT_SCAN_ATTEMPT\" -lt 3 ]; do\n\
+             MOUNT_SCAN_ATTEMPT=$((MOUNT_SCAN_ATTEMPT + 1))\n\
+             MOUNT_SCAN_STATUS=0\n\
+             printf '%s\\n%s\\n' \"$EXPECTED_PEER_MOUNT_DEVICE\" \"$EXPECTED_PEER_INODE\" |\n\
+             /system/bin/awk '\n\
+               function process_released(process, path, result, line, fields, state) {{\n\
+                 if (system(\"[ ! -d \" process \" ]\") == 0) return 1\n\
+                 path = process \"/status\"\n\
+                 while ((result = (getline line < path)) > 0) {{\n\
+                   split(line, fields)\n\
+                   if (fields[1] == \"State:\") {{\n\
+                     state = fields[2]\n\
+                     break\n\
+                   }}\n\
+                 }}\n\
+                 close(path)\n\
+                 if (state == \"Z\" || state == \"X\") return 1\n\
+                 return system(\"[ ! -d \" process \" ]\") == 0\n\
+               }}\n\
+               function fail(code) {{\n\
+                 failure = code\n\
+                 exit code\n\
+               }}\n\
+               BEGIN {{\n\
+                 identity_input = \"/proc/self/fd/0\"\n\
+                 if ((getline expected_device < identity_input) != 1 ||\n\
+                     (getline expected_inode < identity_input) != 1 ||\n\
+                     (getline unexpected_identity_line < identity_input) != 0) fail(109)\n\
+                 close(identity_input)\n\
+                 for (argument = 1; argument < ARGC; argument++) {{\n\
+                   process = ARGV[argument]\n\
+                   ARGV[argument] = \"\"\n\
+                   process_count++\n\
+                   if (process_count > 65536) fail(105)\n\
+                   path = process \"/mountinfo\"\n\
+                   mountinfo_lines = 0\n\
+                   while ((read_status = (getline line < path)) > 0) {{\n\
+                     $0 = line\n\
+                     mountinfo_lines++\n\
+                     total_mountinfo_lines++\n\
+                     if (NF < 10) fail(91)\n\
+                     if (mountinfo_lines > 65536) fail(102)\n\
+                     if (total_mountinfo_lines > 1048576) fail(107)\n\
+                     separator = 0\n\
+                     for (field = 7; field <= NF; field++) {{\n\
+                       if ($field == \"-\") {{\n\
+                         separator = field\n\
+                         break\n\
+                       }}\n\
+                     }}\n\
+                     if (separator == 0 || separator + 3 > NF) fail(91)\n\
+                     if ($(separator + 1) == \"nsfs\" &&\n\
+                         $3 == expected_device &&\n\
+                         ($4 == \"net:[\" expected_inode \"]\" ||\n\
+                          $4 == \"/net:[\" expected_inode \"]\")) fail(92)\n\
+                   }}\n\
+                   close(path)\n\
+                   if (read_status < 0) {{\n\
+                     if (process_released(process)) continue\n\
+                     fail(101)\n\
+                   }}\n\
+                   if (mountinfo_lines == 0) {{\n\
+                     if (process_released(process)) continue\n\
+                     fail(103)\n\
+                   }}\n\
+                   scanned_mountinfo_files++\n\
+                 }}\n\
+                 if (scanned_mountinfo_files == 0) fail(100)\n\
+                 exit 0\n\
+               }}\n\
+               END {{\n\
+                 if (failure) exit failure\n\
+               }}' /proc/[0-9]* 2>/dev/null || MOUNT_SCAN_STATUS=$?\n\
+             [ \"$MOUNT_SCAN_STATUS\" = '0' ] && return 0\n\
+             [ \"$MOUNT_SCAN_STATUS\" = '101' ] || return \"$MOUNT_SCAN_STATUS\"\n\
+           done\n\
+           return 101\n\
+         }}\n\
+         [ \"$(/system/bin/id -u)\" = '0' ]\n\
+         identity_matches\n\
+         scan_task_network_namespaces() {{\n\
+           TASK_SCAN_ATTEMPT=0\n\
+           while [ \"$TASK_SCAN_ATTEMPT\" -lt 3 ]; do\n\
+             TASK_SCAN_ATTEMPT=$((TASK_SCAN_ATTEMPT + 1))\n\
+             TASK_SCAN_STATUS=0\n\
+             {{\n\
+               printf 'I %s\\n' \"$EXPECTED_PEER_INODE\"\n\
+               /system/bin/awk '\n\
+                 BEGIN {{\n\
+                   status_code = 0\n\
+                   for (argument = 1; argument < ARGC; argument++) {{\n\
+                     process = ARGV[argument]\n\
+                     ARGV[argument] = \"\"\n\
+                     process_count++\n\
+                     if (process_count > 65536) {{ status_code = 104; break }}\n\
+                     path = process \"/status\"\n\
+                     state = \"\"\n\
+                     threads = \"\"\n\
+                     state_fields = 0\n\
+                     thread_fields = 0\n\
+                     status_lines = 0\n\
+                     while ((read_status = (getline line < path)) > 0) {{\n\
+                       status_lines++\n\
+                       total_status_lines++\n\
+                       if (status_lines > 4096 || total_status_lines > 1048576) {{\n\
+                         status_code = 104\n\
+                         break\n\
+                       }}\n\
+                       split(line, fields)\n\
+                       if (fields[1] == \"State:\") {{\n\
+                         state_fields++\n\
+                         state = fields[2]\n\
+                       }} else if (fields[1] == \"Threads:\") {{\n\
+                         thread_fields++\n\
+                         threads = fields[2]\n\
+                       }}\n\
+                     }}\n\
+                     close(path)\n\
+                     if (status_code != 0) break\n\
+                     if (read_status < 0) {{\n\
+                       if (state == \"Z\" || state == \"X\" ||\n\
+                           system(\"[ ! -d \" process \" ]\") == 0) continue\n\
+                       status_code = 94\n\
+                       break\n\
+                     }}\n\
+                     if (state == \"Z\" || state == \"X\") continue\n\
+                     if (state_fields != 1 || thread_fields != 1 ||\n\
+                         threads !~ /^[0-9]+$/ || threads + 0 < 1) {{\n\
+                       status_code = 93\n\
+                       break\n\
+                     }}\n\
+                     task_count += threads\n\
+                     if (task_count > 65536) {{ status_code = 104; break }}\n\
+                   }}\n\
+                   print \"C \" task_count \" \" status_code\n\
+                   exit 0\n\
+                 }}' /proc/[0-9]* 2>/dev/null\n\
+               /system/bin/readlink -q /proc/[0-9]*/task/[0-9]*/ns/net 2>/dev/null || :\n\
+             }} | /system/bin/awk '\n\
+               function fail(code) {{\n\
+                 failure = code\n\
+                 exit code\n\
+               }}\n\
+               NR == 1 {{\n\
+                 if ($1 != \"I\" || NF != 2 || $2 !~ /^[0-9]+$/ || $2 + 0 < 1) fail(109)\n\
+                 expected_target = \"net:[\" $2 \"]\"\n\
+                 next\n\
+               }}\n\
+               $1 == \"C\" {{\n\
+                 if (NF != 3 || census_seen++ || $2 !~ /^[0-9]+$/ ||\n\
+                     $3 !~ /^[0-9]+$/) fail(109)\n\
+                 expected_task_count = $2 + 0\n\
+                 census_status = $3 + 0\n\
+                 next\n\
+               }}\n\
+               /^net:\\[[0-9]+\\]$/ {{\n\
+                 observed_task_count++\n\
+                 if (observed_task_count > 65536) fail(104)\n\
+                 if ($0 == expected_target) fail(95)\n\
+                 next\n\
+               }}\n\
+               {{ fail(93) }}\n\
+               END {{\n\
+                 if (failure) exit failure\n\
+                 if (census_seen != 1) exit 109\n\
+                 if (census_status != 0) exit census_status\n\
+                 if (expected_task_count == 0 || observed_task_count == 0) exit 96\n\
+                 if (expected_task_count != observed_task_count) exit 108\n\
+               }}' 2>/dev/null || TASK_SCAN_STATUS=$?\n\
+             [ \"$TASK_SCAN_STATUS\" = '0' ] && return 0\n\
+             [ \"$TASK_SCAN_STATUS\" = '108' ] || return \"$TASK_SCAN_STATUS\"\n\
+           done\n\
+           return 108\n\
+         }}\n\
+         scan_task_network_namespaces || exit $?\n\
+         PROCESS_COUNT=0\n\
+         FD_COUNT=0\n\
+         for PROCESS in /proc/[0-9]*; do\n\
+           [ -d \"$PROCESS\" ] || continue\n\
+           PROCESS_COUNT=$((PROCESS_COUNT + 1))\n\
+           [ \"$PROCESS_COUNT\" -le 65536 ] || exit 105\n\
+           FD_DIRECTORY=\"$PROCESS/fd\"\n\
+           if [ ! -d \"$FD_DIRECTORY\" ]; then\n\
+             [ ! -d \"$PROCESS\" ] && continue\n\
+             exit 97\n\
+           fi\n\
+           # A failed numeric glob is ambiguous: it can mean an empty directory or a\n\
+           # procfs readdir denied by hidepid/ptrace policy. Force one bounded directory\n\
+           # read so an unreadable holder domain fails closed instead of looking empty.\n\
+           if ! /system/bin/ls \"$FD_DIRECTORY\" >/dev/null 2>&1; then\n\
+             [ ! -d \"$PROCESS\" ] && continue\n\
+             exit 97\n\
+           fi\n\
+           set -- \"$FD_DIRECTORY\"/[0-9]*\n\
+           if [ \"$1\" = \"$FD_DIRECTORY/[0-9]*\" ] && [ ! -e \"$1\" ] && [ ! -L \"$1\" ]; then\n\
+             PROCESS_FD_COUNT=0\n\
+           else\n\
+             PROCESS_FD_COUNT=$#\n\
+           fi\n\
+           [ \"$PROCESS_FD_COUNT\" -le 8192 ] || exit 106\n\
+           FD_COUNT=$((FD_COUNT + PROCESS_FD_COUNT))\n\
+           [ \"$FD_COUNT\" -le 262144 ] || exit 106\n\
+           if [ \"$PROCESS_FD_COUNT\" -gt 0 ]; then\n\
+             if ! FD_IDENTITIES=$(/system/bin/stat -Lc '%d:%i' \"$FD_DIRECTORY\"/[0-9]* 2>/dev/null); then\n\
+               [ ! -d \"$PROCESS\" ] && continue\n\
+               exit 98\n\
+             fi\n\
+             OBSERVED_FD_COUNT=0\n\
+             while IFS= read -r FD_ID; do\n\
+               OBSERVED_FD_COUNT=$((OBSERVED_FD_COUNT + 1))\n\
+               [ \"$FD_ID\" = \"$EXPECTED_PEER_NAMESPACE\" ] || continue\n\
+               exit 99\n\
+             done <<FD_IDENTITIES_END\n\
+$FD_IDENTITIES\n\
+FD_IDENTITIES_END\n\
+             [ \"$OBSERVED_FD_COUNT\" = \"$PROCESS_FD_COUNT\" ] || exit 98\n\
+           fi\n\
+         done\n\
+         scan_process_mountinfo || exit $?\n\
+         scan_task_network_namespaces || exit $?\n",
+        device_identity_function(device),
+    )
+}
+fn combine_transaction_and_peer_namespace_absence(
+    transaction: Result<(), String>,
+    peer_namespace_absence: Result<(), String>,
+) -> Result<(), String> {
+    match (transaction, peer_namespace_absence) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(audit_error)) => Err(audit_error),
+        (Err(error), Err(audit_error)) => Err(format!(
+            "{error}; independent peer network-namespace absence proof also failed: {audit_error}"
+        )),
+    }
+}
+
+fn missing_peer_namespace_receipt_result(
+    transaction: &Result<(), String>,
+    receipt_required: bool,
+) -> Result<(), String> {
+    if receipt_required {
+        Err(
+            "qualification peer network-namespace receipt was unavailable; exact absence is unverified"
+                .to_owned(),
+        )
+    } else if transaction.is_ok() {
+        Err("qualification omitted the peer network-namespace receipt".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+const fn linux_device_major(device: u64) -> u64 {
+    ((device & 0x0000_0000_000f_ff00) >> 8) | ((device & 0xffff_f000_0000_0000) >> 32)
+}
+
+const fn linux_device_minor(device: u64) -> u64 {
+    (device & 0x0000_0000_0000_00ff) | ((device & 0x0000_0fff_fff0_0000) >> 12)
+}
+
 fn require_silent_success(output: std::process::Output, description: &str) -> Result<(), String> {
     if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
         Ok(())
@@ -1292,6 +1683,16 @@ mod tests {
             subscription: PathBuf::from("/tmp/subscription-q11.url"),
             subscription_identity: identity(),
         }
+    }
+
+    fn peer_namespace_frame(device: u64, inode: u64) -> Vec<u8> {
+        let mut frame = Vec::from(*PEER_NAMESPACE_REPORT_MAGIC);
+        frame.extend_from_slice(&PEER_NAMESPACE_REPORT_VERSION.to_be_bytes());
+        frame.extend_from_slice(&PEER_NAMESPACE_REPORT_PAYLOAD_BYTES.to_be_bytes());
+        frame.extend_from_slice(&device.to_be_bytes());
+        frame.extend_from_slice(&inode.to_be_bytes());
+        assert_eq!(frame.len(), PEER_NAMESPACE_REPORT_FRAME_BYTES);
+        frame
     }
 
     #[test]
@@ -1343,6 +1744,83 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn binary_peer_namespace_receipt_is_parsed_before_text_newline_normalization() {
+        let device = 0x010a_0d04_0506_0708;
+        let inode = 0x1112_1314_150a_0d18;
+        let mut output = peer_namespace_frame(device, inode);
+        output.extend_from_slice(b"FLUX_ANDROID_Q11_PASS\r\n");
+
+        let receipt =
+            parse_qualification_execution_receipt(&output).expect("canonical binary receipt");
+        assert_eq!(receipt.peer_network_namespace.device, device);
+        assert_eq!(receipt.peer_network_namespace.inode, inode);
+        assert!(receipt.passed);
+
+        let incomplete =
+            parse_qualification_execution_receipt(&peer_namespace_frame(device, inode))
+                .expect("live identity remains available after a later transaction failure");
+        assert!(!incomplete.passed);
+        assert_eq!(incomplete.peer_network_namespace.device, device);
+        assert_eq!(incomplete.peer_network_namespace.inode, inode);
+    }
+
+    #[test]
+    fn valid_peer_namespace_prefix_is_bound_before_suffix_validation() {
+        let identity = PeerNetworkNamespaceIdentity::new(41, 43).expect("namespace identity");
+        let mut output = peer_namespace_frame(identity.device, identity.inode);
+        output.extend_from_slice(b"unexpected");
+
+        let (decoded, suffix) =
+            decode_qualification_peer_namespace_frame(&output).expect("complete binary prefix");
+        assert!(decoded == identity);
+        assert!(parse_qualification_receipt_suffix(suffix).is_err());
+    }
+
+    #[test]
+    fn missing_peer_namespace_receipt_is_uncertain_after_execution_begins() {
+        let failed = Err("transaction failed".to_owned());
+        assert!(
+            missing_peer_namespace_receipt_result(&failed, true)
+                .expect_err("started execution without receipt must be uncertain")
+                .contains("exact absence is unverified")
+        );
+        assert!(missing_peer_namespace_receipt_result(&failed, false).is_ok());
+        assert!(missing_peer_namespace_receipt_result(&Ok(()), false).is_err());
+    }
+
+    #[test]
+    fn peer_namespace_receipt_rejects_missing_duplicate_malformed_and_substituted_output() {
+        let valid = peer_namespace_frame(4, 4_026_531_999);
+        for length in 0..PEER_NAMESPACE_REPORT_FRAME_BYTES {
+            assert!(
+                parse_qualification_execution_receipt(&valid[..length]).is_err(),
+                "truncated frame length {length} must fail"
+            );
+        }
+        assert!(parse_qualification_execution_receipt(QUALIFICATION_PASS_RECEIPT_LINE).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate.extend_from_slice(&valid);
+        assert!(parse_qualification_execution_receipt(&duplicate).is_err());
+
+        let mut malformed = valid.clone();
+        malformed[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        assert!(parse_qualification_execution_receipt(&malformed).is_err());
+        let mut zero_inode = valid.clone();
+        zero_inode[20..28].fill(0);
+        assert!(parse_qualification_execution_receipt(&zero_inode).is_err());
+
+        let mut substituted = valid;
+        substituted.extend_from_slice(&peer_namespace_frame(5, 4_026_532_000));
+        substituted.extend_from_slice(QUALIFICATION_PASS_RECEIPT_LINE);
+        let error = parse_qualification_execution_receipt(&substituted)
+            .err()
+            .expect("substituted receipt must fail");
+        assert!(!error.contains("402653"));
+        assert!(!error.contains("peer_network_namespace="));
     }
 
     #[test]
@@ -1435,6 +1913,81 @@ mod tests {
         assert!(!execution.contains("chown 0:2900002 \"$SUBSCRIPTION\""));
         assert!(execution.contains("710:0:2900002"));
         assert!(cleanup.contains("710:0:2900002"));
+    }
+
+    #[test]
+    fn qualification_daemon_reports_only_through_private_fd_three() {
+        let remote = test_remote_directory();
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let artifacts = test_artifacts();
+        let execution = qualification_execution_script(&remote, &device, &artifacts);
+
+        assert!(execution.contains(
+            "FLUX_Q11_NETNS_REPORT_FD=3 run_flux \"$FLUXD\" daemon 3>&1 </dev/null >\"$ROOT/daemon.stdout\" 2>\"$ROOT/daemon.stderr\" &"
+        ));
+        assert_eq!(execution.matches("FLUX_Q11_NETNS_REPORT_FD=3").count(), 1);
+        assert!(!execution.contains("peer_network_namespace="));
+    }
+
+    #[test]
+    fn peer_namespace_absence_audit_scans_every_holder_domain_without_output() {
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let identity =
+            PeerNetworkNamespaceIdentity::new(4, 4_026_531_999).expect("namespace identity");
+        let script = peer_network_namespace_absence_script(&device, identity);
+
+        for required in [
+            "/proc/[0-9]*/task/[0-9]*/ns/net",
+            "printf 'I %s\\n' \"$EXPECTED_PEER_INODE\"",
+            "/system/bin/readlink -q",
+            "fields[1] == \"Threads:\"",
+            "expected_task_count != observed_task_count",
+            "[ \"$TASK_SCAN_STATUS\" = '108' ]",
+            "$PROCESS/fd",
+            "/system/bin/ls \"$FD_DIRECTORY\" >/dev/null 2>&1",
+            "/proc/[0-9]*",
+            "process \"/mountinfo\"",
+            "/system/bin/awk",
+            "(getline expected_device < identity_input)",
+            "(getline expected_inode < identity_input)",
+            "process_released(process)",
+            "state == \"Z\" || state == \"X\"",
+            "stat -Lc '%d:%i'",
+            "task_count > 65536",
+            "PROCESS_COUNT=$((PROCESS_COUNT + 1))",
+            "FD_COUNT=$((FD_COUNT + PROCESS_FD_COUNT))",
+            "PROCESS_FD_COUNT=$#",
+            "OBSERVED_FD_COUNT=$((OBSERVED_FD_COUNT + 1))",
+            "[ \"$PROCESS_FD_COUNT\" -le 8192 ]",
+            "mountinfo_lines++",
+            "total_mountinfo_lines++",
+            "total_mountinfo_lines > 1048576",
+            "[ \"$MOUNT_SCAN_STATUS\" = '101' ]",
+            "$(separator + 1) == \"nsfs\"",
+            "EXPECTED_PEER_MOUNT_DEVICE='0:4'",
+            "[ \"$(/system/bin/id -u)\" = '0' ]",
+            "identity_matches",
+        ] {
+            assert!(script.contains(required), "missing {required}");
+        }
+        assert!(!script.contains("$TASK/fd"));
+        assert!(!script.contains("$TASK/mountinfo"));
+        assert!(!script.contains("echo "));
+        assert_eq!(script.matches("printf '%s\\n%s\\n'").count(), 1);
+        assert!(!script.contains("-v expected_"));
+        assert!(!script.contains("\n+"));
+
+        let task_scan = "scan_task_network_namespaces || exit $?";
+        let first_task_scan = script.find(task_scan).expect("first task namespace scan");
+        let process_fd_scan = script.find("for PROCESS in /proc/[0-9]*").expect("FD scan");
+        let mount_scan = script
+            .find("scan_process_mountinfo || exit $?")
+            .expect("mountinfo scan");
+        let second_task_scan = script.rfind(task_scan).expect("second task namespace scan");
+        assert_eq!(script.matches(task_scan).count(), 2);
+        assert!(first_task_scan < process_fd_scan);
+        assert!(process_fd_scan < mount_scan);
+        assert!(mount_scan < second_task_scan);
     }
 
     #[test]
@@ -1531,6 +2084,11 @@ mod tests {
             qualification_failure_diagnostic_script(&remote, &device),
             qualification_cleanup_script(&remote, &device, &artifacts),
             qualification_absence_script(&remote, &device),
+            peer_network_namespace_absence_script(
+                &device,
+                PeerNetworkNamespaceIdentity::new(4, 4_026_531_999)
+                    .expect("peer namespace identity"),
+            ),
         ];
         for script in scripts {
             let mut child = Command::new("/bin/sh")

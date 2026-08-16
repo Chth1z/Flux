@@ -1,7 +1,15 @@
 use std::env;
 use std::error::Error;
+#[cfg(any(test, flux_android_qualification))]
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
+#[cfg(flux_android_qualification)]
+use std::io;
+#[cfg(flux_android_qualification)]
+use std::mem::MaybeUninit;
+#[cfg(flux_android_qualification)]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -74,6 +82,13 @@ const NATIVE_XTABLES_TOOL_ROOT: &str = "/system/bin";
 const NATIVE_XTABLES_WAIT_SECONDS: u16 = 2;
 const NATIVE_XTABLES_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_BOOT_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_FD_ENV: &str = "FLUX_Q11_NETNS_REPORT_FD";
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_FD_VALUE: &str = "3";
+#[cfg(any(test, flux_android_qualification))]
+const QUALIFICATION_PEER_NETNS_REPORT_FD: i32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonOptions {
@@ -230,6 +245,17 @@ where
                 }
             }
         };
+        #[cfg(flux_android_qualification)]
+        let mut peer_netns_report_fd = match &pending_admission {
+            PendingNativeAdmission::Configured(configured)
+                if configured.requires_functional_canary() =>
+            {
+                // Claim and seal the private channel before recovery can mutate stale facility
+                // state. Recovery-only configurations do not require this qualification contract.
+                Some(claim_qualification_peer_netns_report_fd()?)
+            }
+            _ => None,
+        };
         let facility_journal_path = runtime_layout.run_path().join("canary-facility.owner");
         let pending_admission = match pending_admission {
             PendingNativeAdmission::Configured(configured) => {
@@ -257,6 +283,14 @@ where
                         None,
                     ),
                     Some(policy) => {
+                        #[cfg(flux_android_qualification)]
+                        let peer_netns_report_fd =
+                            peer_netns_report_fd.take().ok_or_else(|| {
+                                DaemonError::Configuration(
+                                    "qualification peer-netns report descriptor was not retained"
+                                        .to_owned(),
+                                )
+                            })?;
                         let pre_mutation_inventory = collect_network_inventory_once(
                             NATIVE_BOOT_INVENTORY_TIMEOUT,
                         )
@@ -274,6 +308,15 @@ where
                         .map_err(|source| {
                             DaemonError::native("create native boot canary facility", source)
                         })?;
+                        #[cfg(flux_android_qualification)]
+                        facility
+                            .report_qualification_peer_network_namespace(peer_netns_report_fd)
+                            .map_err(|source| {
+                                DaemonError::native(
+                                    "report qualification peer network namespace",
+                                    source,
+                                )
+                            })?;
                         (
                             PendingNativeAdmission::Configured(configured),
                             Some(facility),
@@ -1332,6 +1375,82 @@ fn engine_maintenance_interval(configured: Duration) -> Duration {
     )
 }
 
+#[cfg(any(test, flux_android_qualification))]
+fn qualification_peer_netns_report_fd_from_value(
+    value: Option<&OsStr>,
+) -> Result<i32, &'static str> {
+    if value == Some(OsStr::new(QUALIFICATION_PEER_NETNS_REPORT_FD_VALUE)) {
+        Ok(QUALIFICATION_PEER_NETNS_REPORT_FD)
+    } else {
+        Err("qualification peer-netns report descriptor contract is absent or invalid")
+    }
+}
+
+#[cfg(flux_android_qualification)]
+fn claim_qualification_peer_netns_report_fd() -> Result<OwnedFd, DaemonError> {
+    let value = env::var_os(QUALIFICATION_PEER_NETNS_REPORT_FD_ENV);
+    let raw = qualification_peer_netns_report_fd_from_value(value.as_deref())
+        .map_err(|message| DaemonError::Configuration(message.to_owned()))?;
+
+    // SAFETY: `fcntl(F_GETFD)` only inspects the fixed descriptor selected by the private
+    // qualification contract. A successful result proves it is open before ownership is claimed.
+    let descriptor_flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(DaemonError::native(
+            "claim qualification peer-netns report descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: the successful `F_GETFD` proved descriptor 3 is open, and the exact private
+    // environment contract transfers its sole ownership to this daemon invocation.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+    if descriptor_flags != 0 {
+        return Err(DaemonError::Configuration(
+            "qualification peer-netns report descriptor has unexpected flags".to_owned(),
+        ));
+    }
+    // SAFETY: raw is the live descriptor just transferred into descriptor, and fstat writes one
+    // complete stat value into the owned temporary storage.
+    let mut metadata = MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(raw, metadata.as_mut_ptr()) } < 0 {
+        return Err(DaemonError::native(
+            "inspect qualification peer-netns report descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: a successful fstat initialized the complete structure.
+    let metadata = unsafe { metadata.assume_init() };
+    let file_type = metadata.st_mode as libc::mode_t & libc::S_IFMT;
+    if file_type != libc::S_IFIFO && file_type != libc::S_IFSOCK {
+        return Err(DaemonError::Configuration(
+            "qualification peer-netns report descriptor is not a pipe or socket".to_owned(),
+        ));
+    }
+    // SAFETY: F_GETFL only inspects the same live descriptor and has no pointer argument.
+    let status_flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(DaemonError::native(
+            "inspect qualification peer-netns report descriptor access",
+            io::Error::last_os_error(),
+        ));
+    }
+    let access_mode = status_flags & libc::O_ACCMODE;
+    if access_mode != libc::O_WRONLY && access_mode != libc::O_RDWR {
+        return Err(DaemonError::Configuration(
+            "qualification peer-netns report descriptor is not writable".to_owned(),
+        ));
+    }
+    // Prevent any helper process created during facility construction from retaining the
+    // qualification-only report descriptor. The daemon itself still owns and can write it.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(DaemonError::native(
+            "mark qualification peer-netns report descriptor close-on-exec",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(descriptor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,6 +1458,21 @@ mod tests {
     use crate::generation_engine_config::{
         test_unqualified_capture_path_decision, test_xtables_capture_path_decision,
     };
+
+    #[test]
+    fn qualification_peer_netns_report_requires_exact_fd_three_contract() {
+        assert_eq!(
+            qualification_peer_netns_report_fd_from_value(Some(OsStr::new("3"))),
+            Ok(3)
+        );
+        for value in [None, Some(""), Some("03"), Some("4"), Some(" 3")] {
+            assert!(qualification_peer_netns_report_fd_from_value(value.map(OsStr::new)).is_err());
+        }
+        assert_eq!(
+            QUALIFICATION_PEER_NETNS_REPORT_FD_ENV,
+            "FLUX_Q11_NETNS_REPORT_FD"
+        );
+    }
 
     #[test]
     fn engine_maintenance_interval_is_bounded_independently_of_config_debounce() {

@@ -633,6 +633,7 @@ impl DeviceProfile {
         self.shell_gid
     }
 
+    #[cfg(test)]
     pub(super) fn redact_sensitive_diagnostic(&self, text: &str) -> String {
         [
             (self.model.as_str(), "<redacted-model>"),

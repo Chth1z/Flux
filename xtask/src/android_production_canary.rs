@@ -94,6 +94,7 @@ const QUALIFICATION_PASS_RECEIPT: &str = "FLUX_ANDROID_Q11_PASS";
 const QUALIFICATION_PASS_RECEIPT_LINE: &[u8] = b"FLUX_ANDROID_Q11_PASS\n";
 const QUALIFICATION_DAEMON_EXITED_STATUS: i32 = 74;
 const QUALIFICATION_READINESS_DEADLINE_STATUS: i32 = 75;
+const QUALIFICATION_DAEMON_FAILURE_PREFIX: &[u8] = b"FLUX_ANDROID_Q11_FAILURE=";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Options {
@@ -885,16 +886,58 @@ fn qualification_failure_diagnostic(
     passed: Option<bool>,
     stderr: &[u8],
 ) -> &'static str {
-    if !stderr.is_empty() || passed == Some(true) {
+    if passed == Some(true) {
         return "diagnostic=qualification-receipt-boundary";
     }
     match status {
-        Some(QUALIFICATION_DAEMON_EXITED_STATUS) => {
-            "diagnostic=qualification-daemon-exited-before-readiness"
-        }
-        Some(QUALIFICATION_READINESS_DEADLINE_STATUS) => {
+        Some(QUALIFICATION_DAEMON_EXITED_STATUS) => qualification_daemon_exit_diagnostic(stderr),
+        Some(QUALIFICATION_READINESS_DEADLINE_STATUS) if stderr.is_empty() => {
             "diagnostic=qualification-readiness-deadline-exceeded"
         }
+        _ => "diagnostic=qualification-receipt-boundary",
+    }
+}
+
+fn qualification_daemon_exit_diagnostic(stderr: &[u8]) -> &'static str {
+    if stderr.is_empty() {
+        return "diagnostic=qualification-daemon-exited-before-readiness";
+    }
+    let Some(stage) = stderr
+        .strip_prefix(QUALIFICATION_DAEMON_FAILURE_PREFIX)
+        .and_then(|value| value.strip_suffix(b"\n"))
+    else {
+        return "diagnostic=qualification-receipt-boundary";
+    };
+    match stage {
+        b"facility-authority" => "diagnostic=qualification-daemon-exited-facility-authority",
+        b"native-startup-recovery" => {
+            "diagnostic=qualification-daemon-exited-native-startup-recovery"
+        }
+        b"android-planning-authority" => {
+            "diagnostic=qualification-daemon-exited-android-planning-authority"
+        }
+        b"native-runtime-composition" => {
+            "diagnostic=qualification-daemon-exited-native-runtime-composition"
+        }
+        b"android-planning-retention" => {
+            "diagnostic=qualification-daemon-exited-android-planning-retention"
+        }
+        b"subscription-runtime-start" => {
+            "diagnostic=qualification-daemon-exited-subscription-runtime-start"
+        }
+        b"runtime-coordinator-composition" => {
+            "diagnostic=qualification-daemon-exited-runtime-coordinator-composition"
+        }
+        b"initial-runtime-control" => {
+            "diagnostic=qualification-daemon-exited-initial-runtime-control"
+        }
+        b"daemon-configuration" => "diagnostic=qualification-daemon-exited-daemon-configuration",
+        b"daemon-invariant" => "diagnostic=qualification-daemon-exited-daemon-invariant",
+        b"runtime-layout" => "diagnostic=qualification-daemon-exited-runtime-layout",
+        b"administrative-intent" => "diagnostic=qualification-daemon-exited-administrative-intent",
+        b"control-reactor" => "diagnostic=qualification-daemon-exited-control-reactor",
+        b"control-socket" => "diagnostic=qualification-daemon-exited-control-socket",
+        b"unclassified-daemon-exit" => "diagnostic=qualification-daemon-exited-unclassified-stage",
         _ => "diagnostic=qualification-receipt-boundary",
     }
 }
@@ -1085,6 +1128,7 @@ fn qualification_execution_script(
 ) -> String {
     format!(
         "set -eu\n\
+         umask 077\n\
          {}\
          FLUXD=\"$ROOT/{REMOTE_FLUXD_NAME}\"\n\
          PRODUCER=\"$ROOT/{REMOTE_PRODUCER_NAME}\"\n\
@@ -1113,6 +1157,38 @@ fn qualification_execution_script(
            fi\n\
            wait \"$DAEMON_PID\" 2>/dev/null || true\n\
            DAEMON_PID=''\n\
+         }}\n\
+         classify_daemon_failure() {{\n\
+           FAILURE_STAGE='unclassified-daemon-exit'\n\
+           DAEMON_ERROR_FILE=\"$ROOT/daemon.stderr\"\n\
+           if [ -f \"$DAEMON_ERROR_FILE\" ] && [ ! -L \"$DAEMON_ERROR_FILE\" ] &&\n\
+              [ \"$(/system/bin/stat -c '%a:%u:%g' \"$DAEMON_ERROR_FILE\")\" = '600:0:0' ]; then\n\
+             DAEMON_ERROR_BYTES=$(/system/bin/stat -c '%s' \"$DAEMON_ERROR_FILE\" 2>/dev/null || :)\n\
+             DAEMON_ERROR_LINES=$(/system/bin/grep -c '^' \"$DAEMON_ERROR_FILE\" 2>/dev/null || :)\n\
+             if [ \"$DAEMON_ERROR_BYTES\" -gt 0 ] 2>/dev/null &&\n\
+                [ \"$DAEMON_ERROR_BYTES\" -le 8192 ] 2>/dev/null &&\n\
+                [ \"$DAEMON_ERROR_LINES\" = '1' ]; then\n\
+               DAEMON_ERROR=''\n\
+               IFS= read -r DAEMON_ERROR <\"$DAEMON_ERROR_FILE\" || DAEMON_ERROR=''\n\
+               case \"$DAEMON_ERROR\" in\n\
+                 'fluxd: native startup cannot split native canary facility authority:'*) FAILURE_STAGE='facility-authority' ;;\n\
+                 'fluxd: native startup cannot compose native startup recovery:'*|'fluxd: native startup cannot recover native startup state:'*) FAILURE_STAGE='native-startup-recovery' ;;\n\
+                 'fluxd: native startup cannot mint initial Android planning authority:'*) FAILURE_STAGE='android-planning-authority' ;;\n\
+                 'fluxd: native startup cannot compose native Android runtime:'*) FAILURE_STAGE='native-runtime-composition' ;;\n\
+                 'fluxd: native startup cannot retain initial Android planning authority:'*) FAILURE_STAGE='android-planning-retention' ;;\n\
+                 'fluxd: native startup cannot start subscription runtime:'*) FAILURE_STAGE='subscription-runtime-start' ;;\n\
+                 'fluxd: native startup cannot compose native runtime coordinator:'*) FAILURE_STAGE='runtime-coordinator-composition' ;;\n\
+                 'fluxd: runtime control:'*) FAILURE_STAGE='initial-runtime-control' ;;\n\
+                 'fluxd: daemon configuration:'*) FAILURE_STAGE='daemon-configuration' ;;\n\
+                 'fluxd: daemon invariant:'*) FAILURE_STAGE='daemon-invariant' ;;\n\
+                 'fluxd: runtime layout:'*) FAILURE_STAGE='runtime-layout' ;;\n\
+                 'fluxd: administrative intent:'*) FAILURE_STAGE='administrative-intent' ;;\n\
+                 'fluxd: control reactor:'*) FAILURE_STAGE='control-reactor' ;;\n\
+                 'fluxd: control socket:'*) FAILURE_STAGE='control-socket' ;;\n\
+               esac\n\
+             fi\n\
+           fi\n\
+           printf 'FLUX_ANDROID_Q11_FAILURE=%s\\n' \"$FAILURE_STAGE\" >&2\n\
          }}\n\
          trap 'STATUS=$?; shutdown_daemon; exit $STATUS' EXIT HUP INT TERM\n\
          identity_matches\n\
@@ -1150,7 +1226,10 @@ fn qualification_execution_script(
            N=$((N + 1))\n\
            /system/bin/sleep 1\n\
          done\n\
-         [ \"$DAEMON_EXITED_BEFORE_READY\" = '0' ] || exit {QUALIFICATION_DAEMON_EXITED_STATUS}\n\
+         if [ \"$DAEMON_EXITED_BEFORE_READY\" != '0' ]; then\n\
+           classify_daemon_failure\n\
+           exit {QUALIFICATION_DAEMON_EXITED_STATUS}\n\
+         fi\n\
          [ \"$READY\" = '1' ] || exit {QUALIFICATION_READINESS_DEADLINE_STATUS}\n\
          run_flux \"$FLUXD\" stop >/dev/null 2>&1 || exit 76\n\
          run_flux \"$FLUXD\" status --json >\"$ROOT/status.stopped.json\" 2>/dev/null\n\
@@ -1968,8 +2047,49 @@ mod tests {
 
         assert!(execution.contains("DAEMON_EXITED_BEFORE_READY=0"));
         assert!(execution.contains("DAEMON_EXITED_BEFORE_READY=1"));
-        assert!(execution.contains("[ \"$DAEMON_EXITED_BEFORE_READY\" = '0' ] || exit 74"));
+        let early_failure = execution
+            .find("if [ \"$DAEMON_EXITED_BEFORE_READY\" != '0' ]")
+            .expect("early-exit branch");
+        let classification = execution[early_failure..]
+            .find("classify_daemon_failure")
+            .expect("fixed daemon classifier");
+        let early_exit = execution[early_failure..]
+            .find("exit 74")
+            .expect("dedicated early-exit status");
+        assert!(classification < early_exit);
         assert!(execution.contains("[ \"$READY\" = '1' ] || exit 75"));
+    }
+
+    #[test]
+    fn qualification_runner_reduces_daemon_error_to_one_fixed_stage_token() {
+        let remote = test_remote_directory();
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let artifacts = test_artifacts();
+        let execution = qualification_execution_script(&remote, &device, &artifacts);
+
+        assert!(execution.contains("classify_daemon_failure()"));
+        assert!(execution.contains("FLUX_ANDROID_Q11_FAILURE=%s\\n"));
+        for fixed_stage in [
+            "facility-authority",
+            "native-startup-recovery",
+            "android-planning-authority",
+            "native-runtime-composition",
+            "android-planning-retention",
+            "subscription-runtime-start",
+            "runtime-coordinator-composition",
+            "initial-runtime-control",
+            "daemon-configuration",
+            "daemon-invariant",
+            "runtime-layout",
+            "administrative-intent",
+            "control-reactor",
+            "control-socket",
+            "unclassified-daemon-exit",
+        ] {
+            assert!(execution.contains(fixed_stage), "missing {fixed_stage}");
+        }
+        assert!(!execution.contains("tail -c"));
+        assert!(!execution.contains("cat \"$ROOT/daemon.stderr\""));
     }
 
     #[test]
@@ -1990,6 +2110,78 @@ mod tests {
             ),
             "diagnostic=qualification-readiness-deadline-exceeded"
         );
+        for (stage, diagnostic) in [
+            (
+                "facility-authority",
+                "diagnostic=qualification-daemon-exited-facility-authority",
+            ),
+            (
+                "native-startup-recovery",
+                "diagnostic=qualification-daemon-exited-native-startup-recovery",
+            ),
+            (
+                "android-planning-authority",
+                "diagnostic=qualification-daemon-exited-android-planning-authority",
+            ),
+            (
+                "native-runtime-composition",
+                "diagnostic=qualification-daemon-exited-native-runtime-composition",
+            ),
+            (
+                "android-planning-retention",
+                "diagnostic=qualification-daemon-exited-android-planning-retention",
+            ),
+            (
+                "subscription-runtime-start",
+                "diagnostic=qualification-daemon-exited-subscription-runtime-start",
+            ),
+            (
+                "runtime-coordinator-composition",
+                "diagnostic=qualification-daemon-exited-runtime-coordinator-composition",
+            ),
+            (
+                "initial-runtime-control",
+                "diagnostic=qualification-daemon-exited-initial-runtime-control",
+            ),
+            (
+                "daemon-configuration",
+                "diagnostic=qualification-daemon-exited-daemon-configuration",
+            ),
+            (
+                "daemon-invariant",
+                "diagnostic=qualification-daemon-exited-daemon-invariant",
+            ),
+            (
+                "runtime-layout",
+                "diagnostic=qualification-daemon-exited-runtime-layout",
+            ),
+            (
+                "administrative-intent",
+                "diagnostic=qualification-daemon-exited-administrative-intent",
+            ),
+            (
+                "control-reactor",
+                "diagnostic=qualification-daemon-exited-control-reactor",
+            ),
+            (
+                "control-socket",
+                "diagnostic=qualification-daemon-exited-control-socket",
+            ),
+            (
+                "unclassified-daemon-exit",
+                "diagnostic=qualification-daemon-exited-unclassified-stage",
+            ),
+        ] {
+            let stderr = format!("FLUX_ANDROID_Q11_FAILURE={stage}\n");
+            assert_eq!(
+                qualification_failure_diagnostic(
+                    Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                    Some(false),
+                    stderr.as_bytes(),
+                ),
+                diagnostic
+            );
+        }
         for (status, passed, stderr) in [
             (Some(73), Some(false), b"".as_slice()),
             (
@@ -2001,6 +2193,16 @@ mod tests {
                 Some(QUALIFICATION_DAEMON_EXITED_STATUS),
                 Some(false),
                 b"unexpected".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=facility-authority\nextra\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=unknown-stage\n".as_slice(),
             ),
         ] {
             assert_eq!(

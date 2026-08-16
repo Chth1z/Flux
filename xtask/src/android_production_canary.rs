@@ -78,6 +78,7 @@ const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const PEER_NAMESPACE_ABSENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const ADB_EXECUTION_TIMEOUT: Duration = Duration::from_secs(180);
 const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_RUN_MANIFEST_BYTES: u64 = 512 * 1024;
 #[cfg(test)]
 const DIAGNOSTIC_STATUS_BEGIN: &str = "FLUX_ANDROID_Q11_STATUS_BEGIN";
 #[cfg(test)]
@@ -100,6 +101,7 @@ const QUALIFICATION_DAEMON_FAILURE_PREFIX: &[u8] = b"FLUX_ANDROID_Q11_FAILURE=";
 pub(super) struct Options {
     target: AndroidTargetOptions,
     producer: PathBuf,
+    run_manifest: PathBuf,
     subscription: SubscriptionInput,
 }
 
@@ -144,6 +146,7 @@ pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
     let mut serial = None;
     let mut adb = None;
     let mut producer = None;
+    let mut run_manifest = None;
     let mut subscription_file = None;
     let mut subscription_stdin = false;
     let mut index = 0;
@@ -170,11 +173,15 @@ pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
                 if producer
                     .replace(require_absolute_path(flag, value)?)
                     .is_none() => {}
+            "--run-manifest"
+                if run_manifest
+                    .replace(require_absolute_path(flag, value)?)
+                    .is_none() => {}
             "--subscription-file"
                 if subscription_file
                     .replace(require_absolute_path(flag, value)?)
                     .is_none() => {}
-            "--serial" | "--adb" | "--producer" | "--subscription-file" => {
+            "--serial" | "--adb" | "--producer" | "--run-manifest" | "--subscription-file" => {
                 return Err(format!("{flag} may only be supplied once"));
             }
             unknown => return Err(format!("unknown Android qualification option '{unknown}'")),
@@ -206,6 +213,8 @@ pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
     Ok(Options {
         target,
         producer: producer.ok_or_else(|| format!("{COMMAND} requires --producer FILE"))?,
+        run_manifest: run_manifest
+            .ok_or_else(|| format!("{COMMAND} requires --run-manifest FILE"))?,
         subscription,
     })
 }
@@ -219,6 +228,125 @@ fn require_absolute_path(flag: &str, value: &OsStr) -> Result<PathBuf, String> {
     }
 }
 
+fn validate_run_manifest(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect qualification run manifest: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_RUN_MANIFEST_BYTES
+    {
+        return Err(format!(
+            "qualification run manifest must be one nonempty regular file of at most {MAX_RUN_MANIFEST_BYTES} bytes"
+        ));
+    }
+    let manifest = fs::read_to_string(path)
+        .map_err(|error| format!("read qualification run manifest: {error}"))?;
+    validate_run_manifest_text(&manifest)
+}
+
+fn validate_run_manifest_text(manifest: &str) -> Result<(), String> {
+    let mut pending_sha_declarations = 0usize;
+    let mut saw_sha_declaration = false;
+    let mut in_binding_table = false;
+
+    for line in manifest.lines() {
+        if line.starts_with("| Object | Path or identity | SHA-256 / Git tree |") {
+            in_binding_table = true;
+            continue;
+        }
+        if in_binding_table {
+            if !line.starts_with('|') {
+                in_binding_table = false;
+            } else if !line.contains("|---") {
+                validate_manifest_binding_row(line)?;
+            }
+        }
+
+        let declaration_count = if line.contains("SHA-256 / Git tree") {
+            0
+        } else {
+            line.matches("SHA-256").count()
+        };
+        if declaration_count == 0 && pending_sha_declarations == 0 {
+            continue;
+        }
+
+        saw_sha_declaration |= declaration_count != 0;
+        let expected = pending_sha_declarations.saturating_add(declaration_count);
+        let spans = markdown_code_spans(line);
+        let consumed = spans.len().min(expected);
+        for span in spans.iter().take(consumed) {
+            validate_manifest_sha256(span)?;
+        }
+        pending_sha_declarations = expected.saturating_sub(consumed);
+    }
+
+    if pending_sha_declarations != 0 {
+        return Err(
+            "qualification run manifest has an SHA-256 declaration without a code-span value"
+                .to_owned(),
+        );
+    }
+    if !saw_sha_declaration {
+        return Err("qualification run manifest declares no SHA-256 values".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_manifest_binding_row(line: &str) -> Result<(), String> {
+    let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+    if cells.len() < 5 {
+        return Err(
+            "qualification run manifest has a malformed source/artifact binding row".to_owned(),
+        );
+    }
+    let kind = cells[2];
+    let value = cells[3].trim_matches('`');
+    if value == "—" || value.is_empty() {
+        return Ok(());
+    }
+    if kind == "Git commit" || kind == "Git tree" {
+        if value.len() != 40 || !value.bytes().all(is_lower_hex) {
+            return Err(format!(
+                "qualification run manifest {kind} binding must be exactly 40 lowercase hexadecimal characters"
+            ));
+        }
+        return Ok(());
+    }
+    validate_manifest_sha256(value)
+}
+
+fn validate_manifest_sha256(value: &str) -> Result<(), String> {
+    if value.len() == 64 && value.bytes().all(is_lower_hex) {
+        Ok(())
+    } else {
+        Err(
+            "qualification run manifest SHA-256 values must be exactly 64 lowercase hexadecimal characters"
+                .to_owned(),
+        )
+    }
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
+fn markdown_code_spans(line: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut opening = None;
+    for (index, byte) in line.bytes().enumerate() {
+        if byte != b'`' {
+            continue;
+        }
+        match opening.take() {
+            Some(start) => spans.push(&line[start..index]),
+            None => opening = Some(index + 1),
+        }
+    }
+    spans
+}
+
 pub(super) fn run(options: Options) -> Result<(), String> {
     if env::consts::OS != "linux" {
         return Err(
@@ -226,6 +354,7 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         );
     }
 
+    validate_run_manifest(&options.run_manifest)?;
     let device = verify_device(&options.target)?;
     if device.target_rust_target() != ANDROID_TARGET {
         return Err(
@@ -1811,11 +1940,14 @@ mod tests {
             OsString::from("device-1"),
             OsString::from("--producer"),
             OsString::from("/tmp/sing-box"),
+            OsString::from("--run-manifest"),
+            OsString::from("/tmp/run-manifest.md"),
             OsString::from("--subscription-file"),
             OsString::from("/tmp/subscription.url"),
         ])
         .expect("qualification options");
         assert_eq!(parsed.producer, PathBuf::from("/tmp/sing-box"));
+        assert_eq!(parsed.run_manifest, PathBuf::from("/tmp/run-manifest.md"));
         assert_eq!(
             parsed.subscription,
             SubscriptionInput::File(PathBuf::from("/tmp/subscription.url"))
@@ -1825,6 +1957,8 @@ mod tests {
             OsString::from("device-1"),
             OsString::from("--producer"),
             OsString::from("/tmp/sing-box"),
+            OsString::from("--run-manifest"),
+            OsString::from("/tmp/run-manifest.md"),
             OsString::from("--subscription-stdin"),
         ])
         .expect("stdin qualification options");
@@ -1836,6 +1970,8 @@ mod tests {
                 OsString::from("device-1"),
                 OsString::from("--producer"),
                 OsString::from("relative"),
+                OsString::from("--run-manifest"),
+                OsString::from("/tmp/run-manifest.md"),
                 OsString::from("--subscription-file"),
                 OsString::from("/tmp/subscription.url"),
             ])
@@ -1847,12 +1983,54 @@ mod tests {
                 OsString::from("device-1"),
                 OsString::from("--producer"),
                 OsString::from("/tmp/sing-box"),
+                OsString::from("--run-manifest"),
+                OsString::from("/tmp/run-manifest.md"),
                 OsString::from("--subscription-file"),
                 OsString::from("/tmp/subscription.url"),
                 OsString::from("--subscription-stdin"),
             ])
             .is_err()
         );
+        assert!(
+            parse_options(&[
+                OsString::from("--serial"),
+                OsString::from("device-1"),
+                OsString::from("--producer"),
+                OsString::from("/tmp/sing-box"),
+                OsString::from("--subscription-file"),
+                OsString::from("/tmp/subscription.url"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_manifest_requires_lowercase_sha256_values_and_valid_git_bindings() {
+        let valid = r#"# Run
+
+- Build SHA-256:
+  `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`
+
+| Object | Path or identity | SHA-256 / Git tree | Bytes |
+|---|---|---|---:|
+| Source | Git commit | `0123456789abcdef0123456789abcdef01234567` | — |
+| Artifact | file | `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` | 1 |
+"#;
+        validate_run_manifest_text(valid).expect("valid manifest");
+
+        let malformed = valid.replace(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` | 1",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde` | 1",
+        );
+        let error = validate_run_manifest_text(&malformed)
+            .expect_err("malformed producer-style digest must fail");
+        assert!(error.contains("64 lowercase hexadecimal"));
+
+        let uppercase = valid.replace(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        assert!(validate_run_manifest_text(&uppercase).is_err());
     }
 
     #[test]

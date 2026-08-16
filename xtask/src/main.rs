@@ -2595,7 +2595,7 @@ fn help_text() -> String {
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
            build-sing-box-producer  Validate, patch, test, and reproducibly build pinned Sing-Box; requires --source DIR --go-sdk FILE --target linux-amd64|android-arm64 --output FILE\n\
            {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial; --producer FILE adds the manifest-bound ARM64 report attempt\n\
-           {android_production_canary_command}  Run the exact non-shipping production-canary path on one explicit rooted ARM64 serial; requires --producer FILE and --subscription-file FILE|--subscription-stdin\n\
+           {android_production_canary_command}  Run the exact non-shipping production-canary path on one explicit rooted ARM64 serial; requires --producer FILE --run-manifest FILE and --subscription-file FILE|--subscription-stdin\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\
            collect-android-arm64-fwmark-census  Run the coherent read-only fwmark census in one cleaned explicit-serial ARM64 test directory\n\

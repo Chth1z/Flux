@@ -12,6 +12,8 @@ use serde_json::Value;
 use tempfile::tempdir;
 use url::Url;
 
+use flux_core::AddressHostFamilySelection;
+
 #[cfg(target_os = "linux")]
 use flux_platform::{SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness};
 
@@ -111,6 +113,7 @@ fn prepared<V: SubscriptionSnapshotValidator>(
             &url,
             &asset_root,
             NonZeroU16::new(1_536).unwrap(),
+            AddressHostFamilySelection::DualStack,
             SubscriptionRefreshLimits::new(Duration::from_secs(1), MAX_BYTES, MAX_BYTES, 100),
         ),
     )

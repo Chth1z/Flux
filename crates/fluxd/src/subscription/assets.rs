@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use flux_core::AddressHostFamilySelection;
+
 use crate::MAX_ENGINE_CONFIG_BYTES;
 use crate::generation_engine_config::{
     EngineConfigCompileError, TproxyEngineConfigRequest, compile_tproxy_engine_config,
@@ -36,6 +38,7 @@ pub(super) struct PrepareSubscriptionRequest<'a> {
     subscription_url: &'a Url,
     asset_root: &'a Path,
     listener_port: NonZeroU16,
+    families: AddressHostFamilySelection,
     limits: SubscriptionRefreshLimits,
 }
 
@@ -71,6 +74,7 @@ impl fmt::Debug for PrepareSubscriptionRequest<'_> {
             .field("subscription_url", &"<redacted>")
             .field("asset_root", &self.asset_root)
             .field("listener_port", &self.listener_port)
+            .field("families", &self.families)
             .field("limits", &self.limits)
             .finish()
     }
@@ -82,6 +86,7 @@ impl<'a> PrepareSubscriptionRequest<'a> {
         subscription_url: &'a Url,
         asset_root: &'a Path,
         listener_port: NonZeroU16,
+        families: AddressHostFamilySelection,
         limits: SubscriptionRefreshLimits,
     ) -> Self {
         Self {
@@ -89,6 +94,7 @@ impl<'a> PrepareSubscriptionRequest<'a> {
             subscription_url,
             asset_root,
             listener_port,
+            families,
             limits,
         }
     }
@@ -631,6 +637,7 @@ fn materialize_rule_sets<A: FetchAdapter>(
     let engine_config = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
         &merged,
         request.listener_port,
+        request.families,
     ))
     .map_err(PrepareSubscriptionError::CanonicalEngineConfig)?;
     let bytes = engine_config.bytes().to_vec();
@@ -1065,14 +1072,23 @@ mod tests {
         }]
     }
 
-    fn request<'a>(template: &'a [u8], url: &'a Url) -> PrepareSubscriptionRequest<'a> {
+    fn request_with_families<'a>(
+        template: &'a [u8],
+        url: &'a Url,
+        families: AddressHostFamilySelection,
+    ) -> PrepareSubscriptionRequest<'a> {
         PrepareSubscriptionRequest::new(
             template,
             url,
             Path::new(ASSET_ROOT),
             LISTENER_PORT,
+            families,
             SubscriptionRefreshLimits::new(Duration::from_secs(10), MAX_BYTES, MAX_BYTES, 100),
         )
+    }
+
+    fn request<'a>(template: &'a [u8], url: &'a Url) -> PrepareSubscriptionRequest<'a> {
+        request_with_families(template, url, AddressHostFamilySelection::DualStack)
     }
 
     #[test]
@@ -1098,11 +1114,14 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|inbound| inbound["type"] == "tproxy")
-            .expect("canonical TPROXY inbound");
-        assert_eq!(tproxy["listen"], "::");
-        assert_eq!(tproxy["listen_port"], LISTENER_PORT.get());
-        assert!(tproxy.get("network").is_none());
+            .filter(|inbound| inbound["type"] == "tproxy")
+            .collect::<Vec<_>>();
+        assert_eq!(tproxy.len(), 2);
+        assert_eq!(tproxy[0]["listen"], "0.0.0.0");
+        assert_eq!(tproxy[1]["listen"], "::");
+        assert!(tproxy.iter().all(|inbound| {
+            inbound["listen_port"] == LISTENER_PORT.get() && inbound.get("network").is_none()
+        }));
         let rule_sets = document["route"]["rule_set"].as_array().unwrap();
         assert_eq!(rule_sets[0]["type"], "local");
         assert_eq!(rule_sets[1]["type"], "local");
@@ -1159,6 +1178,39 @@ mod tests {
             assert!(prepared.assets().is_empty());
             assert!(prepared.bindings().is_empty());
             assert!(prepared.verify_assets());
+        }
+    }
+
+    #[test]
+    fn refresh_compiles_only_the_requested_address_family_listeners() {
+        let url = Url::parse(SUBSCRIPTION_URL).unwrap();
+        let cases: [(AddressHostFamilySelection, &[&str]); 3] = [
+            (AddressHostFamilySelection::Ipv4, &["0.0.0.0"]),
+            (AddressHostFamilySelection::Ipv6, &["::"]),
+            (AddressHostFamilySelection::DualStack, &["0.0.0.0", "::"]),
+        ];
+        for (families, expected_listens) in cases {
+            let adapter = DeterministicAdapter::new(subscription_success());
+            let prepared = prepare_subscription_refresh(
+                &adapter,
+                request_with_families(
+                    br#"{"outbounds":[{"type":"selector","tag":"PROXY","outbounds":[]}]}"#,
+                    &url,
+                    families,
+                ),
+            )
+            .unwrap();
+            adapter.assert_exhausted();
+
+            let document: Value = serde_json::from_slice(prepared.bytes()).unwrap();
+            let actual_listens = document["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|inbound| inbound["type"] == "tproxy")
+                .map(|inbound| inbound["listen"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_listens, expected_listens, "families: {families:?}");
         }
     }
 
@@ -1322,6 +1374,7 @@ mod tests {
             &url,
             Path::new("relative/assets"),
             LISTENER_PORT,
+            AddressHostFamilySelection::DualStack,
             SubscriptionRefreshLimits::new(Duration::from_secs(10), MAX_BYTES, MAX_BYTES, 100),
         );
         assert_eq!(

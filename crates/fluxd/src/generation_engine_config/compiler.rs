@@ -11,12 +11,13 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
+use flux_core::AddressHostFamilySelection;
 use flux_platform::{SingBoxPrivilege, SingBoxReadiness};
 
 use crate::intent_store::{IntentStoreError, record_io};
 use crate::{EngineArtifactDigest, EngineArtifactSetIdentity, EngineSpec, MAX_ENGINE_CONFIG_BYTES};
 
-pub(crate) const GENERATION_ENGINE_CONFIG_SCHEMA_VERSION: u16 = 1;
+pub(crate) const GENERATION_ENGINE_CONFIG_SCHEMA_VERSION: u16 = 2;
 pub(crate) const ENGINE_CONFIG_LAUNCH_BINDING_SCHEMA_VERSION: u16 = 2;
 pub(crate) const MAX_GENERATION_ENGINE_CONFIG_INBOUNDS: usize = 256;
 
@@ -28,6 +29,9 @@ const ARTIFACT_DIGEST_DOMAIN: &[u8] =
 const LAUNCH_BINDING_DIGEST_DOMAIN: &[u8] =
     b"Flux Generation Sing-Box engine config launch binding\0sha256-v2\0";
 const TPROXY_CANARY_DIRECT_OUTBOUND_TAG: &str = "flux-canary-direct-v1";
+const LEGACY_TPROXY_INBOUND_TAG: &str = "tproxy-in";
+const TPROXY_IPV4_INBOUND_TAG: &str = "tproxy-in-ipv4";
+const TPROXY_IPV6_INBOUND_TAG: &str = "tproxy-in-ipv6";
 
 pub(crate) fn read_bounded_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let maximum = usize::try_from(MAX_ENGINE_CONFIG_BYTES).unwrap_or(usize::MAX);
@@ -74,15 +78,21 @@ impl fmt::Display for EngineConfigArtifactDigest {
 pub(crate) struct TproxyEngineConfigRequest<'a> {
     template: &'a [u8],
     listener_port: NonZeroU16,
+    listener_families: AddressHostFamilySelection,
     canary_route: Option<TproxyCanaryEngineRoute>,
 }
 
 impl<'a> TproxyEngineConfigRequest<'a> {
     #[must_use]
-    pub(crate) const fn new(template: &'a [u8], listener_port: NonZeroU16) -> Self {
+    pub(crate) const fn new(
+        template: &'a [u8],
+        listener_port: NonZeroU16,
+        listener_families: AddressHostFamilySelection,
+    ) -> Self {
         Self {
             template,
             listener_port,
+            listener_families,
             canary_route: None,
         }
     }
@@ -174,6 +184,7 @@ impl EngineConfigResourceUsage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EngineConfigArtifact {
     listener_port: NonZeroU16,
+    listener_families: AddressHostFamilySelection,
     template_digest: [u8; ENGINE_CONFIG_DIGEST_BYTES],
     content_sha256: [u8; ENGINE_CONFIG_DIGEST_BYTES],
     digest: EngineConfigArtifactDigest,
@@ -190,6 +201,11 @@ impl EngineConfigArtifact {
     #[must_use]
     pub(crate) const fn listener_port(&self) -> NonZeroU16 {
         self.listener_port
+    }
+
+    #[must_use]
+    pub(crate) const fn listener_families(&self) -> AddressHostFamilySelection {
+        self.listener_families
     }
 
     #[must_use]
@@ -397,6 +413,11 @@ pub(crate) enum EngineConfigCompileErrorKind {
     InboundNotObject { index: usize },
     InboundTypeMissing { index: usize },
     InboundTypeNotString { index: usize },
+    InboundTagNotString { index: usize },
+    CanonicalTproxyInboundTagCollision { index: usize },
+    CanonicalTproxyInboundReferenceCollision,
+    InheritedTproxyInboundTagCollision { index: usize },
+    InvalidTproxyInboundReference,
     MultipleTproxyInbounds,
     OutboundsNotArray,
     OutboundNotObject { index: usize },
@@ -406,6 +427,7 @@ pub(crate) enum EngineConfigCompileErrorKind {
     RouteRuleNotObject { index: usize },
     RouteRuleOutboundNotString { index: usize },
     CanaryRouteReservedTagCollision,
+    CanaryRouteListenerFamilyMismatch,
     OutputTooLarge { actual: usize, maximum: u64 },
     NonCanonical,
     ContentDigestMismatch,
@@ -474,8 +496,27 @@ impl fmt::Display for EngineConfigCompileError {
                 formatter,
                 "Sing-Box template inbound {index} field 'type' must be a string"
             ),
+            EngineConfigCompileErrorKind::InboundTagNotString { index } => write!(
+                formatter,
+                "Sing-Box template TPROXY inbound {index} field 'tag' must be a string"
+            ),
+            EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision { index } => write!(
+                formatter,
+                "Sing-Box template inbound {index} reuses a compiler-owned family-specific TPROXY tag"
+            ),
+            EngineConfigCompileErrorKind::CanonicalTproxyInboundReferenceCollision => formatter
+                .write_str(
+                    "Sing-Box template references a compiler-owned family-specific TPROXY tag without the exact canonical listener bundle",
+                ),
+            EngineConfigCompileErrorKind::InheritedTproxyInboundTagCollision { index } => write!(
+                formatter,
+                "Sing-Box template inbound {index} reuses the inherited TPROXY tag"
+            ),
+            EngineConfigCompileErrorKind::InvalidTproxyInboundReference => formatter.write_str(
+                "Sing-Box route or DNS rule field 'inbound' must be a string or an array of strings",
+            ),
             EngineConfigCompileErrorKind::MultipleTproxyInbounds => formatter.write_str(
-                "Sing-Box template contains multiple TPROXY inbounds; one canonical listener is required",
+                "Sing-Box template contains multiple inherited TPROXY inbounds; one canonical source inbound is required",
             ),
             EngineConfigCompileErrorKind::OutboundsNotArray => {
                 formatter.write_str("Sing-Box template field 'outbounds' must be a JSON array")
@@ -505,6 +546,10 @@ impl fmt::Display for EngineConfigCompileError {
                 formatter,
                 "Sing-Box template substitutes or reuses reserved canary outbound tag '{TPROXY_CANARY_DIRECT_OUTBOUND_TAG}'"
             ),
+            EngineConfigCompileErrorKind::CanaryRouteListenerFamilyMismatch => formatter
+                .write_str(
+                    "the admitted canary route families do not exactly match the canonical TPROXY listener families",
+                ),
             EngineConfigCompileErrorKind::OutputTooLarge { actual, maximum } => write!(
                 formatter,
                 "compiled Sing-Box configuration is {actual} bytes, exceeding the {maximum}-byte Generation budget"
@@ -578,10 +623,34 @@ pub(crate) fn compile_tproxy_engine_config(
     }
 
     let input_inbounds = inbounds.len();
-    let mut output_inbounds = Vec::with_capacity(input_inbounds.saturating_add(1));
+    let canonical_listener_count = canonical_tproxy_listener_count(request.listener_families);
+    let exact_canonical_listener_bundle = is_exact_canonical_tproxy_bundle(
+        &inbounds,
+        request.listener_port,
+        request.listener_families,
+    );
+    let alternate_canonical_listener_bundle = [
+        AddressHostFamilySelection::Ipv4,
+        AddressHostFamilySelection::Ipv6,
+        AddressHostFamilySelection::DualStack,
+    ]
+    .into_iter()
+    .any(|families| {
+        families != request.listener_families
+            && is_exact_canonical_tproxy_bundle(&inbounds, request.listener_port, families)
+    });
+    if !exact_canonical_listener_bundle && alternate_canonical_listener_bundle {
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::NonCanonical,
+        ));
+    }
+    let mut output_inbounds =
+        Vec::with_capacity(input_inbounds.saturating_add(canonical_listener_count));
     let mut found_tproxy = false;
+    let mut inherited_tproxy_tag = None;
+    let mut non_tproxy_tags = Vec::new();
     for (index, inbound) in inbounds.into_iter().enumerate() {
-        let Value::Object(mut inbound) = inbound else {
+        let Value::Object(inbound) = inbound else {
             return Err(EngineConfigCompileError::without_source(
                 EngineConfigCompileErrorKind::InboundNotObject { index },
             ));
@@ -599,27 +668,92 @@ pub(crate) fn compile_tproxy_engine_config(
                 ));
             }
         };
+        if inbound_type != "tproxy"
+            && let Some(Value::String(tag)) = inbound.get("tag")
+        {
+            if is_canonical_tproxy_inbound_tag(tag) {
+                return Err(EngineConfigCompileError::without_source(
+                    EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision { index },
+                ));
+            }
+            non_tproxy_tags.push((index, tag.clone()));
+        }
         match inbound_type {
             "tun" => continue,
             "tproxy" => {
+                if exact_canonical_listener_bundle {
+                    found_tproxy = true;
+                    output_inbounds.push(Value::Object(inbound));
+                    continue;
+                }
                 if found_tproxy {
                     return Err(EngineConfigCompileError::without_source(
                         EngineConfigCompileErrorKind::MultipleTproxyInbounds,
                     ));
                 }
                 found_tproxy = true;
-                normalize_tproxy_inbound(&mut inbound, request.listener_port);
+                inherited_tproxy_tag = match inbound.get("tag") {
+                    Some(Value::String(tag)) if is_canonical_tproxy_inbound_tag(tag) => {
+                        return Err(EngineConfigCompileError::without_source(
+                            EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision {
+                                index,
+                            },
+                        ));
+                    }
+                    Some(Value::String(tag)) => Some(tag.clone()),
+                    Some(_) => {
+                        return Err(EngineConfigCompileError::without_source(
+                            EngineConfigCompileErrorKind::InboundTagNotString { index },
+                        ));
+                    }
+                    None => None,
+                };
+                output_inbounds.extend(canonical_tproxy_inbounds(
+                    inbound,
+                    request.listener_port,
+                    request.listener_families,
+                ));
             }
-            _ => {}
+            _ => output_inbounds.push(Value::Object(inbound)),
         }
-        output_inbounds.push(Value::Object(inbound));
+    }
+    let inherited_reference_tag = if exact_canonical_listener_bundle {
+        None
+    } else if found_tproxy {
+        inherited_tproxy_tag.as_deref()
+    } else {
+        Some(LEGACY_TPROXY_INBOUND_TAG)
+    };
+    if let Some(inherited_reference_tag) = inherited_reference_tag
+        && let Some((index, _)) = non_tproxy_tags
+            .iter()
+            .find(|(_, tag)| tag == inherited_reference_tag)
+    {
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::InheritedTproxyInboundTagCollision { index: *index },
+        ));
     }
     if !found_tproxy {
-        output_inbounds.push(Value::Object(default_tproxy_inbound(request.listener_port)));
+        output_inbounds.extend(canonical_tproxy_inbounds(
+            default_tproxy_inbound(),
+            request.listener_port,
+            request.listener_families,
+        ));
     }
     let output_inbound_count = output_inbounds.len();
     document.insert("inbounds".to_owned(), Value::Array(output_inbounds));
+    rewrite_inbound_tag_references(
+        &mut document,
+        inherited_reference_tag,
+        request.listener_families,
+        exact_canonical_listener_bundle,
+    )?;
     if let Some(canary_route) = request.canary_route {
+        if !canary_route_matches_listener_families(canary_route, request.listener_families) {
+            return Err(EngineConfigCompileError::without_source(
+                EngineConfigCompileErrorKind::CanaryRouteListenerFamilyMismatch,
+            ));
+        }
         install_tproxy_canary_route(&mut document, canary_route)?;
     }
 
@@ -640,6 +774,7 @@ pub(crate) fn compile_tproxy_engine_config(
     let content_sha256 = sha256(&bytes);
     let digest = EngineConfigArtifactDigest(digest_engine_config_artifact(
         request.listener_port,
+        request.listener_families,
         template_digest,
         content_sha256,
         input_inbounds,
@@ -647,6 +782,7 @@ pub(crate) fn compile_tproxy_engine_config(
     ));
     Ok(EngineConfigArtifact {
         listener_port: request.listener_port,
+        listener_families: request.listener_families,
         template_digest,
         content_sha256,
         digest,
@@ -664,9 +800,13 @@ pub(crate) fn compile_tproxy_engine_config(
 pub(crate) fn reconstruct_canonical_tproxy_engine_config(
     bytes: &[u8],
     listener_port: NonZeroU16,
+    listener_families: AddressHostFamilySelection,
 ) -> Result<EngineConfigArtifact, EngineConfigCompileError> {
-    let artifact =
-        compile_tproxy_engine_config(TproxyEngineConfigRequest::new(bytes, listener_port))?;
+    let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+        bytes,
+        listener_port,
+        listener_families,
+    ))?;
     if artifact.bytes() != bytes {
         return Err(EngineConfigCompileError::without_source(
             EngineConfigCompileErrorKind::NonCanonical,
@@ -838,23 +978,280 @@ fn count_reserved_canary_tag(value: &Value) -> usize {
     }
 }
 
-fn normalize_tproxy_inbound(inbound: &mut Map<String, Value>, port: NonZeroU16) {
-    inbound.insert("listen".to_owned(), Value::String("::".to_owned()));
+fn normalize_tproxy_inbound(
+    inbound: &mut Map<String, Value>,
+    port: NonZeroU16,
+    listen: &'static str,
+    tag: &'static str,
+) {
+    inbound.insert("listen".to_owned(), Value::String(listen.to_owned()));
     inbound.insert(
         "listen_port".to_owned(),
         Value::Number(Number::from(port.get())),
     );
+    inbound.insert("tag".to_owned(), Value::String(tag.to_owned()));
     // Absence is Sing-Box's exact TCP+UDP selection. A narrower inherited value must not silently
     // weaken the first canonical Capture Path.
     inbound.remove("network");
 }
 
-fn default_tproxy_inbound(port: NonZeroU16) -> Map<String, Value> {
+fn default_tproxy_inbound() -> Map<String, Value> {
     let mut inbound = Map::new();
     inbound.insert("type".to_owned(), Value::String("tproxy".to_owned()));
-    inbound.insert("tag".to_owned(), Value::String("tproxy-in".to_owned()));
-    normalize_tproxy_inbound(&mut inbound, port);
     inbound
+}
+
+fn canonical_tproxy_inbounds(
+    inbound: Map<String, Value>,
+    port: NonZeroU16,
+    families: AddressHostFamilySelection,
+) -> Vec<Value> {
+    let mut canonical = Vec::with_capacity(canonical_tproxy_listener_count(families));
+    if matches!(
+        families,
+        AddressHostFamilySelection::Ipv4 | AddressHostFamilySelection::DualStack
+    ) {
+        let mut ipv4 = inbound.clone();
+        normalize_tproxy_inbound(&mut ipv4, port, "0.0.0.0", TPROXY_IPV4_INBOUND_TAG);
+        canonical.push(Value::Object(ipv4));
+    }
+    if matches!(
+        families,
+        AddressHostFamilySelection::Ipv6 | AddressHostFamilySelection::DualStack
+    ) {
+        let mut ipv6 = inbound;
+        normalize_tproxy_inbound(&mut ipv6, port, "::", TPROXY_IPV6_INBOUND_TAG);
+        canonical.push(Value::Object(ipv6));
+    }
+    canonical
+}
+
+const fn canonical_tproxy_listener_count(families: AddressHostFamilySelection) -> usize {
+    match families {
+        AddressHostFamilySelection::Ipv4 | AddressHostFamilySelection::Ipv6 => 1,
+        AddressHostFamilySelection::DualStack => 2,
+    }
+}
+
+fn is_canonical_tproxy_inbound_tag(tag: &str) -> bool {
+    matches!(tag, TPROXY_IPV4_INBOUND_TAG | TPROXY_IPV6_INBOUND_TAG)
+}
+
+fn is_exact_canonical_tproxy_bundle(
+    inbounds: &[Value],
+    port: NonZeroU16,
+    families: AddressHostFamilySelection,
+) -> bool {
+    let expected_tags = canonical_tproxy_inbound_tags(families);
+    let candidates = inbounds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, inbound)| {
+            let inbound = inbound.as_object()?;
+            (inbound.get("type").and_then(Value::as_str) == Some("tproxy"))
+                .then_some((index, inbound))
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() != expected_tags.len()
+        || candidates
+            .windows(2)
+            .any(|pair| pair[1].0 != pair[0].0.saturating_add(1))
+    {
+        return false;
+    }
+
+    let expected_listens = canonical_tproxy_listen_addresses(families);
+    let mut shared_options = None;
+    for (((_, inbound), tag), listen) in candidates.iter().zip(expected_tags).zip(expected_listens)
+    {
+        if inbound.get("tag").and_then(Value::as_str) != Some(tag)
+            || inbound.get("listen").and_then(Value::as_str) != Some(listen)
+            || inbound.get("listen_port").and_then(Value::as_u64) != Some(u64::from(port.get()))
+            || inbound.contains_key("network")
+        {
+            return false;
+        }
+        let mut options = (*inbound).clone();
+        options.remove("tag");
+        options.remove("listen");
+        options.remove("listen_port");
+        if shared_options
+            .as_ref()
+            .is_some_and(|previous| previous != &options)
+        {
+            return false;
+        }
+        shared_options = Some(options);
+    }
+    true
+}
+
+fn canonical_tproxy_listen_addresses(families: AddressHostFamilySelection) -> Vec<&'static str> {
+    match families {
+        AddressHostFamilySelection::Ipv4 => vec!["0.0.0.0"],
+        AddressHostFamilySelection::Ipv6 => vec!["::"],
+        AddressHostFamilySelection::DualStack => vec!["0.0.0.0", "::"],
+    }
+}
+
+fn rewrite_inbound_tag_references(
+    document: &mut Map<String, Value>,
+    inherited: Option<&str>,
+    families: AddressHostFamilySelection,
+    exact_canonical_bundle: bool,
+) -> Result<(), EngineConfigCompileError> {
+    for root in ["route", "dns"] {
+        let Some(Value::Object(container)) = document.get_mut(root) else {
+            continue;
+        };
+        let Some(Value::Array(rules)) = container.get_mut("rules") else {
+            continue;
+        };
+        for rule in rules {
+            rewrite_inbound_tag_references_in_rule(
+                rule,
+                inherited,
+                families,
+                exact_canonical_bundle,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_inbound_tag_references_in_rule(
+    value: &mut Value,
+    inherited: Option<&str>,
+    families: AddressHostFamilySelection,
+    exact_canonical_bundle: bool,
+) -> Result<(), EngineConfigCompileError> {
+    let Value::Object(rule) = value else {
+        return Ok(());
+    };
+    if let Some(inbound) = rule.get_mut("inbound") {
+        rewrite_inbound_tag_reference(inbound, inherited, families, exact_canonical_bundle)?;
+    }
+    if let Some(Value::Array(nested)) = rule.get_mut("rules") {
+        for rule in nested {
+            rewrite_inbound_tag_references_in_rule(
+                rule,
+                inherited,
+                families,
+                exact_canonical_bundle,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_inbound_tag_reference(
+    value: &mut Value,
+    inherited: Option<&str>,
+    families: AddressHostFamilySelection,
+    exact_canonical_bundle: bool,
+) -> Result<(), EngineConfigCompileError> {
+    let replacement = canonical_tproxy_inbound_tags(families);
+    match value {
+        Value::String(tag) => {
+            validate_inbound_reference_tag(tag, inherited, &replacement, exact_canonical_bundle)?;
+            if inherited == Some(tag.as_str()) {
+                if replacement.len() == 1 {
+                    *tag = replacement[0].to_owned();
+                } else {
+                    *value = Value::Array(
+                        replacement
+                            .into_iter()
+                            .map(|tag| Value::String(tag.to_owned()))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        Value::Array(tags) => {
+            let mut rewritten = Vec::with_capacity(tags.len().saturating_add(1));
+            for tag in tags.drain(..) {
+                let Some(tag_text) = tag.as_str() else {
+                    return Err(EngineConfigCompileError::without_source(
+                        EngineConfigCompileErrorKind::InvalidTproxyInboundReference,
+                    ));
+                };
+                validate_inbound_reference_tag(
+                    tag_text,
+                    inherited,
+                    &replacement,
+                    exact_canonical_bundle,
+                )?;
+                if inherited == Some(tag_text) {
+                    for replacement in &replacement {
+                        let replacement = Value::String((*replacement).to_owned());
+                        if !rewritten.contains(&replacement) {
+                            rewritten.push(replacement);
+                        }
+                    }
+                } else {
+                    let duplicates_replacement = tag.as_str().is_some_and(|candidate| {
+                        replacement.contains(&candidate)
+                            && rewritten
+                                .iter()
+                                .any(|existing| existing.as_str() == Some(candidate))
+                    });
+                    if !duplicates_replacement {
+                        rewritten.push(tag);
+                    }
+                }
+            }
+            *tags = rewritten;
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+            return Err(EngineConfigCompileError::without_source(
+                EngineConfigCompileErrorKind::InvalidTproxyInboundReference,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_inbound_reference_tag(
+    tag: &str,
+    inherited: Option<&str>,
+    requested_canonical_tags: &[&str],
+    exact_canonical_bundle: bool,
+) -> Result<(), EngineConfigCompileError> {
+    let canonical_reference = is_canonical_tproxy_inbound_tag(tag);
+    let requested_canonical_reference = requested_canonical_tags.contains(&tag);
+    let legacy_reference = tag == LEGACY_TPROXY_INBOUND_TAG;
+    let owned_reference = inherited == Some(tag);
+    if (canonical_reference
+        && (!exact_canonical_bundle || !requested_canonical_reference)
+        && !owned_reference)
+        || (legacy_reference && exact_canonical_bundle)
+    {
+        return Err(EngineConfigCompileError::without_source(
+            EngineConfigCompileErrorKind::CanonicalTproxyInboundReferenceCollision,
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_tproxy_inbound_tags(families: AddressHostFamilySelection) -> Vec<&'static str> {
+    match families {
+        AddressHostFamilySelection::Ipv4 => vec![TPROXY_IPV4_INBOUND_TAG],
+        AddressHostFamilySelection::Ipv6 => vec![TPROXY_IPV6_INBOUND_TAG],
+        AddressHostFamilySelection::DualStack => {
+            vec![TPROXY_IPV4_INBOUND_TAG, TPROXY_IPV6_INBOUND_TAG]
+        }
+    }
+}
+
+fn canary_route_matches_listener_families(
+    route: TproxyCanaryEngineRoute,
+    families: AddressHostFamilySelection,
+) -> bool {
+    match families {
+        AddressHostFamilySelection::Ipv4 => route.ipv6_peer.is_none(),
+        AddressHostFamilySelection::Ipv6 => false,
+        AddressHostFamilySelection::DualStack => route.ipv6_peer.is_some(),
+    }
 }
 
 fn bytes_exceed_limit(actual: usize, maximum: u64) -> bool {
@@ -863,6 +1260,7 @@ fn bytes_exceed_limit(actual: usize, maximum: u64) -> bool {
 
 fn digest_engine_config_artifact(
     listener_port: NonZeroU16,
+    listener_families: AddressHostFamilySelection,
     template_digest: [u8; ENGINE_CONFIG_DIGEST_BYTES],
     content_sha256: [u8; ENGINE_CONFIG_DIGEST_BYTES],
     input_inbound_count: usize,
@@ -872,11 +1270,20 @@ fn digest_engine_config_artifact(
     digest.update(ARTIFACT_DIGEST_DOMAIN);
     digest.update(GENERATION_ENGINE_CONFIG_SCHEMA_VERSION.to_be_bytes());
     digest.update(listener_port.get().to_be_bytes());
+    digest.update([listener_family_selection_tag(listener_families)]);
     digest.update(template_digest);
     digest.update(content_sha256);
     digest.update(length_bytes(input_inbound_count));
     digest.update(length_bytes(output_inbound_count));
     digest.finalize().into()
+}
+
+const fn listener_family_selection_tag(families: AddressHostFamilySelection) -> u8 {
+    match families {
+        AddressHostFamilySelection::Ipv4 => 4,
+        AddressHostFamilySelection::Ipv6 => 6,
+        AddressHostFamilySelection::DualStack => 10,
+    }
 }
 
 fn digest_engine_config_launch_binding(

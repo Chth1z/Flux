@@ -733,6 +733,7 @@ impl Fixture {
         let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
             &template,
             desired_state.listener().port(),
+            desired_state.capture().scope().families(),
         ))
         .map_err(|error| format!("compile subscription engine candidate: {error}"))?;
         Ok(ValidatedSubscriptionEngineConfig::for_test(

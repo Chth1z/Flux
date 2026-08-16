@@ -3,9 +3,9 @@ use std::fmt;
 use std::num::NonZeroU16;
 
 use flux_core::{
-    AddressHostSetPlan, CaptureApplicationMode, CaptureApplicationPolicy,
-    CaptureProgramCompilation, CaptureProgramCompileError, CaptureProgramRequest, FluxConfig,
-    compile_capture_program,
+    AddressHostFamilySelection, AddressHostSetPlan, CaptureApplicationMode,
+    CaptureApplicationPolicy, CaptureProgramCompilation, CaptureProgramCompileError,
+    CaptureProgramRequest, FluxConfig, compile_capture_program,
 };
 
 use super::compiler::EngineConfigArtifact;
@@ -138,6 +138,16 @@ impl DesiredStateCaptureArtifacts {
                 selected,
             });
         }
+        let configured = self.desired_state.capture().scope().families();
+        let selected = engine_source.artifact().listener_families();
+        if configured != selected {
+            return Err(
+                DesiredStateCompileError::EngineSourceListenerFamiliesMismatch {
+                    configured,
+                    selected,
+                },
+            );
+        }
         Ok(DesiredStateArtifacts {
             desired_state: self.desired_state,
             engine_source,
@@ -184,6 +194,10 @@ pub(crate) enum DesiredStateCompileErrorKind {
         configured: NonZeroU16,
         selected: NonZeroU16,
     },
+    EngineSourceListenerFamiliesMismatch {
+        configured: AddressHostFamilySelection,
+        selected: AddressHostFamilySelection,
+    },
     Capture,
 }
 
@@ -198,6 +212,10 @@ pub(crate) enum DesiredStateCompileError {
     EngineSourceListenerPortMismatch {
         configured: NonZeroU16,
         selected: NonZeroU16,
+    },
+    EngineSourceListenerFamiliesMismatch {
+        configured: AddressHostFamilySelection,
+        selected: AddressHostFamilySelection,
     },
     Capture(CaptureProgramCompileError),
 }
@@ -219,6 +237,13 @@ impl DesiredStateCompileError {
                 configured,
                 selected,
             } => DesiredStateCompileErrorKind::EngineSourceListenerPortMismatch {
+                configured: *configured,
+                selected: *selected,
+            },
+            Self::EngineSourceListenerFamiliesMismatch {
+                configured,
+                selected,
+            } => DesiredStateCompileErrorKind::EngineSourceListenerFamiliesMismatch {
                 configured: *configured,
                 selected: *selected,
             },
@@ -246,6 +271,13 @@ impl fmt::Display for DesiredStateCompileError {
                 formatter,
                 "selected engine source listener port {selected} does not match Desired State port {configured}"
             ),
+            Self::EngineSourceListenerFamiliesMismatch {
+                configured,
+                selected,
+            } => write!(
+                formatter,
+                "selected engine source listener families {selected:?} do not match Desired State families {configured:?}"
+            ),
             Self::Capture(error) => error.fmt(formatter),
         }
     }
@@ -255,7 +287,8 @@ impl Error for DesiredStateCompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ApplicationModeMismatch { .. }
-            | Self::EngineSourceListenerPortMismatch { .. } => None,
+            | Self::EngineSourceListenerPortMismatch { .. }
+            | Self::EngineSourceListenerFamiliesMismatch { .. } => None,
             #[cfg(test)]
             Self::EngineConfig(error) => Some(error),
             Self::Capture(error) => Some(error),
@@ -270,9 +303,11 @@ pub(crate) fn compile_desired_state(
     engine_template: &[u8],
 ) -> Result<DesiredStateArtifacts, DesiredStateCompileError> {
     let listener_port = request.config.listener().port();
+    let listener_families = request.config.capture().scope().families();
     let engine_config = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
         engine_template,
         listener_port,
+        listener_families,
     ))
     .map_err(DesiredStateCompileError::EngineConfig)?;
     compile_desired_state_capture(request)?

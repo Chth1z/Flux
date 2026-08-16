@@ -449,14 +449,15 @@ impl InspectionSource for ProcessInspectionSource {
                 source: source.to_string(),
             }
         })?;
+        let scope = config.capture().scope();
         let engine = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
             &template,
             config.listener().port(),
+            scope.families(),
         ))
         .map_err(|source| InspectionError::Compile {
             source: source.to_string(),
         })?;
-        let scope = config.capture().scope();
         let protocols = config.capture().protocols();
         let interfaces = config.interfaces().policy();
         let runtime = self.runtime.snapshot();

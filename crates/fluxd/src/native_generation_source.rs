@@ -774,6 +774,7 @@ where
                     TproxyEngineConfigRequest::new(
                         stored_artifact.bytes(),
                         desired_state.listener().port(),
+                        desired_state.capture().scope().families(),
                     )
                     .with_canary_route(route),
                 )
@@ -797,7 +798,11 @@ where
                 source,
             }
         })?;
-        let request = TproxyEngineConfigRequest::new(&template, desired_state.listener().port());
+        let request = TproxyEngineConfigRequest::new(
+            &template,
+            desired_state.listener().port(),
+            desired_state.capture().scope().families(),
+        );
         let request = match canary_route {
             Some(route) => request.with_canary_route(route),
             None => request,
@@ -1195,6 +1200,7 @@ where
                 TproxyEngineConfigRequest::new(
                     stored_artifact.bytes(),
                     inputs.desired_state().listener().port(),
+                    inputs.desired_state().capture().scope().families(),
                 )
                 .with_canary_route(route),
             )
@@ -1869,8 +1875,12 @@ esac
             .expect("dual-stack facility satisfies dual-stack Generation")
             .expect("required Generation has a route");
         let artifact = compile_tproxy_engine_config(
-            TproxyEngineConfigRequest::new(b"{}", dual_state.listener().port())
-                .with_canary_route(route),
+            TproxyEngineConfigRequest::new(
+                b"{}",
+                dual_state.listener().port(),
+                dual_state.capture().scope().families(),
+            )
+            .with_canary_route(route),
         )
         .expect("compile dual-stack Generation route");
         let document: serde_json::Value =
@@ -2299,6 +2309,7 @@ esac
         let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
             template,
             desired_state.listener().port(),
+            desired_state.capture().scope().families(),
         ))
         .expect("compile subscription engine source");
         ValidatedSubscriptionEngineConfig::for_test(desired_state, artifact, digest, 1)

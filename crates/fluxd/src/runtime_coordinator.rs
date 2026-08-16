@@ -8963,6 +8963,7 @@ mod tests {
         let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
             PACKAGED_ENGINE_TEMPLATE,
             desired_state.listener().port(),
+            desired_state.capture().scope().families(),
         ))
         .expect("subscription test artifact");
         ValidatedSubscriptionEngineConfig::for_test(

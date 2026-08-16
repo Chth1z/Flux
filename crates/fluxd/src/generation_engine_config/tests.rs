@@ -6,13 +6,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    CapabilityProfile, CapabilityProfileRevision, CaptureApplicationMode, CaptureApplicationPolicy,
-    CaptureDecisionStage, CaptureGroupId, CaptureInterfaceDirection, CapturePathId,
-    CapturePathQualificationState, CapturePathQualifications, CapturePathRequest, CapturePredicate,
-    CaptureTrafficDomain, CaptureUserId, EngineCredentials, FluxConfig, FwmarkCandidate,
-    InterfaceAddressRecord, InterfaceLinkRecord, KernelSupport, NetworkAddressFamily,
-    NetworkInventory, NetworkInventoryTracker, NetworkNamespaceIdentity, Observation,
-    ObservationKind, RouteProtocol, RouteTableId, RulePriority, RuleProtocol, SelinuxMode,
+    AddressHostFamilySelection, CapabilityProfile, CapabilityProfileRevision,
+    CaptureApplicationMode, CaptureApplicationPolicy, CaptureDecisionStage, CaptureGroupId,
+    CaptureInterfaceDirection, CapturePathId, CapturePathQualificationState,
+    CapturePathQualifications, CapturePathRequest, CapturePredicate, CaptureTrafficDomain,
+    CaptureUserId, EngineCredentials, FluxConfig, FwmarkCandidate, InterfaceAddressRecord,
+    InterfaceLinkRecord, KernelSupport, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol,
+    RouteTableId, RulePriority, RuleProtocol, SelinuxMode,
     select_reviewed_android_platform_profile,
 };
 use flux_platform::internal::SingBoxProcessError;
@@ -204,7 +205,34 @@ fn desired_state_propagates_engine_template_errors() {
 }
 
 #[test]
-fn compiles_one_canonical_tcp_udp_tproxy_inbound() {
+fn desired_state_rejects_an_engine_source_with_different_listener_families() {
+    let config = FluxConfig::parse(PACKAGED_DESIRED_STATE).expect("packaged Desired State");
+    let applications = CaptureApplicationPolicy::new(CaptureApplicationMode::All, [])
+        .expect("resolved all-app policy");
+    let capture =
+        compile_desired_state_capture(DesiredStateCompileRequest::new(config, applications, None))
+            .expect("capture artifacts");
+    let artifact = compile_for_families(
+        PACKAGED_ENGINE_TEMPLATE,
+        PORT,
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect("dual-stack engine artifact");
+
+    let error = capture
+        .with_engine_source(SelectedEngineSource::template(artifact))
+        .expect_err("listener-family substitution must fail closed");
+    assert_eq!(
+        error.kind(),
+        DesiredStateCompileErrorKind::EngineSourceListenerFamiliesMismatch {
+            configured: AddressHostFamilySelection::Ipv4,
+            selected: AddressHostFamilySelection::DualStack,
+        }
+    );
+}
+
+#[test]
+fn compiles_canonical_family_specific_tcp_udp_tproxy_inbounds() {
     let template = br#"{
             "route": {"rules": []},
             "inbounds": [
@@ -228,8 +256,10 @@ fn compiles_one_canonical_tcp_udp_tproxy_inbound() {
         concat!(
             "{\"inbounds\":[",
             "{\"tag\":\"mixed-in\",\"type\":\"mixed\"},",
+            "{\"listen\":\"0.0.0.0\",\"listen_port\":1536,\"sniff\":true,",
+            "\"tag\":\"tproxy-in-ipv4\",\"type\":\"tproxy\"},",
             "{\"listen\":\"::\",\"listen_port\":1536,\"sniff\":true,",
-            "\"tag\":\"existing-tproxy\",\"type\":\"tproxy\"}",
+            "\"tag\":\"tproxy-in-ipv6\",\"type\":\"tproxy\"}",
             "],\"route\":{\"rules\":[]}}\n"
         )
         .as_bytes()
@@ -240,16 +270,16 @@ fn compiles_one_canonical_tcp_udp_tproxy_inbound() {
     );
     assert_eq!(artifact.listener_port().get(), PORT);
     assert_eq!(artifact.usage().input_inbounds(), 3);
-    assert_eq!(artifact.usage().output_inbounds(), 2);
+    assert_eq!(artifact.usage().output_inbounds(), 3);
     assert_eq!(artifact.usage().input_bytes(), template.len());
     assert_eq!(artifact.usage().output_bytes(), artifact.bytes().len());
     assert_eq!(
         hex(artifact.content_sha256()),
-        "d06fd8595a4a85897ad2c5fe68a4ab42ce126afad4570546142c3bc7bf489470"
+        "eb4b4fccc008180a89e5ac6ac7d1a5851f9644638d961ec5d085028780150f80"
     );
     assert_eq!(
         artifact.digest().to_string(),
-        "fa4d5069c6bb6d889bbf1edb4ea0459f0697c7a6b82f17fda83c87e9774d033f"
+        "befda47123b7f3d08bc20a7ae3cbb5ae2af35222d07af2a1cbb0e1a61b20ce6b"
     );
     assert_eq!(artifact.digest().as_bytes().len(), 32);
 }
@@ -262,11 +292,298 @@ fn adds_the_default_listener_when_the_template_has_none() {
     assert_eq!(
         artifact.bytes(),
         concat!(
-            "{\"inbounds\":[{\"listen\":\"::\",\"listen_port\":1536,",
-            "\"tag\":\"tproxy-in\",\"type\":\"tproxy\"}],",
+            "{\"inbounds\":[{\"listen\":\"0.0.0.0\",\"listen_port\":1536,",
+            "\"tag\":\"tproxy-in-ipv4\",\"type\":\"tproxy\"},",
+            "{\"listen\":\"::\",\"listen_port\":1536,",
+            "\"tag\":\"tproxy-in-ipv6\",\"type\":\"tproxy\"}],",
             "\"log\":{\"level\":\"info\"}}\n"
         )
         .as_bytes()
+    );
+}
+
+#[test]
+fn requested_listener_families_are_exact_and_identity_bound() {
+    let template = br#"{"inbounds":[]}"#;
+    let ipv4 = compile_for_families(template, PORT, AddressHostFamilySelection::Ipv4).unwrap();
+    let ipv6 = compile_for_families(template, PORT, AddressHostFamilySelection::Ipv6).unwrap();
+    let dual = compile_for_families(template, PORT, AddressHostFamilySelection::DualStack).unwrap();
+
+    assert_eq!(ipv4.listener_families(), AddressHostFamilySelection::Ipv4);
+    assert_eq!(ipv6.listener_families(), AddressHostFamilySelection::Ipv6);
+    assert_eq!(
+        dual.listener_families(),
+        AddressHostFamilySelection::DualStack
+    );
+    assert_eq!(
+        ipv4.bytes(),
+        b"{\"inbounds\":[{\"listen\":\"0.0.0.0\",\"listen_port\":1536,\"tag\":\"tproxy-in-ipv4\",\"type\":\"tproxy\"}]}\n"
+    );
+    assert_eq!(
+        ipv6.bytes(),
+        b"{\"inbounds\":[{\"listen\":\"::\",\"listen_port\":1536,\"tag\":\"tproxy-in-ipv6\",\"type\":\"tproxy\"}]}\n"
+    );
+    assert_eq!(dual.usage().output_inbounds(), 2);
+    assert_ne!(ipv4.content_sha256(), ipv6.content_sha256());
+    assert_ne!(ipv4.digest(), ipv6.digest());
+    assert_ne!(ipv4.digest(), dual.digest());
+
+    let error = reconstruct_canonical_tproxy_engine_config(
+        ipv4.bytes(),
+        NonZeroU16::new(PORT).unwrap(),
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect_err("an IPv4 artifact must not reconstruct as dual-stack");
+    assert_eq!(error.kind(), EngineConfigCompileErrorKind::NonCanonical);
+}
+
+#[test]
+fn inherited_tproxy_tag_references_expand_to_the_selected_family_tags() {
+    let artifact = compile(
+        br#"{
+          "inbounds":[{"type":"tproxy","tag":"legacy-transparent"}],
+          "route":{"rules":[{"inbound":"legacy-transparent","action":"reject"}]},
+          "dns":{"rules":[{"inbound":["other","legacy-transparent"],"action":"reject"}]}
+        }"#,
+        PORT,
+    )
+    .unwrap();
+    let document: serde_json::Value = serde_json::from_slice(artifact.bytes()).unwrap();
+
+    assert_eq!(
+        document["route"]["rules"][0]["inbound"],
+        serde_json::json!(["tproxy-in-ipv4", "tproxy-in-ipv6"])
+    );
+    assert_eq!(
+        document["dns"]["rules"][0]["inbound"],
+        serde_json::json!(["other", "tproxy-in-ipv4", "tproxy-in-ipv6"])
+    );
+}
+
+#[test]
+fn default_tproxy_tag_references_expand_and_ambiguous_tags_fail_closed() {
+    let default = compile(
+        br#"{"route":{"rules":[{"inbound":"tproxy-in","action":"reject"}]}}"#,
+        PORT,
+    )
+    .unwrap();
+    let document: serde_json::Value = serde_json::from_slice(default.bytes()).unwrap();
+    assert_eq!(
+        document["route"]["rules"][0]["inbound"],
+        serde_json::json!(["tproxy-in-ipv4", "tproxy-in-ipv6"])
+    );
+
+    let inherited_collision = compile(
+        br#"{"inbounds":[
+          {"type":"mixed","tag":"legacy-transparent"},
+          {"type":"tproxy","tag":"legacy-transparent"}
+        ]}"#,
+        PORT,
+    )
+    .expect_err("an inherited TPROXY tag shared by another inbound is ambiguous");
+    assert_eq!(
+        inherited_collision.kind(),
+        EngineConfigCompileErrorKind::InheritedTproxyInboundTagCollision { index: 0 }
+    );
+
+    let canonical_collision = compile(
+        br#"{"inbounds":[{"type":"tun","tag":"tproxy-in-ipv6"}]}"#,
+        PORT,
+    )
+    .expect_err("compiler-owned family tags cannot be inherited from any inbound");
+    assert_eq!(
+        canonical_collision.kind(),
+        EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision { index: 0 }
+    );
+}
+
+#[test]
+fn compiler_owned_tproxy_tag_references_require_the_exact_canonical_bundle() {
+    for template in [
+        br#"{"route":{"rules":[{"inbound":"tproxy-in-ipv4"}]}}"#.as_slice(),
+        br#"{"dns":{"rules":[{"inbound":["other","tproxy-in-ipv6"]}]}}"#.as_slice(),
+    ] {
+        let error = compile(template, PORT)
+            .expect_err("compiler-owned tags require their exact canonical listeners");
+        assert_eq!(
+            error.kind(),
+            EngineConfigCompileErrorKind::CanonicalTproxyInboundReferenceCollision
+        );
+    }
+}
+
+#[test]
+fn exact_single_family_bundles_reject_cross_family_canonical_references() {
+    for (families, configured_tag, configured_listen, foreign_tag) in [
+        (
+            AddressHostFamilySelection::Ipv4,
+            "tproxy-in-ipv4",
+            "0.0.0.0",
+            "tproxy-in-ipv6",
+        ),
+        (
+            AddressHostFamilySelection::Ipv6,
+            "tproxy-in-ipv6",
+            "::",
+            "tproxy-in-ipv4",
+        ),
+    ] {
+        for root in ["route", "dns"] {
+            let template = format!(
+                r#"{{
+                  "inbounds":[{{
+                    "type":"tproxy","tag":"{configured_tag}",
+                    "listen":"{configured_listen}","listen_port":{PORT}
+                  }}],
+                  "{root}":{{"rules":[{{"inbound":"{foreign_tag}"}}]}}
+                }}"#
+            );
+            let error = compile_for_families(template.as_bytes(), PORT, families)
+                .expect_err("a canonical reference must belong to the requested listener family");
+            assert_eq!(
+                error.kind(),
+                EngineConfigCompileErrorKind::CanonicalTproxyInboundReferenceCollision
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_route_and_dns_inbound_references_fail_closed() {
+    for template in [
+        br#"{"route":{"rules":[{"inbound":null}]}}"#.as_slice(),
+        br#"{"route":{"rules":[{"inbound":false}]}}"#.as_slice(),
+        br#"{"route":{"rules":[{"inbound":{"tag":"tproxy-in"}}]}}"#.as_slice(),
+        br#"{"dns":{"rules":[{"inbound":7}]}}"#.as_slice(),
+        br#"{"dns":{"rules":[{"inbound":["other",7]}]}}"#.as_slice(),
+        br#"{"dns":{"rules":[{"rules":[{"inbound":{}}]}]}}"#.as_slice(),
+    ] {
+        let error = compile(template, PORT)
+            .expect_err("route and DNS inbound references must have a closed string shape");
+        assert_eq!(
+            error.kind(),
+            EngineConfigCompileErrorKind::InvalidTproxyInboundReference
+        );
+    }
+}
+
+#[test]
+fn exact_dual_stack_bundle_recompiles_and_reconstructs_with_shared_options() {
+    let artifact = compile(
+        br#"{
+          "inbounds":[{
+            "type":"tproxy",
+            "tag":"legacy-transparent",
+            "network":"udp",
+            "sniff":true,
+            "sniff_override_destination":false
+          }],
+          "route":{"rules":[{"inbound":"legacy-transparent","action":"reject"}]},
+          "dns":{"rules":[{"inbound":["legacy-transparent","other"],"action":"reject"}]}
+        }"#,
+        PORT,
+    )
+    .expect("single inherited TPROXY inbound compiles into a canonical pair");
+
+    let recompiled = compile_for_families(
+        artifact.bytes(),
+        PORT,
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect("an exact canonical pair with shared inherited options recompiles");
+    assert_eq!(recompiled.bytes(), artifact.bytes());
+    assert_eq!(recompiled.content_sha256(), artifact.content_sha256());
+
+    let reconstructed = reconstruct_canonical_tproxy_engine_config(
+        artifact.bytes(),
+        NonZeroU16::new(PORT).unwrap(),
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect("an exact canonical pair with shared inherited options reconstructs");
+    assert_eq!(reconstructed.bytes(), artifact.bytes());
+    assert_eq!(
+        reconstructed.listener_families(),
+        artifact.listener_families()
+    );
+}
+
+#[test]
+fn partial_substituted_and_duplicate_canonical_tproxy_pairs_fail_closed() {
+    let cases: &[(&[u8], EngineConfigCompileErrorKind)] = &[
+        (
+            br#"{"inbounds":[{
+              "type":"tproxy","tag":"tproxy-in-ipv4",
+              "listen":"0.0.0.0","listen_port":1536
+            }]}"#,
+            EngineConfigCompileErrorKind::NonCanonical,
+        ),
+        (
+            br#"{"inbounds":[
+              {"type":"tproxy","tag":"tproxy-in-ipv4","listen":"0.0.0.0","listen_port":1536},
+              {"type":"tproxy","tag":"substituted-ipv6","listen":"::","listen_port":1536}
+            ]}"#,
+            EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision { index: 0 },
+        ),
+        (
+            br#"{"inbounds":[
+              {"type":"tproxy","tag":"tproxy-in-ipv4","listen":"0.0.0.0","listen_port":1536},
+              {"type":"tproxy","tag":"tproxy-in-ipv6","listen":"::","listen_port":1536},
+              {"type":"tproxy","tag":"tproxy-in-ipv6","listen":"::","listen_port":1536}
+            ]}"#,
+            EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision { index: 0 },
+        ),
+    ];
+
+    for (template, expected) in cases {
+        let error = compile_for_families(template, PORT, AddressHostFamilySelection::DualStack)
+            .expect_err("a non-exact canonical TPROXY pair must not be inherited");
+        assert_eq!(error.kind(), *expected);
+    }
+}
+
+#[test]
+fn separated_family_specific_tproxy_pair_is_not_a_canonical_bundle() {
+    let template = br#"{
+      "inbounds":[
+        {"type":"tproxy","tag":"tproxy-in-ipv4","listen":"0.0.0.0","listen_port":1536},
+        {"type":"mixed","tag":"other"},
+        {"type":"tproxy","tag":"tproxy-in-ipv6","listen":"::","listen_port":1536}
+      ]
+    }"#;
+    let error = compile_for_families(template, PORT, AddressHostFamilySelection::DualStack)
+        .expect_err("only an adjacent family-specific pair can be compiler output");
+    assert!(matches!(
+        error.kind(),
+        EngineConfigCompileErrorKind::CanonicalTproxyInboundTagCollision { .. }
+            | EngineConfigCompileErrorKind::NonCanonical
+    ));
+    reconstruct_canonical_tproxy_engine_config(
+        template,
+        NonZeroU16::new(PORT).unwrap(),
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect_err("a separated family-specific pair cannot reconstruct as canonical output");
+}
+
+#[test]
+fn untagged_source_tproxy_preserves_unowned_legacy_references() {
+    let artifact = compile(
+        br#"{
+          "inbounds":[
+            {"type":"tproxy"},
+            {"type":"mixed","tag":"tproxy-in"}
+          ],
+          "route":{"rules":[{"inbound":"tproxy-in"}]},
+          "dns":{"rules":[{"inbound":["other","tproxy-in"]}]}
+        }"#,
+        PORT,
+    )
+    .expect("an untagged source does not claim the legacy default tag");
+    let document: serde_json::Value = serde_json::from_slice(artifact.bytes()).unwrap();
+    assert_eq!(document["route"]["rules"][0]["inbound"], "tproxy-in");
+    assert_eq!(
+        document["dns"]["rules"][0]["inbound"],
+        serde_json::json!(["other", "tproxy-in"])
     );
 }
 
@@ -315,8 +632,13 @@ fn canary_route_precedes_and_preserves_user_policy() {
             "final":"USER-PROXY"
         }
     }"#;
-    let artifact = compile_with_canary_route(template, PORT, dual_stack_canary_route())
-        .expect("canonical canary route");
+    let artifact = compile_with_canary_route(
+        template,
+        PORT,
+        AddressHostFamilySelection::DualStack,
+        dual_stack_canary_route(),
+    )
+    .expect("canonical canary route");
     let document: serde_json::Value =
         serde_json::from_slice(artifact.bytes()).expect("compiled configuration JSON");
 
@@ -357,8 +679,16 @@ fn canary_route_is_deterministic_and_bound_to_config_identity() {
     let template = br#"{"inbounds":[],"route":{"rules":[]}}"#;
     let reordered = br#" { "route" : { "rules" : [ ] }, "inbounds" : [ ] } "#;
     let route = dual_stack_canary_route();
-    let first = compile_with_canary_route(template, PORT, route).unwrap();
-    let second = compile_with_canary_route(reordered, PORT, route).unwrap();
+    let first =
+        compile_with_canary_route(template, PORT, AddressHostFamilySelection::DualStack, route)
+            .unwrap();
+    let second = compile_with_canary_route(
+        reordered,
+        PORT,
+        AddressHostFamilySelection::DualStack,
+        route,
+    )
+    .unwrap();
 
     assert_eq!(first.bytes(), second.bytes());
     assert_eq!(first.template_digest(), second.template_digest());
@@ -372,29 +702,69 @@ fn canary_route_is_deterministic_and_bound_to_config_identity() {
         NonZeroU16::new(41002).unwrap(),
         NonZeroU16::new(41053).unwrap(),
     );
-    let changed = compile_with_canary_route(template, PORT, changed_route).unwrap();
+    let changed = compile_with_canary_route(
+        template,
+        PORT,
+        AddressHostFamilySelection::DualStack,
+        changed_route,
+    )
+    .unwrap();
     assert_eq!(first.template_digest(), changed.template_digest());
     assert_ne!(first.content_sha256(), changed.content_sha256());
     assert_ne!(first.digest(), changed.digest());
 }
 
 #[test]
+fn canary_route_families_must_exactly_match_listener_families() {
+    let cases = [
+        (
+            AddressHostFamilySelection::DualStack,
+            ipv4_only_canary_route(),
+        ),
+        (AddressHostFamilySelection::Ipv4, dual_stack_canary_route()),
+        (AddressHostFamilySelection::Ipv6, ipv4_only_canary_route()),
+        (AddressHostFamilySelection::Ipv6, dual_stack_canary_route()),
+    ];
+
+    for (families, route) in cases {
+        let error = compile_with_canary_route(br#"{}"#, PORT, families, route)
+            .expect_err("canary route and listener families must match exactly");
+        assert_eq!(
+            error.kind(),
+            EngineConfigCompileErrorKind::CanaryRouteListenerFamilyMismatch
+        );
+    }
+}
+
+#[test]
 fn ipv4_only_canary_route_recompiles_idempotently() {
     let route = ipv4_only_canary_route();
-    let artifact = compile_with_canary_route(br#"{"inbounds":[]}"#, PORT, route).unwrap();
+    let artifact = compile_with_canary_route(
+        br#"{"inbounds":[]}"#,
+        PORT,
+        AddressHostFamilySelection::Ipv4,
+        route,
+    )
+    .unwrap();
     let document: serde_json::Value = serde_json::from_slice(artifact.bytes()).unwrap();
     let rules = document["route"]["rules"].as_array().unwrap();
     assert_eq!(rules[0]["ip_cidr"], serde_json::json!(["192.0.2.2/32"]));
     assert_eq!(rules[1]["ip_cidr"], serde_json::json!(["192.0.2.2/32"]));
 
-    let recompiled = compile_with_canary_route(artifact.bytes(), PORT, route)
-        .expect("exact generated canary bundle recompiles");
+    let recompiled = compile_with_canary_route(
+        artifact.bytes(),
+        PORT,
+        AddressHostFamilySelection::Ipv4,
+        route,
+    )
+    .expect("exact generated canary bundle recompiles");
     assert_eq!(recompiled.bytes(), artifact.bytes());
     assert_eq!(recompiled.content_sha256(), artifact.content_sha256());
 
     let reconstructed = reconstruct_canonical_tproxy_engine_config(
         artifact.bytes(),
         NonZeroU16::new(PORT).unwrap(),
+        AddressHostFamilySelection::Ipv4,
     )
     .expect("exact routed artifact reconstructs canonically");
     assert_eq!(reconstructed.bytes(), artifact.bytes());
@@ -408,15 +778,26 @@ fn canary_route_rejects_reserved_tag_substitution_and_duplicates() {
             .as_slice(),
         br#"{"route":{"final":"flux-canary-direct-v1"}}"#.as_slice(),
     ] {
-        let error = compile_with_canary_route(template, PORT, dual_stack_canary_route())
-            .expect_err("reserved canary tag must remain compiler-owned");
+        let error = compile_with_canary_route(
+            template,
+            PORT,
+            AddressHostFamilySelection::DualStack,
+            dual_stack_canary_route(),
+        )
+        .expect_err("reserved canary tag must remain compiler-owned");
         assert_eq!(
             error.kind(),
             EngineConfigCompileErrorKind::CanaryRouteReservedTagCollision
         );
     }
 
-    let artifact = compile_with_canary_route(br#"{}"#, PORT, dual_stack_canary_route()).unwrap();
+    let artifact = compile_with_canary_route(
+        br#"{}"#,
+        PORT,
+        AddressHostFamilySelection::DualStack,
+        dual_stack_canary_route(),
+    )
+    .unwrap();
     let mut duplicate: serde_json::Value = serde_json::from_slice(artifact.bytes()).unwrap();
     let outbound = duplicate["outbounds"][0].clone();
     duplicate["outbounds"]
@@ -424,8 +805,13 @@ fn canary_route_rejects_reserved_tag_substitution_and_duplicates() {
         .unwrap()
         .push(outbound);
     let duplicate = serde_json::to_vec(&duplicate).unwrap();
-    let error = compile_with_canary_route(&duplicate, PORT, dual_stack_canary_route())
-        .expect_err("duplicate reserved outbound must fail");
+    let error = compile_with_canary_route(
+        &duplicate,
+        PORT,
+        AddressHostFamilySelection::DualStack,
+        dual_stack_canary_route(),
+    )
+    .expect_err("duplicate reserved outbound must fail");
     assert_eq!(
         error.kind(),
         EngineConfigCompileErrorKind::CanaryRouteReservedTagCollision
@@ -466,8 +852,13 @@ fn canary_route_rejects_malformed_route_and_outbound_containers() {
     ];
 
     for (template, expected) in cases {
-        let error = compile_with_canary_route(template, PORT, dual_stack_canary_route())
-            .expect_err("malformed canary route container must fail");
+        let error = compile_with_canary_route(
+            template,
+            PORT,
+            AddressHostFamilySelection::DualStack,
+            dual_stack_canary_route(),
+        )
+        .expect_err("malformed canary route container must fail");
         assert_eq!(error.kind(), *expected);
     }
 }
@@ -497,7 +888,7 @@ fn binds_exact_config_listener_and_launch_artifact_identities() {
     assert_eq!(binding.digest().as_bytes().len(), 32);
     assert_eq!(
         binding.digest().to_string(),
-        "ec673a244afebccf4d9cc6a7e8efc31211b845d37dc3168b09a69cff96468a78"
+        "e78104b0d1fd6eb757046c5d13eba5b3cbd2d2b3f41a9aac71a1467281a4f42b"
     );
 }
 
@@ -647,7 +1038,7 @@ fn collects_exact_binary_profile_and_pins_its_revision() {
     assert_eq!(profile.build().stderr(), "Tags: with_quic,with_wireguard\n");
     assert_eq!(
         profile.revision().to_string(),
-        "9c7e6eabd63dab8a8b052dfa2fa242685759578e1351419706ca5a14dbe558a3"
+        "d0ea1b00cfc7ea9686e29aabf4a89173e3b82b65b72b75920f602052e21ca985"
     );
     assert_eq!(profile.revision().as_bytes().len(), 32);
     assert_eq!(profile.supervised_delivery_report(), None);
@@ -674,7 +1065,7 @@ fn supervised_report_fixture_changes_and_pins_the_complete_profile_revision() {
     assert_ne!(declared.revision(), baseline_revision);
     assert_eq!(
         declared.revision().to_string(),
-        "dfb8a48db8fec360158bdf1aa66dd2fa529a536dfe0c8e70c32e11114efd1096"
+        "be0d00645e6c39cb53a0576f8ea16aa4129e2602e1484abe9c1410bd50444796"
     );
     assert_eq!(declared.artifacts(), binding.artifacts());
     assert_eq!(declared.validated_binding(), binding.digest());
@@ -1787,6 +2178,10 @@ fn rejects_invalid_or_multiple_inbound_shapes() {
             EngineConfigCompileErrorKind::InboundTypeNotString { index: 0 },
         ),
         (
+            br#"{"inbounds":[{"type":"tproxy","tag":7}]}"#,
+            EngineConfigCompileErrorKind::InboundTagNotString { index: 0 },
+        ),
+        (
             br#"{"inbounds":[{"type":"tproxy"},{"type":"tproxy"}]}"#,
             EngineConfigCompileErrorKind::MultipleTproxyInbounds,
         ),
@@ -1813,15 +2208,23 @@ fn removed_template_input_remains_bound_to_the_artifact_identity() {
 fn canonical_artifact_reconstruction_rejects_semantically_equal_noncanonical_bytes() {
     let artifact = compile(br#"{"inbounds":[]}"#, PORT).unwrap();
     let port = NonZeroU16::new(PORT).unwrap();
-    let reconstructed = reconstruct_canonical_tproxy_engine_config(artifact.bytes(), port)
-        .expect("exact canonical bytes reconstruct");
+    let reconstructed = reconstruct_canonical_tproxy_engine_config(
+        artifact.bytes(),
+        port,
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect("exact canonical bytes reconstruct");
     assert_eq!(reconstructed.bytes(), artifact.bytes());
     assert_eq!(reconstructed.content_sha256(), artifact.content_sha256());
     assert_eq!(reconstructed.listener_port(), artifact.listener_port());
     assert_ne!(reconstructed.template_digest(), artifact.template_digest());
 
-    let error = reconstruct_canonical_tproxy_engine_config(br#"{"inbounds":[]}"#, port)
-        .expect_err("raw template bytes are not a canonical output artifact");
+    let error = reconstruct_canonical_tproxy_engine_config(
+        br#"{"inbounds":[]}"#,
+        port,
+        AddressHostFamilySelection::DualStack,
+    )
+    .expect_err("raw template bytes are not a canonical output artifact");
     assert_eq!(error.kind(), EngineConfigCompileErrorKind::NonCanonical);
 }
 
@@ -1864,7 +2267,17 @@ struct HostAssemblyFixture {
 
 impl HostAssemblyFixture {
     fn new() -> Self {
-        let canonical = compile(PACKAGED_ENGINE_TEMPLATE, PORT).expect("canonical engine config");
+        let base_desired_state = PACKAGED_DESIRED_STATE
+            .replacen("/data/adb/flux/bin/sing-box", "/tmp/flux-test-sing-box", 1)
+            .replacen("startup_timeout_ms = 5000", "startup_timeout_ms = 1000", 1)
+            .replacen("stop_timeout_ms = 5000", "stop_timeout_ms = 1000", 1);
+        let base_config = FluxConfig::parse(&base_desired_state).expect("fixture Desired State");
+        let canonical = compile_for_families(
+            PACKAGED_ENGINE_TEMPLATE,
+            PORT,
+            base_config.capture().scope().families(),
+        )
+        .expect("canonical engine config");
         let mut engine = EngineSpecFixture::new_executable(
             canonical.bytes(),
             PROFILE_SCRIPT,
@@ -1876,10 +2289,7 @@ impl HostAssemblyFixture {
             .binary
             .to_str()
             .expect("UTF-8 fixture path");
-        let base_desired_state = PACKAGED_DESIRED_STATE
-            .replacen("/data/adb/flux/bin/sing-box", binary, 1)
-            .replacen("startup_timeout_ms = 5000", "startup_timeout_ms = 1000", 1)
-            .replacen("stop_timeout_ms = 5000", "stop_timeout_ms = 1000", 1);
+        let base_desired_state = base_desired_state.replacen("/tmp/flux-test-sing-box", binary, 1);
         let desired_state = compile_fixture_desired_state(&base_desired_state);
         let probe_binding =
             bind_engine_config_to_spec(desired_state.engine_config().clone(), &engine.spec)
@@ -2029,16 +2439,30 @@ fn compile(
     compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
         template,
         NonZeroU16::new(port).unwrap(),
+        AddressHostFamilySelection::DualStack,
+    ))
+}
+
+fn compile_for_families(
+    template: &[u8],
+    port: u16,
+    families: AddressHostFamilySelection,
+) -> Result<super::EngineConfigArtifact, super::EngineConfigCompileError> {
+    compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+        template,
+        NonZeroU16::new(port).unwrap(),
+        families,
     ))
 }
 
 fn compile_with_canary_route(
     template: &[u8],
     port: u16,
+    families: AddressHostFamilySelection,
     canary_route: TproxyCanaryEngineRoute,
 ) -> Result<super::EngineConfigArtifact, super::EngineConfigCompileError> {
     compile_tproxy_engine_config(
-        TproxyEngineConfigRequest::new(template, NonZeroU16::new(port).unwrap())
+        TproxyEngineConfigRequest::new(template, NonZeroU16::new(port).unwrap(), families)
             .with_canary_route(canary_route),
     )
 }

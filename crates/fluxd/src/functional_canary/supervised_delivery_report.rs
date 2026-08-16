@@ -1076,7 +1076,7 @@ pub(in crate::functional_canary) mod tests {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use flux_core::GenerationId;
+    use flux_core::{AddressHostFamilySelection, GenerationId};
     #[cfg(target_os = "linux")]
     use flux_platform::ProcessHandleErrorKind;
     #[cfg(target_os = "linux")]
@@ -1166,6 +1166,10 @@ esac
             let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
                 br#"{"inbounds":[]}"#,
                 listener_port,
+                match families {
+                    CanaryAddressFamilies::Ipv4Only => AddressHostFamilySelection::Ipv4,
+                    CanaryAddressFamilies::Ipv4AndIpv6 => AddressHostFamilySelection::DualStack,
+                },
             ))
             .expect("compile parser engine config");
             let directory = tempfile::tempdir().expect("parser engine fixture");
@@ -1464,9 +1468,12 @@ esac
             )
             .expect("reserved launch-control listener port is nonzero");
             drop(listener);
-            let artifact =
-                compile_tproxy_engine_config(TproxyEngineConfigRequest::new(template, port))
-                    .expect("compile launch-control engine config");
+            let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+                template,
+                port,
+                AddressHostFamilySelection::DualStack,
+            ))
+            .expect("compile launch-control engine config");
             let config = directory.path().join("config.json");
             fs::write(&config, artifact.bytes()).expect("write launch-control engine config");
             let spec = EngineSpec::new(

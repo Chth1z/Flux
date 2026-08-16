@@ -40,8 +40,87 @@ index 0000000000000000000000000000000000000000..4a320cf1656aea8090bd7b78e608ed26
 +	}
 +	return fluxreport.WrapTProxyTCP(l.tcpListener, connection)
 +}
+diff --git a/common/listener/listener.go b/common/listener/listener.go
+index cc27a62e18726e870c859422d58bef81bf692166..7181a5189c11db9e44ff682f723b71df0dcc49c8 100644
+--- a/common/listener/listener.go
++++ b/common/listener/listener.go
+@@ -80 +80,8 @@ func New(
++func listenNetwork(network string, address netip.Addr, tproxy bool) string {
++	if tproxy && address == netip.IPv6Unspecified() {
++		return network + "6"
++	}
++	return M.NetworkFromNetAddr(network, address)
++}
++
+ func (l *Listener) Start() error {
+diff --git a/common/listener/listener_tcp.go b/common/listener/listener_tcp.go
+index 54d84a6b7b27a89048cc61e5561e8d6f140d9fd4..0efa4754cfacc4faf440c0eb73c6d215028d3cee 100644
+--- a/common/listener/listener_tcp.go
++++ b/common/listener/listener_tcp.go
+@@ -72,12 +72,12 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
+-			return tfoConfig.Listen(l.ctx, M.NetworkFromNetAddr(N.NetworkTCP, bindAddr.Addr), bindAddr.String())
+-		} else {
+-			return listenConfig.Listen(l.ctx, M.NetworkFromNetAddr(N.NetworkTCP, bindAddr.Addr), bindAddr.String())
+-		}
+-	})
+-	if err != nil {
+-		return nil, err
+-	}
+-	l.logger.Info("tcp server started at ", tcpListener.Addr())
+-	l.tcpListener = tcpListener
+-	return tcpListener, err
++			return tfoConfig.Listen(l.ctx, listenNetwork(N.NetworkTCP, bindAddr.Addr, l.tproxy), bindAddr.String())
++		} else {
++			return listenConfig.Listen(l.ctx, listenNetwork(N.NetworkTCP, bindAddr.Addr, l.tproxy), bindAddr.String())
++		}
++	})
++	if err != nil {
++		return nil, err
++	}
++	l.logger.Info("tcp server started at ", tcpListener.Addr())
++	l.tcpListener = tcpListener
++	return tcpListener, err
+ }
+diff --git a/common/listener/listener_test.go b/common/listener/listener_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e7a58c5fea735979adc2c8b750519bce700f226
+--- /dev/null
++++ b/common/listener/listener_test.go
+@@ -0,0 +1,32 @@
++package listener
++
++import (
++	"net/netip"
++	"testing"
++)
++
++func TestListenNetworkScopesIPv6WildcardToTProxy(t *testing.T) {
++	tests := []struct {
++		name     string
++		network  string
++		address  netip.Addr
++		tproxy   bool
++		expected string
++	}{
++		{"ordinary IPv4 wildcard", "tcp", netip.IPv4Unspecified(), false, "tcp4"},
++		{"ordinary IPv6 wildcard", "tcp", netip.IPv6Unspecified(), false, "tcp"},
++		{"TPROXY IPv4 wildcard", "tcp", netip.IPv4Unspecified(), true, "tcp4"},
++		{"TPROXY IPv6 wildcard", "tcp", netip.IPv6Unspecified(), true, "tcp6"},
++		{"TPROXY IPv6 address", "tcp", netip.IPv6Loopback(), true, "tcp"},
++		{"ordinary IPv6 UDP wildcard", "udp", netip.IPv6Unspecified(), false, "udp"},
++		{"TPROXY IPv6 UDP wildcard", "udp", netip.IPv6Unspecified(), true, "udp6"},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			actual := listenNetwork(test.network, test.address, test.tproxy)
++			if actual != test.expected {
++				t.Fatalf("listenNetwork(%q, %s, %t) = %q, want %q", test.network, test.address, test.tproxy, actual, test.expected)
++			}
++		})
++	}
++}
 diff --git a/common/listener/listener_udp.go b/common/listener/listener_udp.go
-index e689c8bb67b84b3fc7901f99840d5194237f45e4..c5e7c9a838f8939c9a481d5aa5321f5140069d7d 100644
+index e689c8bb67b84b3fc7901f99840d5194237f45e4..62d09f996ea8c693066611749fda4a5cce011558 100644
 --- a/common/listener/listener_udp.go
 +++ b/common/listener/listener_udp.go
 @@ -10,6 +10,7 @@ import (
@@ -52,6 +131,26 @@ index e689c8bb67b84b3fc7901f99840d5194237f45e4..c5e7c9a838f8939c9a481d5aa5321f51
  	"github.com/sagernet/sing/common/buf"
  	"github.com/sagernet/sing/common/control"
  	E "github.com/sagernet/sing/common/exceptions"
+@@ -50,10 +51,10 @@ func (l *Listener) ListenUDP() (net.PacketConn, error) {
+-		return listenConfig.ListenPacket(l.ctx, M.NetworkFromNetAddr(N.NetworkUDP, bindAddr.Addr), bindAddr.String())
+-	})
+-	if err != nil {
+-		return nil, err
+-	}
+-	l.udpConn = udpConn.(*net.UDPConn)
+-	l.udpAddr = bindAddr
+-	l.logger.Info("udp server started at ", udpConn.LocalAddr())
+-	return udpConn, err
++		return listenConfig.ListenPacket(l.ctx, listenNetwork(N.NetworkUDP, bindAddr.Addr, l.tproxy), bindAddr.String())
++	})
++	if err != nil {
++		return nil, err
++	}
++	l.udpConn = udpConn.(*net.UDPConn)
++	l.udpAddr = bindAddr
++	l.logger.Info("udp server started at ", udpConn.LocalAddr())
++	return udpConn, err
+ }
 @@ -113,7 +114,7 @@ func (l *Listener) loopUDPIn() {
  			} else {
  				buffer.Reset()

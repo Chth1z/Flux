@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-use flux_core::GenerationId;
+use flux_core::{AddressHostFamilySelection, GenerationId};
 use flux_platform::internal::{
     PinnedSingBoxLaunch, SingBoxChild, SingBoxProcessAdapter, TerminationOutcome,
 };
@@ -41,8 +41,8 @@ const PRODUCER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SELECTOR_PACKETS: u64 = 64;
 const TCP_ECHO_PAYLOAD_BYTES: usize = FUNCTIONAL_CANARY_NONCE_BYTES;
 const EXPECTED_SUPERVISED_CONFIG_SHA256: [u8; 32] = [
-    0xea, 0x16, 0xae, 0xf2, 0x57, 0x78, 0xcc, 0x74, 0xae, 0x44, 0xba, 0xa3, 0x04, 0x63, 0xca, 0xb5,
-    0xb2, 0xef, 0xb9, 0x8c, 0xbc, 0x2c, 0x6c, 0x7c, 0x90, 0x5a, 0xa7, 0x01, 0x32, 0x18, 0xf2, 0x83,
+    0x4a, 0xfc, 0x4a, 0x77, 0x8e, 0xc9, 0x70, 0x69, 0x4e, 0x48, 0xa9, 0xfc, 0xc8, 0xb1, 0x69, 0xbf,
+    0x40, 0xfd, 0x2b, 0x18, 0x0a, 0xaf, 0x2b, 0x10, 0x85, 0x9e, 0x1d, 0xe3, 0xbb, 0xdb, 0x30, 0xc0,
 ];
 
 pub(super) fn config(nonce: String) -> Result<LocalOutputConfig, String> {
@@ -208,9 +208,12 @@ impl PreparedProducer {
         let sinks = PreparedSinks::bind()?;
         let template = supervised_config_template(sinks.port)?;
         let listener_port = NonZeroU16::new(TPROXY_PORT).expect("TPROXY port is nonzero");
-        let artifact =
-            compile_tproxy_engine_config(TproxyEngineConfigRequest::new(&template, listener_port))
-                .map_err(|error| format!("compile supervised-producer config: {error}"))?;
+        let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+            &template,
+            listener_port,
+            AddressHostFamilySelection::DualStack,
+        ))
+        .map_err(|error| format!("compile supervised-producer config: {error}"))?;
         if artifact.content_sha256() != &EXPECTED_SUPERVISED_CONFIG_SHA256 {
             return Err("supervised-producer canonical config digest drifted".to_owned());
         }
@@ -1613,9 +1616,12 @@ mod tests {
         let sink_port = NonZeroU16::new(SINK_PORT).expect("fixed sink port is nonzero");
         let template = supervised_config_template(sink_port).expect("encode config template");
         let listener_port = NonZeroU16::new(TPROXY_PORT).expect("TPROXY port is nonzero");
-        let artifact =
-            compile_tproxy_engine_config(TproxyEngineConfigRequest::new(&template, listener_port))
-                .expect("compile canonical supervised config");
+        let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+            &template,
+            listener_port,
+            AddressHostFamilySelection::DualStack,
+        ))
+        .expect("compile canonical supervised config");
         assert_eq!(
             artifact.content_sha256(),
             &EXPECTED_SUPERVISED_CONFIG_SHA256

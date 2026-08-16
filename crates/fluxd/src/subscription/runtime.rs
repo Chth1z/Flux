@@ -217,7 +217,11 @@ impl ValidatedSubscriptionEngineConfig {
         &self,
         listener_port: std::num::NonZeroU16,
     ) -> Result<EngineConfigArtifact, EngineConfigCompileError> {
-        let artifact = reconstruct_canonical_tproxy_engine_config(&self.bytes, listener_port)?;
+        let artifact = reconstruct_canonical_tproxy_engine_config(
+            &self.bytes,
+            listener_port,
+            self.desired_state.capture().scope().families(),
+        )?;
         if artifact.content_sha256() != &self.content_sha256 {
             return Err(EngineConfigCompileError::content_digest_mismatch());
         }
@@ -487,6 +491,7 @@ impl<A: FetchAdapter + Send + 'static> ProductionRefreshOperation<A> {
                 &subscription_url,
                 &self.store.asset_root(),
                 config.listener().port(),
+                config.capture().scope().families(),
                 SubscriptionRefreshLimits::new(
                     config.subscription().download_timeout(),
                     config.subscription().max_download_bytes(),

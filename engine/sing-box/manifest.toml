@@ -13,10 +13,10 @@ upstream_ldflags_sha256 = "b2380b51f636edb80147897e7b9ccc426b7f5ced47e7c641bbac5
 
 [[patches]]
 path = "patches/0001-flux-supervised-report-producer.patch"
-sha256 = "56feb792b35c50d8bdae8ed107b85703e53ab63f3ea50185a688d1edb97dcda8"
+sha256 = "ea7c674e1f0ec5914645dfc1207db49c2ce6cfdf869b8fb9a32717b7647ff80a"
 
 [patched_source]
-tree = "f3c1d50d66831bbdda05377f4d5eb5d57b0db481"
+tree = "6dd4451de3bc4c10a51e80e78276422d7534cde8"
 
 [toolchain]
 version = "go1.24.7"
@@ -45,14 +45,14 @@ target = "linux-amd64"
 target_os = "linux"
 target_arch = "amd64"
 target_variant = "v1"
-sha256 = "7ea1e7e4ee63ca8bbe6f2f0e6d1a7ec1fa241605d7322af778a7f0a26770359b"
+sha256 = "d8734982417be48d03b75e876fad6e2e82708661907ea0981803bcf3eaae20ff"
 bytes = 57368724
 
 [[artifacts]]
 target = "android-arm64"
 target_os = "android"
 target_arch = "arm64"
-sha256 = "5f455701bff0da57f939d367a4a547683a145cca4e58ea636f794ee24d8563bf"
+sha256 = "56cd66dc18adfc64a70f1b5bf44601e3770d6f8d03258d4354f1871a0388cf90"
 bytes = 59244861
 
 [license]

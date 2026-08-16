@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flux_core::AddressHostFamilySelection;
+
 use super::*;
 use crate::generation_engine_config::{
     EngineConfigCompileErrorKind, TproxyEngineConfigRequest, compile_tproxy_engine_config,
@@ -114,10 +116,15 @@ fn validated_config(
     node_count: u32,
 ) -> ValidatedSubscriptionEngineConfig {
     let port = NonZeroU16::new(9_898).expect("nonzero test listener");
-    let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(b"{}", port))
-        .expect("canonical test engine configuration");
+    let desired_state = test_desired_state();
+    let artifact = compile_tproxy_engine_config(TproxyEngineConfigRequest::new(
+        b"{}",
+        port,
+        desired_state.capture().scope().families(),
+    ))
+    .expect("canonical test engine configuration");
     ValidatedSubscriptionEngineConfig {
-        desired_state: Arc::new(test_desired_state()),
+        desired_state: Arc::new(desired_state),
         bytes: Arc::from(artifact.bytes()),
         content_sha256: *artifact.content_sha256(),
         snapshot_digest,
@@ -127,8 +134,19 @@ fn validated_config(
 }
 
 fn test_desired_state() -> FluxConfig {
-    FluxConfig::parse(include_str!("../../../../../conf/flux.toml"))
-        .expect("packaged test Desired State")
+    test_desired_state_for_families(AddressHostFamilySelection::Ipv4)
+}
+
+fn test_desired_state_for_families(families: AddressHostFamilySelection) -> FluxConfig {
+    let (ipv4, ipv6) = match families {
+        AddressHostFamilySelection::Ipv4 => (true, false),
+        AddressHostFamilySelection::Ipv6 => (false, true),
+        AddressHostFamilySelection::DualStack => (true, true),
+    };
+    let source = include_str!("../../../../../conf/flux.toml")
+        .replace("ipv4 = true", &format!("ipv4 = {ipv4}"))
+        .replace("ipv6 = false", &format!("ipv6 = {ipv6}"));
+    FluxConfig::parse(&source).expect("packaged test Desired State")
 }
 
 #[test]
@@ -309,6 +327,35 @@ fn canonical_reconstruction_reports_an_explicit_content_digest_mismatch() {
         error.kind(),
         EngineConfigCompileErrorKind::ContentDigestMismatch
     );
+}
+
+#[test]
+fn canonical_reconstruction_uses_the_bound_desired_state_address_families() {
+    let port = NonZeroU16::new(9_898).expect("nonzero test listener");
+    for (index, families) in [
+        AddressHostFamilySelection::Ipv4,
+        AddressHostFamilySelection::Ipv6,
+        AddressHostFamilySelection::DualStack,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let desired_state = test_desired_state_for_families(families);
+        let artifact =
+            compile_tproxy_engine_config(TproxyEngineConfigRequest::new(b"{}", port, families))
+                .expect("canonical family-specific engine configuration");
+        let config = ValidatedSubscriptionEngineConfig::for_test(
+            desired_state,
+            artifact,
+            [u8::try_from(index + 1).unwrap(); 32],
+            1,
+        );
+
+        let reconstructed = config
+            .reconstruct_artifact(port)
+            .expect("reconstruct with the bound address families");
+        assert_eq!(reconstructed.listener_families(), families);
+    }
 }
 
 #[cfg(target_os = "linux")]

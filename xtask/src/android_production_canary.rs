@@ -1094,9 +1094,9 @@ fn remote_artifact_verification(artifacts: &QualificationArtifacts) -> String {
 }
 
 fn exact_flux_absence_function() -> &'static str {
-    "exact_flux_absence() {\n\
+    "exact_flux_absence_without_target_archive() {\n\
        [ ! -e \"$ROOT/run/canary-facility.owner\" ] && [ ! -L \"$ROOT/run/canary-facility.owner\" ] || return 1\n\
-       for RECORD in native_xtables.journal native_xtables.lease native_xtables.attempt native_xtables.targets; do\n\
+       for RECORD in native_xtables.journal native_xtables.lease native_xtables.attempt; do\n\
          [ ! -e \"$ROOT/run/$RECORD\" ] && [ ! -L \"$ROOT/run/$RECORD\" ] || return 1\n\
        done\n\
        ! /system/bin/ip link show dev fxq11d0 >/dev/null 2>&1 || return 1\n\
@@ -1109,6 +1109,10 @@ fn exact_flux_absence_function() -> &'static str {
        [ -z \"$(/system/bin/ip -6 route show table 20254 2>/dev/null)\" ] || return 1\n\
        ! /system/bin/iptables-save | /system/bin/grep -F 'FLX' >/dev/null || return 1\n\
        ! /system/bin/ip6tables-save | /system/bin/grep -F 'FLX' >/dev/null || return 1\n\
+     }\n\
+     exact_flux_absence() {\n\
+       exact_flux_absence_without_target_archive || return 1\n\
+       [ ! -e \"$ROOT/run/native_xtables.targets\" ] && [ ! -L \"$ROOT/run/native_xtables.targets\" ]\n\
      }\n"
 }
 
@@ -1198,6 +1202,19 @@ fn qualification_cleanup_script(
            while /system/bin/kill -0 \"$RECOVERY_PID\" 2>/dev/null && [ \"$N\" -lt 10 ]; do /system/bin/sleep 1; N=$((N + 1)); done\n\
            /system/bin/kill -KILL \"$RECOVERY_PID\" 2>/dev/null || true\n\
            wait \"$RECOVERY_PID\" 2>/dev/null || true\n\
+         fi\n\
+         if ! exact_flux_absence; then\n\
+           exact_flux_absence_without_target_archive\n\
+           TARGET_ARCHIVE=\"$ROOT/run/native_xtables.targets\"\n\
+           [ -f \"$TARGET_ARCHIVE\" ] && [ ! -L \"$TARGET_ARCHIVE\" ]\n\
+           [ \"$(/system/bin/stat -c '%a:%u:%g' \"$TARGET_ARCHIVE\")\" = '600:0:0' ]\n\
+           OFFLINE_RESULT=$(FLUX_ROOT=\"$ROOT\" FLUXD_SOCKET=\"$SOCKET\" FLUXD_LEASE_PATH=\"$ROOT/run/fluxd.lease\" FLUXD_CONFIG_PATH=\"$RECOVERY_CONFIG\" FLUXD_INTENT_PATH=\"$ROOT/state/administrative-intent.json\" FLUX_DISABLE_PATH=\"$ROOT/disable\" \"$FLUXD\" cleanup --offline)\n\
+           [ \"$OFFLINE_RESULT\" = 'cleanup complete' ]\n\
+           probe_process_absent\n\
+           exact_flux_absence_without_target_archive\n\
+           [ -f \"$TARGET_ARCHIVE\" ] && [ ! -L \"$TARGET_ARCHIVE\" ]\n\
+           [ \"$(/system/bin/stat -c '%a:%u:%g' \"$TARGET_ARCHIVE\")\" = '600:0:0' ]\n\
+           /system/bin/rm \"$ROOT/run/native_xtables.targets\"\n\
          fi\n\
          probe_process_absent\n\
          exact_flux_absence\n\
@@ -1440,6 +1457,23 @@ mod tests {
         ] {
             assert!(script.contains(required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn cleanup_retires_a_targets_only_clean_settlement_through_offline_recovery() {
+        let remote = test_remote_directory();
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let artifacts = test_artifacts();
+        let cleanup = qualification_cleanup_script(&remote, &device, &artifacts);
+
+        assert!(cleanup.contains("native_xtables.targets"));
+        assert!(cleanup.contains("\"$FLUXD\" cleanup --offline"));
+        assert!(cleanup.contains("[ \"$OFFLINE_RESULT\" = 'cleanup complete' ]"));
+        assert!(cleanup.contains("/system/bin/rm \"$ROOT/run/native_xtables.targets\""));
+        assert!(
+            cleanup.find("\"$FLUXD\" cleanup --offline")
+                < cleanup.find("/system/bin/rm \"$ROOT/run/native_xtables.targets\"")
+        );
     }
 
     #[test]

@@ -47,10 +47,12 @@ use crate::native_canary_facility::{
     NativeCanaryRuntimeAuthorities, create_native_boot_canary_facility,
     recover_native_boot_canary_facility,
 };
+#[cfg(any(test, flux_android_qualification))]
+use crate::native_generation_source::SystemAndroidGenerationPlanningFailureClass;
 use crate::native_generation_source::{
     AssembledNativeGenerationSource, NativeGenerationPlanningSource, NativeGenerationSourcePaths,
     NativeGenerationTargetAdmission, PlatformNativeGenerationTargetAdmission,
-    SystemAndroidGenerationPlanningSource,
+    SystemAndroidGenerationPlanningError, SystemAndroidGenerationPlanningSource,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use crate::native_generation_source::{
@@ -599,7 +601,10 @@ impl NativeDaemonPlatform for AndroidNativeDaemonPlatform {
         let initial_planning = planning
             .plan_initial(&admitted.config, &admitted.initial_inventory)
             .map_err(|source| {
-                DaemonError::native("mint initial Android planning authority", source)
+                DaemonError::native(
+                    "mint initial Android planning authority",
+                    AndroidPlanningStartupError::new(source),
+                )
             })?;
         let (mark_authority, placement) =
             initial_planning
@@ -1298,6 +1303,44 @@ pub enum DaemonError {
     Socket(ControlSocketError),
 }
 
+/// Keeps the concrete planning error chained for trusted local diagnostics while exposing only
+/// one closed, identity-free class to the qualification runner's existing reducer.
+#[derive(Debug)]
+struct AndroidPlanningStartupError {
+    #[cfg(any(test, flux_android_qualification))]
+    class: SystemAndroidGenerationPlanningFailureClass,
+    source: SystemAndroidGenerationPlanningError,
+}
+
+impl AndroidPlanningStartupError {
+    fn new(source: SystemAndroidGenerationPlanningError) -> Self {
+        Self {
+            #[cfg(any(test, flux_android_qualification))]
+            class: source.failure_class(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for AndroidPlanningStartupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(any(test, flux_android_qualification))]
+        {
+            write!(formatter, "[qualification={}] {}", self.class, self.source)
+        }
+        #[cfg(not(any(test, flux_android_qualification)))]
+        {
+            self.source.fmt(formatter)
+        }
+    }
+}
+
+impl Error for AndroidPlanningStartupError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl DaemonError {
     fn native(operation: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
         Self::NativeStartup {
@@ -1471,6 +1514,17 @@ mod tests {
         assert_eq!(
             QUALIFICATION_PEER_NETNS_REPORT_FD_ENV,
             "FLUX_Q11_NETNS_REPORT_FD"
+        );
+    }
+
+    #[test]
+    fn android_planning_startup_error_prefixes_one_closed_qualification_class() {
+        let source = SystemAndroidGenerationPlanningError::ForwardedIngressUnsupported;
+        let error = AndroidPlanningStartupError::new(source);
+
+        assert_eq!(
+            error.to_string(),
+            "[qualification=forwarded-ingress-unsupported] native Android production planning does not yet admit forwarded-ingress capture"
         );
     }
 

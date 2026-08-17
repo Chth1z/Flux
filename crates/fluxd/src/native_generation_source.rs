@@ -6,22 +6,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AddressHostFamilySelection, AndroidNetdSourceProfile, AndroidTproxyRoutingShape,
-    AndroidTproxyTopologyScopeRequest, AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain,
-    FluxConfig, FwmarkCandidate, GenerationId, NetworkAddressFamily, NetworkInventory, Reason,
-    ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection, ReviewedCanaryRoleCredentials,
-    RpdbFamilyPlacement, RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
+    AddressHostFamilySelection, AndroidMarkPlanningAuthorizationError, AndroidNetdSourceProfile,
+    AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
+    AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain, CompleteFwmarkCensusError, FluxConfig,
+    FwmarkCandidate, FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane, GenerationId,
+    NetworkAddressFamily, NetworkInventory, Reason, ReviewedCanaryFacilityPolicy,
+    ReviewedCanaryFacilitySelection, ReviewedCanaryRoleCredentials, RpdbFamilyPlacement,
+    RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
     classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
     plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_core::{CapabilityProfile, NetworkNamespaceIdentity};
 use flux_platform::{
+    AndroidFwmarkCensusCollectionStage, AndroidFwmarkCensusCoordinatorError,
     AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
-    AndroidFwmarkCensusCoordinatorRequest, NativeXtablesCaptureAdmission,
-    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
-    SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
-    coordinate_android_fwmark_census_for_inventory,
+    AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusExternalPhase,
+    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget,
+    NetworkInventorySource, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,
+    SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
+    SystemAndroidFwmarkCensusSourceErrorKind, coordinate_android_fwmark_census_for_inventory,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{
@@ -296,7 +300,9 @@ impl SystemAndroidGenerationPlanningSource {
             Arc::clone(&inventory),
         )
         .map_err(|source| {
-            SystemAndroidGenerationPlanningError::Census(source.to_string().into_boxed_str())
+            SystemAndroidGenerationPlanningError::Census(
+                SystemAndroidGenerationPlanningCensusError::new(source),
+            )
         })?;
         let evidence = match outcome {
             AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(evidence) => *evidence,
@@ -332,7 +338,12 @@ impl SystemAndroidGenerationPlanningSource {
                 *selection,
             )
             .map_err(|source| {
-                SystemAndroidGenerationPlanningError::Placement(source.to_string().into_boxed_str())
+                SystemAndroidGenerationPlanningError::Placement(
+                    SystemAndroidGenerationPlanningPlacementError::new(
+                        SystemAndroidGenerationPlanningPlacementFailureClass::ReviewedClassification,
+                        source,
+                    ),
+                )
             })?,
             None => classify_android_rpdb(&inventory, netd_source_profile),
         };
@@ -347,14 +358,20 @@ impl SystemAndroidGenerationPlanningSource {
                 )
                 .map_err(|source| {
                     SystemAndroidGenerationPlanningError::Placement(
-                        source.to_string().into_boxed_str(),
+                        SystemAndroidGenerationPlanningPlacementError::new(
+                            SystemAndroidGenerationPlanningPlacementFailureClass::ReviewedPlanning,
+                            source,
+                        ),
                     )
                 })?
             }
             None => plan_android_rpdb_placement(&inventory, &classification, placement_request)
                 .map_err(|source| {
                     SystemAndroidGenerationPlanningError::Placement(
-                        source.to_string().into_boxed_str(),
+                        SystemAndroidGenerationPlanningPlacementError::new(
+                            SystemAndroidGenerationPlanningPlacementFailureClass::GenericPlanning,
+                            source,
+                        ),
                     )
                 })?,
         };
@@ -381,6 +398,459 @@ impl NativeGenerationPlanningSource for SystemAndroidGenerationPlanningSource {
     }
 }
 
+#[cfg(any(test, flux_android_qualification))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemAndroidGenerationPlanningFailureClass {
+    LocalOutputRequired,
+    ForwardedIngressUnsupported,
+    InitialAlreadyAccepted,
+    InitialDesiredStateChanged,
+    UnexpectedDiagnostic,
+    CapturePathEvidence,
+    Census(SystemAndroidGenerationPlanningCensusFailureClass),
+    Placement(SystemAndroidGenerationPlanningPlacementFailureClass),
+}
+
+#[cfg(any(test, flux_android_qualification))]
+impl fmt::Display for SystemAndroidGenerationPlanningFailureClass {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::LocalOutputRequired => formatter.write_str("local-output-required"),
+            Self::ForwardedIngressUnsupported => {
+                formatter.write_str("forwarded-ingress-unsupported")
+            }
+            Self::InitialAlreadyAccepted => formatter.write_str("initial-already-accepted"),
+            Self::InitialDesiredStateChanged => {
+                formatter.write_str("initial-desired-state-changed")
+            }
+            Self::UnexpectedDiagnostic => formatter.write_str("unexpected-diagnostic"),
+            Self::CapturePathEvidence => formatter.write_str("capture-path-evidence"),
+            Self::Census(class) => class.fmt_token(formatter),
+            Self::Placement(class) => class.fmt_token(formatter),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemAndroidGenerationPlanningCensusFailureClass {
+    Collection {
+        stage: AndroidFwmarkCensusCollectionStage,
+        source: SystemAndroidFwmarkCensusSourceErrorKind,
+    },
+    CapabilityDeviceIdentityUnavailable,
+    CapabilityDrift,
+    ExternalSnapshotContextMismatch(AndroidFwmarkCensusExternalPhase),
+    ExternalSnapshotDrift,
+    PlatformProfile,
+    SelectedNetdSourceProfileMismatch,
+    ReviewedCanaryFacilityPolicyMismatch,
+    ReviewedCanaryRpdb,
+    Topology,
+    Rpdb,
+    Assembly,
+    CompleteCensus(SystemAndroidGenerationPlanningCompleteCensusFailureClass),
+    Authorization(SystemAndroidGenerationPlanningAuthorizationFailureClass),
+}
+
+impl SystemAndroidGenerationPlanningCensusFailureClass {
+    fn from_error(
+        error: &AndroidFwmarkCensusCoordinatorError<SystemAndroidFwmarkCensusSourceError>,
+    ) -> Self {
+        match error {
+            AndroidFwmarkCensusCoordinatorError::Collection { stage, source } => Self::Collection {
+                stage: *stage,
+                source: source.kind(),
+            },
+            AndroidFwmarkCensusCoordinatorError::CapabilityDeviceIdentityUnavailable { .. } => {
+                Self::CapabilityDeviceIdentityUnavailable
+            }
+            AndroidFwmarkCensusCoordinatorError::CapabilityDrift { .. } => Self::CapabilityDrift,
+            AndroidFwmarkCensusCoordinatorError::ExternalSnapshotContextMismatch {
+                phase, ..
+            } => Self::ExternalSnapshotContextMismatch(*phase),
+            AndroidFwmarkCensusCoordinatorError::ExternalSnapshotDrift { .. } => {
+                Self::ExternalSnapshotDrift
+            }
+            AndroidFwmarkCensusCoordinatorError::PlatformProfile(_) => Self::PlatformProfile,
+            AndroidFwmarkCensusCoordinatorError::SelectedNetdSourceProfileMismatch { .. } => {
+                Self::SelectedNetdSourceProfileMismatch
+            }
+            AndroidFwmarkCensusCoordinatorError::ReviewedCanaryFacilityPolicyMismatch => {
+                Self::ReviewedCanaryFacilityPolicyMismatch
+            }
+            AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(_) => Self::ReviewedCanaryRpdb,
+            AndroidFwmarkCensusCoordinatorError::Topology(_) => Self::Topology,
+            AndroidFwmarkCensusCoordinatorError::Rpdb(_) => Self::Rpdb,
+            AndroidFwmarkCensusCoordinatorError::Assembly(_) => Self::Assembly,
+            AndroidFwmarkCensusCoordinatorError::CompleteCensus(error) => Self::CompleteCensus(
+                SystemAndroidGenerationPlanningCompleteCensusFailureClass::from_error(error),
+            ),
+            AndroidFwmarkCensusCoordinatorError::Authorization(error) => Self::Authorization(
+                SystemAndroidGenerationPlanningAuthorizationFailureClass::from_error(error),
+            ),
+        }
+    }
+
+    #[cfg(any(test, flux_android_qualification))]
+    fn fmt_token(self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Collection { stage, source } => write!(
+                formatter,
+                "census/collection/{}/{}",
+                stage.as_str(),
+                system_android_census_source_error_kind_token(source)
+            ),
+            Self::CapabilityDeviceIdentityUnavailable => {
+                formatter.write_str("census/capability-device-identity-unavailable")
+            }
+            Self::CapabilityDrift => formatter.write_str("census/capability-drift"),
+            Self::ExternalSnapshotContextMismatch(phase) => write!(
+                formatter,
+                "census/external-snapshot-context-mismatch/{}",
+                android_fwmark_external_phase_token(phase)
+            ),
+            Self::ExternalSnapshotDrift => formatter.write_str("census/external-snapshot-drift"),
+            Self::PlatformProfile => formatter.write_str("census/platform-profile"),
+            Self::SelectedNetdSourceProfileMismatch => {
+                formatter.write_str("census/selected-netd-source-profile-mismatch")
+            }
+            Self::ReviewedCanaryFacilityPolicyMismatch => {
+                formatter.write_str("census/reviewed-canary-facility-policy-mismatch")
+            }
+            Self::ReviewedCanaryRpdb => formatter.write_str("census/reviewed-canary-rpdb"),
+            Self::Topology => formatter.write_str("census/topology"),
+            Self::Rpdb => formatter.write_str("census/rpdb"),
+            Self::Assembly => formatter.write_str("census/assembly"),
+            Self::CompleteCensus(error) => fmt_complete_census_error_token(error, formatter),
+            Self::Authorization(class) => class.fmt_token(formatter),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemAndroidGenerationPlanningCompleteCensusFailureClass {
+    UnverifiedBootIdentity,
+    UnverifiedDeviceIdentity,
+    NetworkNamespaceMismatch,
+    TooManyCoverageRecords,
+    DuplicateCoverage {
+        source: FwmarkEvidenceSource,
+        plane: FwmarkPlane,
+    },
+    MissingCoverage {
+        source: FwmarkEvidenceSource,
+        plane: FwmarkPlane,
+    },
+    NonCompleteCoverage {
+        source: FwmarkEvidenceSource,
+        plane: FwmarkPlane,
+        state: FwmarkCensusCoverageState,
+    },
+    TooManyMarkUseRecords,
+    TooManyOrderedLateWrites,
+    DuplicateOrderedLateWrite,
+    OrderedLateWriteHasNoMarkUse,
+    TooManyExactMarkSentinels,
+    DuplicateExactMarkSentinel,
+    ExactMarkSentinelHasNoMarkUse,
+    PresentCoverageHasNoMarkUse {
+        source: FwmarkEvidenceSource,
+        plane: FwmarkPlane,
+    },
+    AbsentCoverageHasMarkUse {
+        source: FwmarkEvidenceSource,
+        plane: FwmarkPlane,
+    },
+    ObservationIdExhausted,
+}
+
+impl SystemAndroidGenerationPlanningCompleteCensusFailureClass {
+    fn from_error(error: &CompleteFwmarkCensusError) -> Self {
+        match error {
+            CompleteFwmarkCensusError::UnverifiedBootIdentity { .. } => {
+                Self::UnverifiedBootIdentity
+            }
+            CompleteFwmarkCensusError::UnverifiedDeviceIdentity { .. } => {
+                Self::UnverifiedDeviceIdentity
+            }
+            CompleteFwmarkCensusError::NetworkNamespaceMismatch { .. } => {
+                Self::NetworkNamespaceMismatch
+            }
+            CompleteFwmarkCensusError::TooManyCoverageRecords { .. } => {
+                Self::TooManyCoverageRecords
+            }
+            CompleteFwmarkCensusError::DuplicateCoverage { source, plane } => {
+                Self::DuplicateCoverage {
+                    source: *source,
+                    plane: *plane,
+                }
+            }
+            CompleteFwmarkCensusError::MissingCoverage { source, plane } => Self::MissingCoverage {
+                source: *source,
+                plane: *plane,
+            },
+            CompleteFwmarkCensusError::NonCompleteCoverage {
+                source,
+                plane,
+                state,
+            } => Self::NonCompleteCoverage {
+                source: *source,
+                plane: *plane,
+                state: *state,
+            },
+            CompleteFwmarkCensusError::TooManyMarkUseRecords { .. } => Self::TooManyMarkUseRecords,
+            CompleteFwmarkCensusError::TooManyOrderedLateWrites { .. } => {
+                Self::TooManyOrderedLateWrites
+            }
+            CompleteFwmarkCensusError::DuplicateOrderedLateWrite => Self::DuplicateOrderedLateWrite,
+            CompleteFwmarkCensusError::OrderedLateWriteHasNoMarkUse => {
+                Self::OrderedLateWriteHasNoMarkUse
+            }
+            CompleteFwmarkCensusError::TooManyExactMarkSentinels { .. } => {
+                Self::TooManyExactMarkSentinels
+            }
+            CompleteFwmarkCensusError::DuplicateExactMarkSentinel => {
+                Self::DuplicateExactMarkSentinel
+            }
+            CompleteFwmarkCensusError::ExactMarkSentinelHasNoMarkUse => {
+                Self::ExactMarkSentinelHasNoMarkUse
+            }
+            CompleteFwmarkCensusError::PresentCoverageHasNoMarkUse { source, plane } => {
+                Self::PresentCoverageHasNoMarkUse {
+                    source: *source,
+                    plane: *plane,
+                }
+            }
+            CompleteFwmarkCensusError::AbsentCoverageHasMarkUse { source, plane } => {
+                Self::AbsentCoverageHasMarkUse {
+                    source: *source,
+                    plane: *plane,
+                }
+            }
+            CompleteFwmarkCensusError::ObservationIdExhausted => Self::ObservationIdExhausted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemAndroidGenerationPlanningAuthorizationFailureClass {
+    NoPositiveDeviceGrant,
+    IneligibleCandidate,
+    UnverifiedBootIdentity,
+    StaleTopologyScope,
+    TopologyScopeNotAllResidual,
+    MalformedPositiveGrant,
+    GrantCandidateMismatch,
+    GrantTopologyScopeMismatch,
+    GrantBootIdentityMismatch,
+    GrantNetworkNamespaceMismatch,
+    GrantCapabilityProfileMismatch,
+    GrantMissingPlanes,
+    CensusInventoryMismatch,
+    CensusBootIdentityMismatch,
+    CensusNetworkNamespaceMismatch,
+    CensusCapabilityProfileMismatch,
+    CensusDevicePolicyIdentityMismatch,
+    CensusDevicePolicyRevisionMismatch,
+    CensusCollectorRevisionMismatch,
+    CensusOwnershipJournalIdentityMismatch,
+    CensusOwnershipJournalRevisionMismatch,
+    PartialAuditConflict,
+    PartialAuditEvidenceNotAvailable,
+    CensusConflict,
+    OrderedPacketWriteQualificationRequired,
+    OrderedLateWriteQualificationMismatch,
+    ExactMarkSentinelQualificationMismatch,
+    NonFreshCensusObservation,
+}
+
+impl SystemAndroidGenerationPlanningAuthorizationFailureClass {
+    fn from_error(error: &AndroidMarkPlanningAuthorizationError) -> Self {
+        match error {
+            AndroidMarkPlanningAuthorizationError::NoPositiveDeviceGrant { .. } => {
+                Self::NoPositiveDeviceGrant
+            }
+            AndroidMarkPlanningAuthorizationError::IneligibleCandidate(_) => {
+                Self::IneligibleCandidate
+            }
+            AndroidMarkPlanningAuthorizationError::UnverifiedBootIdentity { .. } => {
+                Self::UnverifiedBootIdentity
+            }
+            AndroidMarkPlanningAuthorizationError::StaleTopologyScope(_) => {
+                Self::StaleTopologyScope
+            }
+            AndroidMarkPlanningAuthorizationError::TopologyScopeNotAllResidual { .. } => {
+                Self::TopologyScopeNotAllResidual
+            }
+            AndroidMarkPlanningAuthorizationError::MalformedPositiveGrant => {
+                Self::MalformedPositiveGrant
+            }
+            AndroidMarkPlanningAuthorizationError::GrantCandidateMismatch { .. } => {
+                Self::GrantCandidateMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::GrantTopologyScopeMismatch => {
+                Self::GrantTopologyScopeMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::GrantBootIdentityMismatch => {
+                Self::GrantBootIdentityMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::GrantNetworkNamespaceMismatch { .. } => {
+                Self::GrantNetworkNamespaceMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::GrantCapabilityProfileMismatch { .. } => {
+                Self::GrantCapabilityProfileMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::GrantMissingPlanes { .. } => {
+                Self::GrantMissingPlanes
+            }
+            AndroidMarkPlanningAuthorizationError::CensusInventoryMismatch { .. } => {
+                Self::CensusInventoryMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::CensusBootIdentityMismatch => {
+                Self::CensusBootIdentityMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::CensusNetworkNamespaceMismatch { .. } => {
+                Self::CensusNetworkNamespaceMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::CensusCapabilityProfileMismatch { .. } => {
+                Self::CensusCapabilityProfileMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::CensusDevicePolicyIdentityMismatch => {
+                Self::CensusDevicePolicyIdentityMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::CensusDevicePolicyRevisionMismatch {
+                ..
+            } => Self::CensusDevicePolicyRevisionMismatch,
+            AndroidMarkPlanningAuthorizationError::CensusCollectorRevisionMismatch { .. } => {
+                Self::CensusCollectorRevisionMismatch
+            }
+            AndroidMarkPlanningAuthorizationError::CensusOwnershipJournalIdentityMismatch {
+                ..
+            } => Self::CensusOwnershipJournalIdentityMismatch,
+            AndroidMarkPlanningAuthorizationError::CensusOwnershipJournalRevisionMismatch {
+                ..
+            } => Self::CensusOwnershipJournalRevisionMismatch,
+            AndroidMarkPlanningAuthorizationError::PartialAuditConflict { .. } => {
+                Self::PartialAuditConflict
+            }
+            AndroidMarkPlanningAuthorizationError::PartialAuditEvidenceNotAvailable { .. } => {
+                Self::PartialAuditEvidenceNotAvailable
+            }
+            AndroidMarkPlanningAuthorizationError::CensusConflict { .. } => Self::CensusConflict,
+            AndroidMarkPlanningAuthorizationError::OrderedPacketWriteQualificationRequired {
+                ..
+            } => Self::OrderedPacketWriteQualificationRequired,
+            AndroidMarkPlanningAuthorizationError::OrderedLateWriteQualificationMismatch {
+                ..
+            } => Self::OrderedLateWriteQualificationMismatch,
+            AndroidMarkPlanningAuthorizationError::ExactMarkSentinelQualificationMismatch {
+                ..
+            } => Self::ExactMarkSentinelQualificationMismatch,
+            AndroidMarkPlanningAuthorizationError::NonFreshCensusObservation { .. } => {
+                Self::NonFreshCensusObservation
+            }
+        }
+    }
+
+    #[cfg(any(test, flux_android_qualification))]
+    fn fmt_token(self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let token = match self {
+            Self::NoPositiveDeviceGrant => "no-positive-device-grant",
+            Self::IneligibleCandidate => "ineligible-candidate",
+            Self::UnverifiedBootIdentity => "unverified-boot-identity",
+            Self::StaleTopologyScope => "stale-topology-scope",
+            Self::TopologyScopeNotAllResidual => "topology-scope-not-all-residual",
+            Self::MalformedPositiveGrant => "malformed-positive-grant",
+            Self::GrantCandidateMismatch => "grant-candidate-mismatch",
+            Self::GrantTopologyScopeMismatch => "grant-topology-scope-mismatch",
+            Self::GrantBootIdentityMismatch => "grant-boot-identity-mismatch",
+            Self::GrantNetworkNamespaceMismatch => "grant-network-namespace-mismatch",
+            Self::GrantCapabilityProfileMismatch => "grant-capability-profile-mismatch",
+            Self::GrantMissingPlanes => "grant-missing-planes",
+            Self::CensusInventoryMismatch => "census-inventory-mismatch",
+            Self::CensusBootIdentityMismatch => "census-boot-identity-mismatch",
+            Self::CensusNetworkNamespaceMismatch => "census-network-namespace-mismatch",
+            Self::CensusCapabilityProfileMismatch => "census-capability-profile-mismatch",
+            Self::CensusDevicePolicyIdentityMismatch => "census-device-policy-identity-mismatch",
+            Self::CensusDevicePolicyRevisionMismatch => "census-device-policy-revision-mismatch",
+            Self::CensusCollectorRevisionMismatch => "census-collector-revision-mismatch",
+            Self::CensusOwnershipJournalIdentityMismatch => {
+                "census-ownership-journal-identity-mismatch"
+            }
+            Self::CensusOwnershipJournalRevisionMismatch => {
+                "census-ownership-journal-revision-mismatch"
+            }
+            Self::PartialAuditConflict => "partial-audit-conflict",
+            Self::PartialAuditEvidenceNotAvailable => "partial-audit-evidence-not-available",
+            Self::CensusConflict => "census-conflict",
+            Self::OrderedPacketWriteQualificationRequired => {
+                "ordered-packet-write-qualification-required"
+            }
+            Self::OrderedLateWriteQualificationMismatch => {
+                "ordered-late-write-qualification-mismatch"
+            }
+            Self::ExactMarkSentinelQualificationMismatch => {
+                "exact-mark-sentinel-qualification-mismatch"
+            }
+            Self::NonFreshCensusObservation => "non-fresh-census-observation",
+        };
+        write!(formatter, "census/authorization/{token}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemAndroidGenerationPlanningPlacementFailureClass {
+    ReviewedClassification,
+    ReviewedPlanning,
+    GenericPlanning,
+}
+
+impl SystemAndroidGenerationPlanningPlacementFailureClass {
+    #[cfg(any(test, flux_android_qualification))]
+    fn fmt_token(self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ReviewedClassification => "placement/reviewed-classification",
+            Self::ReviewedPlanning => "placement/reviewed-planning",
+            Self::GenericPlanning => "placement/generic-planning",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SystemAndroidGenerationPlanningCensusError {
+    class: SystemAndroidGenerationPlanningCensusFailureClass,
+    detail: Box<str>,
+}
+
+impl SystemAndroidGenerationPlanningCensusError {
+    fn new(
+        source: AndroidFwmarkCensusCoordinatorError<SystemAndroidFwmarkCensusSourceError>,
+    ) -> Self {
+        Self {
+            class: SystemAndroidGenerationPlanningCensusFailureClass::from_error(&source),
+            detail: source.to_string().into_boxed_str(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SystemAndroidGenerationPlanningPlacementError {
+    class: SystemAndroidGenerationPlanningPlacementFailureClass,
+    detail: Box<str>,
+}
+
+impl SystemAndroidGenerationPlanningPlacementError {
+    fn new(
+        class: SystemAndroidGenerationPlanningPlacementFailureClass,
+        source: impl fmt::Display,
+    ) -> Self {
+        Self {
+            class,
+            detail: source.to_string().into_boxed_str(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SystemAndroidGenerationPlanningError {
     LocalOutputRequired,
@@ -389,8 +859,39 @@ pub(crate) enum SystemAndroidGenerationPlanningError {
     InitialDesiredStateChanged,
     UnexpectedDiagnostic,
     CapturePathEvidence(CapturePathQualificationEvidenceError),
-    Census(Box<str>),
-    Placement(Box<str>),
+    Census(SystemAndroidGenerationPlanningCensusError),
+    Placement(SystemAndroidGenerationPlanningPlacementError),
+}
+
+impl SystemAndroidGenerationPlanningError {
+    #[cfg(any(test, flux_android_qualification))]
+    #[must_use]
+    pub(crate) const fn failure_class(&self) -> SystemAndroidGenerationPlanningFailureClass {
+        match self {
+            Self::LocalOutputRequired => {
+                SystemAndroidGenerationPlanningFailureClass::LocalOutputRequired
+            }
+            Self::ForwardedIngressUnsupported => {
+                SystemAndroidGenerationPlanningFailureClass::ForwardedIngressUnsupported
+            }
+            Self::InitialAlreadyAccepted => {
+                SystemAndroidGenerationPlanningFailureClass::InitialAlreadyAccepted
+            }
+            Self::InitialDesiredStateChanged => {
+                SystemAndroidGenerationPlanningFailureClass::InitialDesiredStateChanged
+            }
+            Self::UnexpectedDiagnostic => {
+                SystemAndroidGenerationPlanningFailureClass::UnexpectedDiagnostic
+            }
+            Self::CapturePathEvidence(_) => {
+                SystemAndroidGenerationPlanningFailureClass::CapturePathEvidence
+            }
+            Self::Census(error) => SystemAndroidGenerationPlanningFailureClass::Census(error.class),
+            Self::Placement(error) => {
+                SystemAndroidGenerationPlanningFailureClass::Placement(error.class)
+            }
+        }
+    }
 }
 
 impl fmt::Display for SystemAndroidGenerationPlanningError {
@@ -411,14 +912,184 @@ impl fmt::Display for SystemAndroidGenerationPlanningError {
                 formatter.write_str("Android planning census returned a diagnostic-only projection")
             }
             Self::CapturePathEvidence(source) => source.fmt(formatter),
-            Self::Census(detail) => write!(formatter, "Android planning census failed: {detail}"),
-            Self::Placement(detail) => {
+            Self::Census(error) => write!(
+                formatter,
+                "Android planning census failed: {}",
+                error.detail
+            ),
+            Self::Placement(error) => {
                 write!(
                     formatter,
-                    "Android proxy-only RPDB placement failed: {detail}"
+                    "Android proxy-only RPDB placement failed: {}",
+                    error.detail
                 )
             }
         }
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+fn fmt_complete_census_error_token(
+    error: SystemAndroidGenerationPlanningCompleteCensusFailureClass,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match error {
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::UnverifiedBootIdentity => {
+            formatter.write_str("census/complete/unverified-boot-identity")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::UnverifiedDeviceIdentity => {
+            formatter.write_str("census/complete/unverified-device-identity")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::NetworkNamespaceMismatch => {
+            formatter.write_str("census/complete/network-namespace-mismatch")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::TooManyCoverageRecords => {
+            formatter.write_str("census/complete/too-many-coverage-records")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::DuplicateCoverage {
+            source,
+            plane,
+        } => write!(
+            formatter,
+            "census/complete/duplicate-coverage/{}/{}",
+            fwmark_evidence_source_token(source),
+            fwmark_plane_token(plane)
+        ),
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::MissingCoverage {
+            source,
+            plane,
+        } => write!(
+            formatter,
+            "census/complete/missing-coverage/{}/{}",
+            fwmark_evidence_source_token(source),
+            fwmark_plane_token(plane)
+        ),
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::NonCompleteCoverage {
+            source,
+            plane,
+            state,
+        } => write!(
+            formatter,
+            "census/complete/noncomplete-coverage/{}/{}/{}",
+            fwmark_evidence_source_token(source),
+            fwmark_plane_token(plane),
+            fwmark_coverage_state_token(state)
+        ),
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::TooManyMarkUseRecords => {
+            formatter.write_str("census/complete/too-many-mark-use-records")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::TooManyOrderedLateWrites => {
+            formatter.write_str("census/complete/too-many-ordered-late-writes")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::DuplicateOrderedLateWrite => {
+            formatter.write_str("census/complete/duplicate-ordered-late-write")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::OrderedLateWriteHasNoMarkUse => {
+            formatter.write_str("census/complete/ordered-late-write-has-no-mark-use")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::TooManyExactMarkSentinels => {
+            formatter.write_str("census/complete/too-many-exact-mark-sentinels")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::DuplicateExactMarkSentinel => {
+            formatter.write_str("census/complete/duplicate-exact-mark-sentinel")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::ExactMarkSentinelHasNoMarkUse => {
+            formatter.write_str("census/complete/exact-mark-sentinel-has-no-mark-use")
+        }
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::PresentCoverageHasNoMarkUse {
+            source,
+            plane,
+        } => write!(
+            formatter,
+            "census/complete/present-coverage-has-no-mark-use/{}/{}",
+            fwmark_evidence_source_token(source),
+            fwmark_plane_token(plane)
+        ),
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::AbsentCoverageHasMarkUse {
+            source,
+            plane,
+        } => write!(
+            formatter,
+            "census/complete/absent-coverage-has-mark-use/{}/{}",
+            fwmark_evidence_source_token(source),
+            fwmark_plane_token(plane)
+        ),
+        SystemAndroidGenerationPlanningCompleteCensusFailureClass::ObservationIdExhausted => {
+            formatter.write_str("census/complete/observation-id-exhausted")
+        }
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+const fn android_fwmark_external_phase_token(
+    phase: AndroidFwmarkCensusExternalPhase,
+) -> &'static str {
+    match phase {
+        AndroidFwmarkCensusExternalPhase::Before => "before",
+        AndroidFwmarkCensusExternalPhase::After => "after",
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+const fn system_android_census_source_error_kind_token(
+    kind: SystemAndroidFwmarkCensusSourceErrorKind,
+) -> &'static str {
+    match kind {
+        SystemAndroidFwmarkCensusSourceErrorKind::InvalidCapabilityStage => {
+            "invalid-capability-stage"
+        }
+        SystemAndroidFwmarkCensusSourceErrorKind::InvalidBound => "invalid-bound",
+        SystemAndroidFwmarkCensusSourceErrorKind::DeadlineExceeded => "deadline-exceeded",
+        SystemAndroidFwmarkCensusSourceErrorKind::KernelConfig => "kernel-config",
+        SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate => "nftables-gate",
+        SystemAndroidFwmarkCensusSourceErrorKind::XtablesProcess => "xtables-process",
+        SystemAndroidFwmarkCensusSourceErrorKind::XtablesObservation => "xtables-observation",
+        SystemAndroidFwmarkCensusSourceErrorKind::NftablesObservation => "nftables-observation",
+        SystemAndroidFwmarkCensusSourceErrorKind::TrafficControlBpfObservation => {
+            "traffic-control-bpf-observation"
+        }
+        SystemAndroidFwmarkCensusSourceErrorKind::XfrmObservation => "xfrm-observation",
+        SystemAndroidFwmarkCensusSourceErrorKind::NetworkInventory => "network-inventory",
+        SystemAndroidFwmarkCensusSourceErrorKind::ExistingFluxOwnership => {
+            "existing-flux-ownership"
+        }
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+const fn fwmark_evidence_source_token(source: FwmarkEvidenceSource) -> &'static str {
+    match source {
+        FwmarkEvidenceSource::AndroidNetId => "android-net-id",
+        FwmarkEvidenceSource::Rpdb => "rpdb",
+        FwmarkEvidenceSource::DeviceMarkPolicy => "device-mark-policy",
+        FwmarkEvidenceSource::Xtables => "xtables",
+        FwmarkEvidenceSource::Nftables => "nftables",
+        FwmarkEvidenceSource::TrafficControlAndBpf => "traffic-control-and-bpf",
+        FwmarkEvidenceSource::Xfrm => "xfrm",
+        FwmarkEvidenceSource::ConnmarkAndSocketTransfers => "connmark-and-socket-transfers",
+        FwmarkEvidenceSource::ExistingFluxOwnership => "existing-flux-ownership",
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+const fn fwmark_plane_token(plane: FwmarkPlane) -> &'static str {
+    match plane {
+        FwmarkPlane::Packet => "packet",
+        FwmarkPlane::Socket => "socket",
+        FwmarkPlane::Conntrack => "conntrack",
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+const fn fwmark_coverage_state_token(state: FwmarkCensusCoverageState) -> &'static str {
+    match state {
+        FwmarkCensusCoverageState::CompletePresent => "complete-present",
+        FwmarkCensusCoverageState::CompleteAbsent => "complete-absent",
+        FwmarkCensusCoverageState::Incomplete => "incomplete",
+        FwmarkCensusCoverageState::Opaque => "opaque",
+        FwmarkCensusCoverageState::Denied => "denied",
+        FwmarkCensusCoverageState::Transient => "transient",
+        FwmarkCensusCoverageState::Unavailable => "unavailable",
     }
 }
 
@@ -1441,6 +2112,77 @@ mod tests {
 
     const PACKAGED_DESIRED_STATE: &str = include_str!("../../../conf/flux.toml");
     const PACKAGED_ENGINE_TEMPLATE: &[u8] = include_bytes!("../../../conf/template.json");
+
+    #[test]
+    fn android_planning_failure_token_keeps_complete_census_cell_identity_free() {
+        let class = SystemAndroidGenerationPlanningFailureClass::Census(
+            SystemAndroidGenerationPlanningCensusFailureClass::CompleteCensus(
+                SystemAndroidGenerationPlanningCompleteCensusFailureClass::NonCompleteCoverage {
+                    source: FwmarkEvidenceSource::DeviceMarkPolicy,
+                    plane: FwmarkPlane::Packet,
+                    state: FwmarkCensusCoverageState::Unavailable,
+                },
+            ),
+        );
+        let token = class.to_string();
+
+        assert_eq!(
+            token,
+            "census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable"
+        );
+        assert!(token.chars().all(|character| character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '/')));
+
+        let error = SystemAndroidGenerationPlanningError::Census(
+            SystemAndroidGenerationPlanningCensusError {
+                class: match class {
+                    SystemAndroidGenerationPlanningFailureClass::Census(class) => class,
+                    _ => unreachable!("test class is census-scoped"),
+                },
+                detail: "secret=/device/private provider=credential".into(),
+            },
+        );
+        assert_eq!(error.failure_class(), class);
+        assert!(!error.failure_class().to_string().contains("secret"));
+        assert!(!error.failure_class().to_string().contains("device/private"));
+    }
+
+    #[test]
+    fn android_planning_failure_class_discards_namespace_identity_fields() {
+        let profile = NetworkNamespaceIdentity::new(17, 19).expect("profile namespace identity");
+        let observed = NetworkNamespaceIdentity::new(23, 29).expect("observed namespace identity");
+        let class = SystemAndroidGenerationPlanningCompleteCensusFailureClass::from_error(
+            &CompleteFwmarkCensusError::NetworkNamespaceMismatch { profile, observed },
+        );
+
+        assert_eq!(
+            class,
+            SystemAndroidGenerationPlanningCompleteCensusFailureClass::NetworkNamespaceMismatch
+        );
+        let token = SystemAndroidGenerationPlanningFailureClass::Census(
+            SystemAndroidGenerationPlanningCensusFailureClass::CompleteCensus(class),
+        )
+        .to_string();
+        assert_eq!(token, "census/complete/network-namespace-mismatch");
+        for identity_component in [17_u64, 19, 23, 29] {
+            assert!(!token.contains(&identity_component.to_string()));
+        }
+    }
+
+    #[test]
+    fn android_planning_failure_token_distinguishes_ordered_write_authorization() {
+        let class = SystemAndroidGenerationPlanningFailureClass::Census(
+            SystemAndroidGenerationPlanningCensusFailureClass::Authorization(
+                SystemAndroidGenerationPlanningAuthorizationFailureClass::
+                    OrderedLateWriteQualificationMismatch,
+            ),
+        );
+        assert_eq!(
+            class.to_string(),
+            "census/authorization/ordered-late-write-qualification-mismatch"
+        );
+    }
     const PROFILE_SCRIPT: &[u8] = br#"#!/bin/sh
 case "$1" in
     version)

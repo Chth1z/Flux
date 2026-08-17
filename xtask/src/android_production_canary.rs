@@ -1014,62 +1014,237 @@ fn qualification_failure_diagnostic(
     status: Option<i32>,
     passed: Option<bool>,
     stderr: &[u8],
-) -> &'static str {
+) -> String {
     if passed == Some(true) {
-        return "diagnostic=qualification-receipt-boundary";
+        return "diagnostic=qualification-receipt-boundary".to_owned();
     }
     match status {
         Some(QUALIFICATION_DAEMON_EXITED_STATUS) => qualification_daemon_exit_diagnostic(stderr),
         Some(QUALIFICATION_READINESS_DEADLINE_STATUS) if stderr.is_empty() => {
-            "diagnostic=qualification-readiness-deadline-exceeded"
+            "diagnostic=qualification-readiness-deadline-exceeded".to_owned()
         }
-        _ => "diagnostic=qualification-receipt-boundary",
+        _ => "diagnostic=qualification-receipt-boundary".to_owned(),
     }
 }
 
-fn qualification_daemon_exit_diagnostic(stderr: &[u8]) -> &'static str {
+fn qualification_daemon_exit_diagnostic(stderr: &[u8]) -> String {
     if stderr.is_empty() {
-        return "diagnostic=qualification-daemon-exited-before-readiness";
+        return "diagnostic=qualification-daemon-exited-before-readiness".to_owned();
     }
     let Some(stage) = stderr
         .strip_prefix(QUALIFICATION_DAEMON_FAILURE_PREFIX)
         .and_then(|value| value.strip_suffix(b"\n"))
     else {
-        return "diagnostic=qualification-receipt-boundary";
+        return "diagnostic=qualification-receipt-boundary".to_owned();
     };
+    if let Ok(stage) = std::str::from_utf8(stage)
+        && let Some(token) = stage.strip_prefix("android-planning-authority/")
+    {
+        if let Some(token) = qualification_android_planning_failure_token(token) {
+            return format!(
+                "diagnostic=qualification-daemon-exited-android-planning-authority-{token}"
+            );
+        }
+        return "diagnostic=qualification-receipt-boundary".to_owned();
+    }
     match stage {
-        b"facility-authority" => "diagnostic=qualification-daemon-exited-facility-authority",
+        b"facility-authority" => {
+            "diagnostic=qualification-daemon-exited-facility-authority".to_owned()
+        }
         b"native-startup-recovery" => {
-            "diagnostic=qualification-daemon-exited-native-startup-recovery"
+            "diagnostic=qualification-daemon-exited-native-startup-recovery".to_owned()
         }
         b"android-planning-authority" => {
-            "diagnostic=qualification-daemon-exited-android-planning-authority"
+            "diagnostic=qualification-daemon-exited-android-planning-authority".to_owned()
         }
         b"native-runtime-composition" => {
-            "diagnostic=qualification-daemon-exited-native-runtime-composition"
+            "diagnostic=qualification-daemon-exited-native-runtime-composition".to_owned()
         }
         b"android-planning-retention" => {
-            "diagnostic=qualification-daemon-exited-android-planning-retention"
+            "diagnostic=qualification-daemon-exited-android-planning-retention".to_owned()
         }
         b"subscription-runtime-start" => {
-            "diagnostic=qualification-daemon-exited-subscription-runtime-start"
+            "diagnostic=qualification-daemon-exited-subscription-runtime-start".to_owned()
         }
         b"runtime-coordinator-composition" => {
-            "diagnostic=qualification-daemon-exited-runtime-coordinator-composition"
+            "diagnostic=qualification-daemon-exited-runtime-coordinator-composition".to_owned()
         }
         b"initial-runtime-control" => {
-            "diagnostic=qualification-daemon-exited-initial-runtime-control"
+            "diagnostic=qualification-daemon-exited-initial-runtime-control".to_owned()
         }
-        b"daemon-configuration" => "diagnostic=qualification-daemon-exited-daemon-configuration",
-        b"daemon-invariant" => "diagnostic=qualification-daemon-exited-daemon-invariant",
-        b"runtime-layout" => "diagnostic=qualification-daemon-exited-runtime-layout",
-        b"administrative-intent" => "diagnostic=qualification-daemon-exited-administrative-intent",
-        b"control-reactor" => "diagnostic=qualification-daemon-exited-control-reactor",
-        b"control-socket" => "diagnostic=qualification-daemon-exited-control-socket",
-        b"unclassified-daemon-exit" => "diagnostic=qualification-daemon-exited-unclassified-stage",
-        _ => "diagnostic=qualification-receipt-boundary",
+        b"daemon-configuration" => {
+            "diagnostic=qualification-daemon-exited-daemon-configuration".to_owned()
+        }
+        b"daemon-invariant" => "diagnostic=qualification-daemon-exited-daemon-invariant".to_owned(),
+        b"runtime-layout" => "diagnostic=qualification-daemon-exited-runtime-layout".to_owned(),
+        b"administrative-intent" => {
+            "diagnostic=qualification-daemon-exited-administrative-intent".to_owned()
+        }
+        b"control-reactor" => "diagnostic=qualification-daemon-exited-control-reactor".to_owned(),
+        b"control-socket" => "diagnostic=qualification-daemon-exited-control-socket".to_owned(),
+        b"unclassified-daemon-exit" => {
+            "diagnostic=qualification-daemon-exited-unclassified-stage".to_owned()
+        }
+        _ => "diagnostic=qualification-receipt-boundary".to_owned(),
     }
 }
+
+fn qualification_android_planning_failure_token(token: &str) -> Option<String> {
+    if token.is_empty() || token.len() > 192 || !token.is_ascii() {
+        return None;
+    }
+    let parts = token.split('/').collect::<Vec<_>>();
+    let valid = match parts.as_slice() {
+        ["census", "collection", stage, source]
+            if QUALIFICATION_CENSUS_COLLECTION_STAGES.contains(stage)
+                && QUALIFICATION_CENSUS_SOURCE_KINDS.contains(source) =>
+        {
+            true
+        }
+        ["census", "external-snapshot-context-mismatch", phase]
+            if matches!(*phase, "before" | "after") =>
+        {
+            true
+        }
+        ["census", "complete", kind, source, plane]
+            if matches!(
+                *kind,
+                "duplicate-coverage"
+                    | "missing-coverage"
+                    | "present-coverage-has-no-mark-use"
+                    | "absent-coverage-has-mark-use"
+            ) && QUALIFICATION_FWMARK_SOURCES.contains(source)
+                && QUALIFICATION_FWMARK_PLANES.contains(plane) =>
+        {
+            true
+        }
+        [
+            "census",
+            "complete",
+            "noncomplete-coverage",
+            source,
+            plane,
+            state,
+        ] if QUALIFICATION_FWMARK_SOURCES.contains(source)
+            && QUALIFICATION_FWMARK_PLANES.contains(plane)
+            && QUALIFICATION_FWMARK_COVERAGE_STATES.contains(state) =>
+        {
+            true
+        }
+        ["census", "authorization", kind]
+            if QUALIFICATION_AUTHORIZATION_FAILURES.contains(kind) =>
+        {
+            true
+        }
+        _ => QUALIFICATION_ANDROID_PLANNING_STATIC_TOKENS.contains(&token),
+    };
+    valid.then(|| token.replace('/', "-"))
+}
+
+const QUALIFICATION_CENSUS_COLLECTION_STAGES: &[&str] = &[
+    "capability-before",
+    "external-before",
+    "network-inventory",
+    "existing-flux-ownership",
+    "external-after",
+    "capability-after",
+];
+const QUALIFICATION_CENSUS_SOURCE_KINDS: &[&str] = &[
+    "invalid-capability-stage",
+    "invalid-bound",
+    "deadline-exceeded",
+    "kernel-config",
+    "nftables-gate",
+    "xtables-process",
+    "xtables-observation",
+    "nftables-observation",
+    "traffic-control-bpf-observation",
+    "xfrm-observation",
+    "network-inventory",
+    "existing-flux-ownership",
+];
+const QUALIFICATION_FWMARK_SOURCES: &[&str] = &[
+    "android-net-id",
+    "rpdb",
+    "device-mark-policy",
+    "xtables",
+    "nftables",
+    "traffic-control-and-bpf",
+    "xfrm",
+    "connmark-and-socket-transfers",
+    "existing-flux-ownership",
+];
+const QUALIFICATION_FWMARK_PLANES: &[&str] = &["packet", "socket", "conntrack"];
+const QUALIFICATION_FWMARK_COVERAGE_STATES: &[&str] = &[
+    "complete-present",
+    "complete-absent",
+    "incomplete",
+    "opaque",
+    "denied",
+    "transient",
+    "unavailable",
+];
+const QUALIFICATION_AUTHORIZATION_FAILURES: &[&str] = &[
+    "no-positive-device-grant",
+    "ineligible-candidate",
+    "unverified-boot-identity",
+    "stale-topology-scope",
+    "topology-scope-not-all-residual",
+    "malformed-positive-grant",
+    "grant-candidate-mismatch",
+    "grant-topology-scope-mismatch",
+    "grant-boot-identity-mismatch",
+    "grant-network-namespace-mismatch",
+    "grant-capability-profile-mismatch",
+    "grant-missing-planes",
+    "census-inventory-mismatch",
+    "census-boot-identity-mismatch",
+    "census-network-namespace-mismatch",
+    "census-capability-profile-mismatch",
+    "census-device-policy-identity-mismatch",
+    "census-device-policy-revision-mismatch",
+    "census-collector-revision-mismatch",
+    "census-ownership-journal-identity-mismatch",
+    "census-ownership-journal-revision-mismatch",
+    "partial-audit-conflict",
+    "partial-audit-evidence-not-available",
+    "census-conflict",
+    "ordered-packet-write-qualification-required",
+    "ordered-late-write-qualification-mismatch",
+    "exact-mark-sentinel-qualification-mismatch",
+    "non-fresh-census-observation",
+];
+const QUALIFICATION_ANDROID_PLANNING_STATIC_TOKENS: &[&str] = &[
+    "local-output-required",
+    "forwarded-ingress-unsupported",
+    "unexpected-diagnostic",
+    "capture-path-evidence",
+    "census/capability-device-identity-unavailable",
+    "census/capability-drift",
+    "census/external-snapshot-drift",
+    "census/platform-profile",
+    "census/selected-netd-source-profile-mismatch",
+    "census/reviewed-canary-facility-policy-mismatch",
+    "census/reviewed-canary-rpdb",
+    "census/topology",
+    "census/rpdb",
+    "census/assembly",
+    "census/complete/unverified-boot-identity",
+    "census/complete/unverified-device-identity",
+    "census/complete/network-namespace-mismatch",
+    "census/complete/too-many-coverage-records",
+    "census/complete/too-many-mark-use-records",
+    "census/complete/too-many-ordered-late-writes",
+    "census/complete/duplicate-ordered-late-write",
+    "census/complete/ordered-late-write-has-no-mark-use",
+    "census/complete/too-many-exact-mark-sentinels",
+    "census/complete/duplicate-exact-mark-sentinel",
+    "census/complete/exact-mark-sentinel-has-no-mark-use",
+    "census/complete/observation-id-exhausted",
+    "placement/reviewed-classification",
+    "placement/reviewed-planning",
+    "placement/generic-planning",
+];
 
 #[cfg(test)]
 fn parse_qualification_execution_receipt(
@@ -1287,6 +1462,94 @@ fn qualification_execution_script(
            wait \"$DAEMON_PID\" 2>/dev/null || true\n\
            DAEMON_PID=''\n\
          }}\n\
+         planning_census_stage_allowed() {{\n\
+           case \"$1\" in\n\
+             capability-before|external-before|network-inventory|existing-flux-ownership|external-after|capability-after) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_census_source_kind_allowed() {{\n\
+           case \"$1\" in\n\
+             invalid-capability-stage|invalid-bound|deadline-exceeded|kernel-config|nftables-gate|xtables-process|xtables-observation|nftables-observation|traffic-control-bpf-observation|xfrm-observation|network-inventory|existing-flux-ownership) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_fwmark_source_allowed() {{\n\
+           case \"$1\" in\n\
+             android-net-id|rpdb|device-mark-policy|xtables|nftables|traffic-control-and-bpf|xfrm|connmark-and-socket-transfers|existing-flux-ownership) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_fwmark_plane_allowed() {{\n\
+           case \"$1\" in\n\
+             packet|socket|conntrack) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_coverage_state_allowed() {{\n\
+           case \"$1\" in\n\
+             complete-present|complete-absent|incomplete|opaque|denied|transient|unavailable) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_authorization_failure_allowed() {{\n\
+           case \"$1\" in\n\
+             no-positive-device-grant|ineligible-candidate|unverified-boot-identity|stale-topology-scope|topology-scope-not-all-residual|malformed-positive-grant|grant-candidate-mismatch|grant-topology-scope-mismatch|grant-boot-identity-mismatch|grant-network-namespace-mismatch|grant-capability-profile-mismatch|grant-missing-planes|census-inventory-mismatch|census-boot-identity-mismatch|census-network-namespace-mismatch|census-capability-profile-mismatch|census-device-policy-identity-mismatch|census-device-policy-revision-mismatch|census-collector-revision-mismatch|census-ownership-journal-identity-mismatch|census-ownership-journal-revision-mismatch|partial-audit-conflict|partial-audit-evidence-not-available|census-conflict|ordered-packet-write-qualification-required|ordered-late-write-qualification-mismatch|exact-mark-sentinel-qualification-mismatch|non-fresh-census-observation) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_failure_token_is_allowed() {{\n\
+           TOKEN=\"$1\"\n\
+           case \"$TOKEN\" in\n\
+             local-output-required|forwarded-ingress-unsupported|unexpected-diagnostic|capture-path-evidence|census/capability-device-identity-unavailable|census/capability-drift|census/external-snapshot-drift|census/platform-profile|census/selected-netd-source-profile-mismatch|census/reviewed-canary-facility-policy-mismatch|census/reviewed-canary-rpdb|census/topology|census/rpdb|census/assembly|census/complete/unverified-boot-identity|census/complete/unverified-device-identity|census/complete/network-namespace-mismatch|census/complete/too-many-coverage-records|census/complete/too-many-mark-use-records|census/complete/too-many-ordered-late-writes|census/complete/duplicate-ordered-late-write|census/complete/ordered-late-write-has-no-mark-use|census/complete/too-many-exact-mark-sentinels|census/complete/duplicate-exact-mark-sentinel|census/complete/exact-mark-sentinel-has-no-mark-use|census/complete/observation-id-exhausted|placement/reviewed-classification|placement/reviewed-planning|placement/generic-planning) return 0 ;;\n\
+           esac\n\
+           case \"$TOKEN\" in\n\
+             census/collection/*/*)\n\
+               REST=${{TOKEN#census/collection/}}\n\
+               STAGE=${{REST%%/*}}\n\
+               SOURCE=${{REST#*/}}\n\
+               [ \"$SOURCE\" != \"$REST\" ] && [ \"$SOURCE\" != '*/*' ] || return 1\n\
+               planning_census_stage_allowed \"$STAGE\" || return 1\n\
+               planning_census_source_kind_allowed \"$SOURCE\" || return 1\n\
+               return 0\n\
+               ;;\n\
+             census/external-snapshot-context-mismatch/*)\n\
+               PHASE=${{TOKEN#census/external-snapshot-context-mismatch/}}\n\
+               [ \"$PHASE\" = before ] || [ \"$PHASE\" = after ] || return 1\n\
+               return 0\n\
+               ;;\n\
+             census/complete/duplicate-coverage/*/*|census/complete/missing-coverage/*/*|census/complete/present-coverage-has-no-mark-use/*/*|census/complete/absent-coverage-has-mark-use/*/*)\n\
+               REST=${{TOKEN#census/complete/}}\n\
+               KIND=${{REST%%/*}}\n\
+               REST=${{REST#*/}}\n\
+               SOURCE=${{REST%%/*}}\n\
+               PLANE=${{REST#*/}}\n\
+               [ \"$PLANE\" != '*/*' ] || return 1\n\
+               planning_fwmark_source_allowed \"$SOURCE\" || return 1\n\
+               planning_fwmark_plane_allowed \"$PLANE\" || return 1\n\
+               return 0\n\
+               ;;\n\
+             census/complete/noncomplete-coverage/*/*/*)\n\
+               REST=${{TOKEN#census/complete/noncomplete-coverage/}}\n\
+               SOURCE=${{REST%%/*}}\n\
+               REST=${{REST#*/}}\n\
+               PLANE=${{REST%%/*}}\n\
+               STATE=${{REST#*/}}\n\
+               [ \"$STATE\" != '*/*' ] || return 1\n\
+               planning_fwmark_source_allowed \"$SOURCE\" || return 1\n\
+               planning_fwmark_plane_allowed \"$PLANE\" || return 1\n\
+               planning_coverage_state_allowed \"$STATE\" || return 1\n\
+               return 0\n\
+               ;;\n\
+             census/authorization/*)\n\
+               FAILURE=${{TOKEN#census/authorization/}}\n\
+               [ \"$FAILURE\" != '*/*' ] || return 1\n\
+               planning_authorization_failure_allowed \"$FAILURE\" || return 1\n\
+               return 0\n\
+               ;;\n\
+           esac\n\
+           return 1\n\
+         }}\n\
          classify_daemon_failure() {{\n\
            FAILURE_STAGE='unclassified-daemon-exit'\n\
            DAEMON_ERROR_FILE=\"$ROOT/daemon.stderr\"\n\
@@ -1302,6 +1565,17 @@ fn qualification_execution_script(
                case \"$DAEMON_ERROR\" in\n\
                  'fluxd: native startup cannot split native canary facility authority:'*) FAILURE_STAGE='facility-authority' ;;\n\
                  'fluxd: native startup cannot compose native startup recovery:'*|'fluxd: native startup cannot recover native startup state:'*) FAILURE_STAGE='native-startup-recovery' ;;\n\
+                 'fluxd: native startup cannot mint initial Android planning authority: [qualification='*'] '*)\n\
+                   PLANNING_ERROR_PREFIX='fluxd: native startup cannot mint initial Android planning authority: [qualification='\n\
+                   PLANNING_ERROR_SUFFIX='] '\n\
+                   PLANNING_FAILURE=${{DAEMON_ERROR#\"$PLANNING_ERROR_PREFIX\"}}\n\
+                   PLANNING_FAILURE=${{PLANNING_FAILURE%%\"$PLANNING_ERROR_SUFFIX\"*}}\n\
+                   if planning_failure_token_is_allowed \"$PLANNING_FAILURE\"; then\n\
+                     FAILURE_STAGE=\"android-planning-authority/$PLANNING_FAILURE\"\n\
+                   else\n\
+                     FAILURE_STAGE='android-planning-authority'\n\
+                   fi\n\
+                   ;;\n\
                  'fluxd: native startup cannot mint initial Android planning authority:'*) FAILURE_STAGE='android-planning-authority' ;;\n\
                  'fluxd: native startup cannot compose native Android runtime:'*) FAILURE_STAGE='native-runtime-composition' ;;\n\
                  'fluxd: native startup cannot retain initial Android planning authority:'*) FAILURE_STAGE='android-planning-retention' ;;\n\
@@ -2246,6 +2520,8 @@ mod tests {
         let execution = qualification_execution_script(&remote, &device, &artifacts);
 
         assert!(execution.contains("classify_daemon_failure()"));
+        assert!(execution.contains("planning_failure_token_is_allowed()"));
+        assert!(execution.contains("android-planning-authority/$PLANNING_FAILURE"));
         assert!(execution.contains("FLUX_ANDROID_Q11_FAILURE=%s\\n"));
         for fixed_stage in [
             "facility-authority",
@@ -2268,6 +2544,30 @@ mod tests {
         }
         assert!(!execution.contains("tail -c"));
         assert!(!execution.contains("cat \"$ROOT/daemon.stderr\""));
+    }
+
+    #[test]
+    fn generated_planning_failure_allowlist_accepts_only_closed_tokens() {
+        let remote = test_remote_directory();
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let artifacts = test_artifacts();
+        let execution = qualification_execution_script(&remote, &device, &artifacts);
+        let start = execution
+            .find("planning_census_stage_allowed()")
+            .expect("planning-token helper starts");
+        let end = execution
+            .find("classify_daemon_failure()")
+            .expect("planning-token helper ends");
+        let helpers = &execution[start..end];
+        let script = format!(
+            "set -eu\n{helpers}\nplanning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable'\n! planning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/credential'\n! planning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable/extra'\nplanning_failure_token_is_allowed 'census/external-snapshot-context-mismatch/before'\n! planning_failure_token_is_allowed 'census/external-snapshot-context-mismatch/side-channel'\n"
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .expect("run generated planning-token helper");
+        assert!(status.success(), "generated helper rejected its contract");
     }
 
     #[test]
@@ -2349,6 +2649,10 @@ mod tests {
                 "unclassified-daemon-exit",
                 "diagnostic=qualification-daemon-exited-unclassified-stage",
             ),
+            (
+                "android-planning-authority/census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable",
+                "diagnostic=qualification-daemon-exited-android-planning-authority-census-complete-noncomplete-coverage-device-mark-policy-packet-unavailable",
+            ),
         ] {
             let stderr = format!("FLUX_ANDROID_Q11_FAILURE={stage}\n");
             assert_eq!(
@@ -2381,6 +2685,16 @@ mod tests {
                 Some(QUALIFICATION_DAEMON_EXITED_STATUS),
                 Some(false),
                 b"FLUX_ANDROID_Q11_FAILURE=unknown-stage\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/complete/noncomplete-coverage/device-mark-policy/packet/credential\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable/extra\n".as_slice(),
             ),
         ] {
             assert_eq!(

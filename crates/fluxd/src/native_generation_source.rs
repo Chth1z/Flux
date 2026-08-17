@@ -9,12 +9,12 @@ use flux_core::{
     AddressHostFamilySelection, AndroidMarkPlanningAuthorizationError, AndroidNetdSourceProfile,
     AndroidTproxyRoutingShape, AndroidTproxyTopologyScopeRequest,
     AndroidTproxyTrafficDomainRequest, CaptureTrafficDomain, CompleteFwmarkCensusError, FluxConfig,
-    FwmarkCandidate, FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane, GenerationId,
-    NetworkAddressFamily, NetworkInventory, Reason, ReviewedCanaryFacilityPolicy,
-    ReviewedCanaryFacilitySelection, ReviewedCanaryRoleCredentials, RpdbFamilyPlacement,
-    RpdbPlacementRequest, RulePriority, RuleTableId, classify_android_rpdb,
-    classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
-    plan_android_rpdb_placement_with_reviewed_canary_facility,
+    FwmarkCandidate, FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane,
+    FwmarkUseOperation, FwmarkUseRecord, GenerationId, NetworkAddressFamily, NetworkInventory,
+    Reason, ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
+    ReviewedCanaryRoleCredentials, RpdbFamilyPlacement, RpdbPlacementRequest, RulePriority,
+    RuleTableId, classify_android_rpdb, classify_android_rpdb_with_reviewed_canary_facility,
+    plan_android_rpdb_placement, plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_core::{CapabilityProfile, NetworkNamespaceIdentity};
@@ -633,6 +633,28 @@ impl SystemAndroidGenerationPlanningCompleteCensusFailureClass {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SystemAndroidGenerationPlanningCensusConflictSignature {
+    source: FwmarkEvidenceSource,
+    plane: FwmarkPlane,
+    operation: FwmarkUseOperation,
+    mask: u32,
+    overlap: u32,
+}
+
+const fn census_conflict_signature(
+    mark_use: FwmarkUseRecord,
+    overlap: u32,
+) -> SystemAndroidGenerationPlanningCensusConflictSignature {
+    SystemAndroidGenerationPlanningCensusConflictSignature {
+        source: mark_use.source(),
+        plane: mark_use.plane(),
+        operation: mark_use.operation(),
+        mask: mark_use.mask(),
+        overlap,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemAndroidGenerationPlanningAuthorizationFailureClass {
     NoPositiveDeviceGrant,
     IneligibleCandidate,
@@ -657,7 +679,7 @@ pub(crate) enum SystemAndroidGenerationPlanningAuthorizationFailureClass {
     CensusOwnershipJournalRevisionMismatch,
     PartialAuditConflict,
     PartialAuditEvidenceNotAvailable,
-    CensusConflict,
+    CensusConflict(Option<SystemAndroidGenerationPlanningCensusConflictSignature>),
     OrderedPacketWriteQualificationRequired,
     OrderedLateWriteQualificationMismatch,
     ExactMarkSentinelQualificationMismatch,
@@ -736,7 +758,11 @@ impl SystemAndroidGenerationPlanningAuthorizationFailureClass {
             AndroidMarkPlanningAuthorizationError::PartialAuditEvidenceNotAvailable { .. } => {
                 Self::PartialAuditEvidenceNotAvailable
             }
-            AndroidMarkPlanningAuthorizationError::CensusConflict { .. } => Self::CensusConflict,
+            AndroidMarkPlanningAuthorizationError::CensusConflict { conflicts } => {
+                Self::CensusConflict(conflicts.first().map(|conflict| {
+                    census_conflict_signature(conflict.mark_use(), conflict.overlap())
+                }))
+            }
             AndroidMarkPlanningAuthorizationError::OrderedPacketWriteQualificationRequired {
                 ..
             } => Self::OrderedPacketWriteQualificationRequired,
@@ -782,7 +808,21 @@ impl SystemAndroidGenerationPlanningAuthorizationFailureClass {
             }
             Self::PartialAuditConflict => "partial-audit-conflict",
             Self::PartialAuditEvidenceNotAvailable => "partial-audit-evidence-not-available",
-            Self::CensusConflict => "census-conflict",
+            Self::CensusConflict(signature) => {
+                formatter.write_str("census/authorization/census-conflict")?;
+                if let Some(signature) = signature {
+                    write!(
+                        formatter,
+                        "/{}/{}/{}/mask-{:08x}/overlap-{:08x}",
+                        fwmark_evidence_source_token(signature.source),
+                        fwmark_plane_token(signature.plane),
+                        fwmark_use_operation_token(signature.operation),
+                        signature.mask,
+                        signature.overlap,
+                    )?;
+                }
+                return Ok(());
+            }
             Self::OrderedPacketWriteQualificationRequired => {
                 "ordered-packet-write-qualification-required"
             }
@@ -1077,6 +1117,16 @@ const fn fwmark_plane_token(plane: FwmarkPlane) -> &'static str {
         FwmarkPlane::Packet => "packet",
         FwmarkPlane::Socket => "socket",
         FwmarkPlane::Conntrack => "conntrack",
+    }
+}
+
+#[cfg(any(test, flux_android_qualification))]
+const fn fwmark_use_operation_token(operation: FwmarkUseOperation) -> &'static str {
+    match operation {
+        FwmarkUseOperation::PredicateRead => "predicate-read",
+        FwmarkUseOperation::MaskedWrite => "masked-write",
+        FwmarkUseOperation::TransferRead => "transfer-read",
+        FwmarkUseOperation::TransferWrite => "transfer-write",
     }
 }
 
@@ -2182,6 +2232,35 @@ mod tests {
             class.to_string(),
             "census/authorization/ordered-late-write-qualification-mismatch"
         );
+    }
+
+    #[test]
+    fn android_planning_failure_token_retains_bounded_census_conflict_signature() {
+        let mark_use = flux_core::FwmarkUseRecord::new(
+            FwmarkEvidenceSource::Xfrm,
+            FwmarkPlane::Packet,
+            flux_core::FwmarkUseOperation::TransferRead,
+            0x0c00_0000,
+        )
+        .expect("nonzero canonical mark use");
+        let class = SystemAndroidGenerationPlanningFailureClass::Census(
+            SystemAndroidGenerationPlanningCensusFailureClass::Authorization(
+                SystemAndroidGenerationPlanningAuthorizationFailureClass::CensusConflict(Some(
+                    census_conflict_signature(mark_use, 0x0400_0000),
+                )),
+            ),
+        );
+
+        assert_eq!(
+            class.to_string(),
+            "census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0c000000/overlap-04000000"
+        );
+        assert!(class.to_string().len() <= 192);
+        assert!(class.to_string().chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '/')
+        }));
     }
     const PROFILE_SCRIPT: &[u8] = br#"#!/bin/sh
 case "$1" in

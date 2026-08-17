@@ -1136,9 +1136,55 @@ fn qualification_android_planning_failure_token(token: &str) -> Option<String> {
         {
             true
         }
+        [
+            "census",
+            "authorization",
+            "census-conflict",
+            source,
+            plane,
+            operation,
+            mask,
+            overlap,
+        ] => qualification_census_conflict_signature_is_valid(
+            source, plane, operation, mask, overlap,
+        ),
         _ => QUALIFICATION_ANDROID_PLANNING_STATIC_TOKENS.contains(&token),
     };
     valid.then(|| token.replace('/', "-"))
+}
+
+fn qualification_census_conflict_signature_is_valid(
+    source: &str,
+    plane: &str,
+    operation: &str,
+    mask: &str,
+    overlap: &str,
+) -> bool {
+    if !QUALIFICATION_FWMARK_SOURCES.contains(&source)
+        || !QUALIFICATION_FWMARK_PLANES.contains(&plane)
+        || !QUALIFICATION_FWMARK_OPERATIONS.contains(&operation)
+    {
+        return false;
+    }
+    let Some(mask) = qualification_fwmark_token_value(mask, "mask-") else {
+        return false;
+    };
+    let Some(overlap) = qualification_fwmark_token_value(overlap, "overlap-") else {
+        return false;
+    };
+    mask != 0 && overlap != 0 && overlap & !mask == 0
+}
+
+fn qualification_fwmark_token_value(token: &str, prefix: &str) -> Option<u32> {
+    let digits = token.strip_prefix(prefix)?;
+    if digits.len() != 8
+        || !digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok()
 }
 
 const QUALIFICATION_CENSUS_COLLECTION_STAGES: &[&str] = &[
@@ -1175,6 +1221,12 @@ const QUALIFICATION_FWMARK_SOURCES: &[&str] = &[
     "existing-flux-ownership",
 ];
 const QUALIFICATION_FWMARK_PLANES: &[&str] = &["packet", "socket", "conntrack"];
+const QUALIFICATION_FWMARK_OPERATIONS: &[&str] = &[
+    "predicate-read",
+    "masked-write",
+    "transfer-read",
+    "transfer-write",
+];
 const QUALIFICATION_FWMARK_COVERAGE_STATES: &[&str] = &[
     "complete-present",
     "complete-absent",
@@ -1486,6 +1538,22 @@ fn qualification_execution_script(
              *) return 1 ;;\n\
            esac\n\
          }}\n\
+         planning_fwmark_operation_allowed() {{\n\
+           case \"$1\" in\n\
+             predicate-read|masked-write|transfer-read|transfer-write) return 0 ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         planning_fwmark_value_allowed() {{\n\
+           case \"$1\" in\n\
+             ????????) ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+           case \"$1\" in\n\
+             *[!0-9a-f]*|00000000) return 1 ;;\n\
+             *) return 0 ;;\n\
+           esac\n\
+         }}\n\
          planning_coverage_state_allowed() {{\n\
            case \"$1\" in\n\
              complete-present|complete-absent|incomplete|opaque|denied|transient|unavailable) return 0 ;;\n\
@@ -1539,6 +1607,28 @@ fn qualification_execution_script(
                planning_fwmark_source_allowed \"$SOURCE\" || return 1\n\
                planning_fwmark_plane_allowed \"$PLANE\" || return 1\n\
                planning_coverage_state_allowed \"$STATE\" || return 1\n\
+               return 0\n\
+               ;;\n\
+             census/authorization/census-conflict/*/*/*/mask-*/overlap-*)\n\
+               REST=${{TOKEN#census/authorization/census-conflict/}}\n\
+               SOURCE=${{REST%%/*}}\n\
+               REST=${{REST#*/}}\n\
+               PLANE=${{REST%%/*}}\n\
+               REST=${{REST#*/}}\n\
+               OPERATION=${{REST%%/*}}\n\
+               REST=${{REST#*/}}\n\
+               MASK_FIELD=${{REST%%/*}}\n\
+               OVERLAP_FIELD=${{REST#*/}}\n\
+               MASK=${{MASK_FIELD#mask-}}\n\
+               OVERLAP=${{OVERLAP_FIELD#overlap-}}\n\
+               planning_fwmark_source_allowed \"$SOURCE\" || return 1\n\
+               planning_fwmark_plane_allowed \"$PLANE\" || return 1\n\
+               planning_fwmark_operation_allowed \"$OPERATION\" || return 1\n\
+               [ \"$MASK\" != \"$MASK_FIELD\" ] || return 1\n\
+               [ \"$OVERLAP\" != \"$OVERLAP_FIELD\" ] || return 1\n\
+               planning_fwmark_value_allowed \"$MASK\" || return 1\n\
+               planning_fwmark_value_allowed \"$OVERLAP\" || return 1\n\
+               [ $((0x$OVERLAP & ~0x$MASK)) -eq 0 ] || return 1\n\
                return 0\n\
                ;;\n\
              census/authorization/*)\n\
@@ -2560,7 +2650,7 @@ mod tests {
             .expect("planning-token helper ends");
         let helpers = &execution[start..end];
         let script = format!(
-            "set -eu\n{helpers}\nplanning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable'\n! planning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/credential'\n! planning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable/extra'\nplanning_failure_token_is_allowed 'census/external-snapshot-context-mismatch/before'\n! planning_failure_token_is_allowed 'census/external-snapshot-context-mismatch/side-channel'\n"
+            "set -eu\n{helpers}\nplanning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable'\n! planning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/credential'\n! planning_failure_token_is_allowed 'census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable/extra'\nplanning_failure_token_is_allowed 'census/external-snapshot-context-mismatch/before'\n! planning_failure_token_is_allowed 'census/external-snapshot-context-mismatch/side-channel'\nplanning_failure_token_is_allowed 'census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0c000000/overlap-04000000'\n! planning_failure_token_is_allowed 'census/authorization/census-conflict/xfrm/packet/unknown/mask-0c000000/overlap-04000000'\n! planning_failure_token_is_allowed 'census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0C000000/overlap-04000000'\n! planning_failure_token_is_allowed 'census/authorization/census-conflict/xfrm/packet/transfer-read/mask-04000000/overlap-08000000'\n"
         );
         let status = std::process::Command::new("sh")
             .arg("-c")
@@ -2653,6 +2743,10 @@ mod tests {
                 "android-planning-authority/census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable",
                 "diagnostic=qualification-daemon-exited-android-planning-authority-census-complete-noncomplete-coverage-device-mark-policy-packet-unavailable",
             ),
+            (
+                "android-planning-authority/census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0c000000/overlap-04000000",
+                "diagnostic=qualification-daemon-exited-android-planning-authority-census-authorization-census-conflict-xfrm-packet-transfer-read-mask-0c000000-overlap-04000000",
+            ),
         ] {
             let stderr = format!("FLUX_ANDROID_Q11_FAILURE={stage}\n");
             assert_eq!(
@@ -2695,6 +2789,36 @@ mod tests {
                 Some(QUALIFICATION_DAEMON_EXITED_STATUS),
                 Some(false),
                 b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/complete/noncomplete-coverage/device-mark-policy/packet/unavailable/extra\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/authorization/census-conflict/xfrm/packet/unknown/mask-0c000000/overlap-04000000\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0C000000/overlap-04000000\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0c00000/overlap-04000000\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/authorization/census-conflict/xfrm/packet/transfer-read/mask-00000000/overlap-00000000\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/authorization/census-conflict/xfrm/packet/transfer-read/mask-04000000/overlap-08000000\n".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_DAEMON_EXITED_STATUS),
+                Some(false),
+                b"FLUX_ANDROID_Q11_FAILURE=android-planning-authority/census/authorization/census-conflict/xfrm/packet/transfer-read/mask-0c000000/overlap-04000000/extra\n".as_slice(),
             ),
         ] {
             assert_eq!(

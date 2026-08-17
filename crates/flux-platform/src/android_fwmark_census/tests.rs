@@ -228,18 +228,8 @@ fn candidate_overlapping_transfer_prevents_lifetime_qualification() {
     )
     .unwrap();
     assert!(
-        observation
-            .ordered_late_writes()
-            .iter()
-            .all(|record| { record.family() != NetworkAddressFamily::Ipv4 })
-    );
-    assert_eq!(
-        observation
-            .ordered_late_writes()
-            .iter()
-            .filter(|record| record.family() == NetworkAddressFamily::Ipv6)
-            .count(),
-        3
+        observation.ordered_late_writes().is_empty(),
+        "one transfer-overlapping family invalidates shared canonical uses in both families"
     );
 }
 
@@ -256,17 +246,35 @@ fn one_unqualified_duplicate_mask_keeps_the_whole_mark_use_unqualified() {
         candidate(),
     )
     .unwrap();
-    assert_eq!(
+    let canonical_use = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::Xtables,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::MaskedWrite,
+        u32::MAX,
+    )
+    .expect("nonzero xtables packet-write mask");
+    assert!(
         observation
             .ordered_late_writes()
             .iter()
-            .filter(|record| {
-                record.family() == NetworkAddressFamily::Ipv4
-                    && record.hook() == FwmarkNetfilterBuiltinHook::Postrouting
-            })
-            .count(),
-        0
+            .all(|record| record.mark_use() != canonical_use),
+        "one unqualified occurrence must invalidate the canonical use across both families"
     );
+    assert_eq!(observation.ordered_late_writes().len(), 4);
+    for family in [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6] {
+        assert_eq!(
+            observation
+                .ordered_late_writes()
+                .iter()
+                .filter(|record| {
+                    record.family() == family
+                        && record.mark_use().source() == FwmarkEvidenceSource::AndroidNetId
+                })
+                .count(),
+            2,
+            "canonical-use invalidation must retain unrelated {family:?} qualifications"
+        );
+    }
 }
 
 #[test]

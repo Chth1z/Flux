@@ -273,6 +273,7 @@ pub fn observe_android_xtables_fwmarks(
     let mut legacy_mark_uses = BTreeSet::new();
     let mut transfer_mark_uses = BTreeSet::new();
     let mut ordered_late_writes = Vec::new();
+    let mut unqualified_ordered_late_write_uses = BTreeSet::new();
     let mut exact_mark_sentinels = Vec::new();
     let mut unqualified_exact_mark_sentinel_uses = BTreeSet::new();
 
@@ -281,10 +282,13 @@ pub fn observe_android_xtables_fwmarks(
         legacy_mark_uses.extend(evidence.legacy_mark_uses);
         transfer_mark_uses.extend(evidence.transfer_mark_uses);
         ordered_late_writes.extend(evidence.ordered_late_writes);
+        unqualified_ordered_late_write_uses.extend(evidence.unqualified_ordered_late_write_uses);
         exact_mark_sentinels.extend(evidence.exact_mark_sentinels);
         unqualified_exact_mark_sentinel_uses.extend(evidence.unqualified_exact_mark_sentinel_uses);
     }
     ordered_late_writes.sort_unstable();
+    ordered_late_writes
+        .retain(|record| !unqualified_ordered_late_write_uses.contains(&record.mark_use()));
     if ordered_late_writes
         .windows(2)
         .any(|records| records[0] == records[1])
@@ -721,6 +725,7 @@ struct FamilyMarkEvidence {
     legacy_mark_uses: BTreeSet<FwmarkUseRecord>,
     transfer_mark_uses: BTreeSet<FwmarkUseRecord>,
     ordered_late_writes: Vec<FwmarkOrderedLateWriteQualification>,
+    unqualified_ordered_late_write_uses: BTreeSet<FwmarkUseRecord>,
     exact_mark_sentinels: Vec<FwmarkExactMarkSentinelQualification>,
     unqualified_exact_mark_sentinel_uses: BTreeSet<FwmarkUseRecord>,
 }
@@ -893,6 +898,10 @@ impl ParsedRuleset {
                         .iter()
                         .filter_map(|occurrence| occurrence.qualification.clone()),
                 );
+            } else if let Some(occurrence) = occurrences.first() {
+                evidence
+                    .unqualified_ordered_late_write_uses
+                    .insert(occurrence.mark_use);
             }
         }
 

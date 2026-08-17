@@ -93,6 +93,9 @@ const PEER_NAMESPACE_REPORT_PAYLOAD_BYTES: u16 = 16;
 const PEER_NAMESPACE_REPORT_FRAME_BYTES: usize = 28;
 const QUALIFICATION_PASS_RECEIPT: &str = "FLUX_ANDROID_Q11_PASS";
 const QUALIFICATION_PASS_RECEIPT_LINE: &[u8] = b"FLUX_ANDROID_Q11_PASS\n";
+// `process_absence_function` reserves this status for an exact process-name collision.
+// Keep the value explicit so the host can expose only the bounded class, never an identity.
+const QUALIFICATION_PROCESS_NAME_COLLISION_STATUS: i32 = 72;
 const QUALIFICATION_DAEMON_EXITED_STATUS: i32 = 74;
 const QUALIFICATION_READINESS_DEADLINE_STATUS: i32 = 75;
 const QUALIFICATION_DAEMON_FAILURE_PREFIX: &[u8] = b"FLUX_ANDROID_Q11_FAILURE=";
@@ -1019,6 +1022,11 @@ fn qualification_failure_diagnostic(
         return "diagnostic=qualification-receipt-boundary".to_owned();
     }
     match status {
+        Some(QUALIFICATION_PROCESS_NAME_COLLISION_STATUS)
+            if passed.is_none() && stderr.is_empty() =>
+        {
+            "diagnostic=qualification-process-name-collision".to_owned()
+        }
         Some(QUALIFICATION_DAEMON_EXITED_STATUS) => qualification_daemon_exit_diagnostic(stderr),
         Some(QUALIFICATION_READINESS_DEADLINE_STATUS) if stderr.is_empty() => {
             "diagnostic=qualification-readiness-deadline-exceeded".to_owned()
@@ -2664,6 +2672,14 @@ mod tests {
     fn qualification_failure_classes_are_fixed_and_require_a_clean_failure_boundary() {
         assert_eq!(
             qualification_failure_diagnostic(
+                Some(QUALIFICATION_PROCESS_NAME_COLLISION_STATUS),
+                None,
+                b"",
+            ),
+            "diagnostic=qualification-process-name-collision"
+        );
+        assert_eq!(
+            qualification_failure_diagnostic(
                 Some(QUALIFICATION_DAEMON_EXITED_STATUS),
                 Some(false),
                 b"",
@@ -2759,6 +2775,16 @@ mod tests {
             );
         }
         for (status, passed, stderr) in [
+            (
+                Some(QUALIFICATION_PROCESS_NAME_COLLISION_STATUS),
+                None,
+                b"unexpected".as_slice(),
+            ),
+            (
+                Some(QUALIFICATION_PROCESS_NAME_COLLISION_STATUS),
+                Some(false),
+                b"".as_slice(),
+            ),
             (Some(73), Some(false), b"".as_slice()),
             (
                 Some(QUALIFICATION_DAEMON_EXITED_STATUS),

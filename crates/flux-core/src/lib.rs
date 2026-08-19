@@ -65,12 +65,15 @@ pub use android_mark_authority::{
     authorize_android_mark_planning,
 };
 pub use android_netd::AndroidNetdSourceProfile;
-#[cfg(flux_android_qualification)]
-pub use android_platform_profile_catalog::qualification_selector_mismatch_fields;
 pub use android_platform_profile_catalog::{
     BoundReviewedAndroidPlatformProfile, MAX_REVIEWED_ANDROID_PLATFORM_PROFILE_CATALOG_ENTRIES,
     ReviewedAndroidPlatformProfileCatalogError, ReviewedAndroidPlatformProfileCatalogField,
     ReviewedAndroidPlatformProfileSelection, select_reviewed_android_platform_profile,
+};
+#[cfg(flux_android_qualification)]
+pub use android_platform_profile_catalog::{
+    QualificationAndroidOrderedWritePreflight, qualification_android_ordered_write_preflight,
+    qualification_selector_mismatch_fields,
 };
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPriorityBand,

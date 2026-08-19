@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+default-run = "xtask"
+
+[[bin]]
+name = "android-qualification-fwmark-cohort"
+path = "src/android_qualification_fwmark_cohort.rs"
 
 [dependencies]
 flux-core = { path = "../crates/flux-core" }

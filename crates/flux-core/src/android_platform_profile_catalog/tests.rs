@@ -687,6 +687,44 @@ fn qualification_cfg_selects_only_the_exact_nonshipping_profile() {
 }
 
 #[cfg(flux_android_qualification)]
+#[test]
+fn qualification_preflight_accepts_only_one_complete_reviewed_ordered_write_cohort() {
+    let contract = qualification_android_ordered_write_preflight()
+        .expect("validated non-shipping qualification cohort contract");
+    assert_eq!(
+        contract.netd_source_profile(),
+        AndroidNetdSourceProfile::AospNetd20250324
+    );
+    assert_eq!(
+        contract.candidate(),
+        FwmarkCandidate::new(0x0c00_0000, 0x0400_0000, 0x0800_0000)
+            .expect("qualification candidate")
+    );
+
+    let primary = validate_ordered_late_writes(
+        &SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES,
+    )
+    .expect("primary reviewed cohort");
+    let alternative = validate_ordered_late_writes(
+        &SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ORDERED_WRITES_12,
+    )
+    .expect("alternative reviewed cohort");
+    assert!(contract.accepts(&primary));
+    assert!(contract.accepts(&alternative));
+    assert!(!contract.accepts(&primary[..primary.len() - 1]));
+
+    let mut reordered = primary.into_vec();
+    reordered.swap(0, 1);
+    assert!(!contract.accepts(&reordered));
+
+    let mut hybrid = alternative.into_vec();
+    hybrid.pop();
+    hybrid.push(reordered[0].clone());
+    hybrid.sort_unstable();
+    assert!(!contract.accepts(&hybrid));
+}
+
+#[cfg(flux_android_qualification)]
 fn qualification_ordered_write_projection_digest(
     records: &[FwmarkOrderedLateWriteQualification],
 ) -> [u8; 32] {

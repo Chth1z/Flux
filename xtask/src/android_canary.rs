@@ -1708,6 +1708,16 @@ pub(super) fn adb_root_shell_output(
     timeout: Duration,
     description: &str,
 ) -> Result<Output, String> {
+    adb_root_shell_output_with_limit(options, script, timeout, MAX_ADB_CAPTURE_BYTES, description)
+}
+
+pub(super) fn adb_root_shell_output_with_limit(
+    options: &Options,
+    script: &[u8],
+    timeout: Duration,
+    capture_limit: usize,
+    description: &str,
+) -> Result<Output, String> {
     let mut command = Command::new(options.adb());
     command
         .args([
@@ -1723,7 +1733,7 @@ pub(super) fn adb_root_shell_output(
         &mut command,
         Some(script),
         timeout,
-        MAX_ADB_CAPTURE_BYTES,
+        capture_limit,
         description,
     )
 }

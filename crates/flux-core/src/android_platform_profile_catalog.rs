@@ -616,6 +616,68 @@ impl ReviewedAndroidPlatformProfileSelection {
     }
 }
 
+/// Read-only contract for the exact ordered-write cohorts compiled into the non-shipping Android
+/// qualification profile.
+///
+/// This value can reject an incompatible xtables observation before a qualification transaction
+/// consumes credentials or creates a boot facility. It cannot select a platform profile, bind a
+/// topology, construct an [`AndroidMarkDevicePolicy`], or grant planning or mutation authority.
+#[cfg(flux_android_qualification)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct QualificationAndroidOrderedWritePreflight {
+    netd_source_profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
+    reviewed_cohorts: Box<[Box<[FwmarkOrderedLateWriteQualification]>]>,
+}
+
+#[cfg(flux_android_qualification)]
+impl QualificationAndroidOrderedWritePreflight {
+    #[must_use]
+    pub const fn netd_source_profile(&self) -> AndroidNetdSourceProfile {
+        self.netd_source_profile
+    }
+
+    #[must_use]
+    pub const fn candidate(&self) -> FwmarkCandidate {
+        self.candidate
+    }
+
+    /// Returns true only for byte-exact equality with one complete reviewed cohort.
+    ///
+    /// Subsets, supersets, unions, reordered records, and hybrids all reject. A positive result is
+    /// diagnostic compatibility only; the production coordinator must still repeat the complete
+    /// census and every authority check.
+    #[must_use]
+    pub fn accepts(&self, observed: &[FwmarkOrderedLateWriteQualification]) -> bool {
+        self.reviewed_cohorts
+            .iter()
+            .any(|cohort| cohort.as_ref() == observed)
+    }
+}
+
+/// Builds the read-only exact-cohort contract from the same validated catalog entry used by the
+/// non-shipping qualification daemon.
+#[cfg(flux_android_qualification)]
+pub fn qualification_android_ordered_write_preflight()
+-> Result<QualificationAndroidOrderedWritePreflight, ReviewedAndroidPlatformProfileCatalogError> {
+    let validated = validate_entry(0, &SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1)?;
+    let policy =
+        validated
+            .mark_policy
+            .ok_or(ReviewedAndroidPlatformProfileCatalogError::InvalidEntry {
+                index: 0,
+                field: ReviewedAndroidPlatformProfileCatalogField::MarkOrderedLateWrites,
+            })?;
+    let mut reviewed_cohorts = Vec::with_capacity(policy.ordered_late_write_alternatives.len() + 1);
+    reviewed_cohorts.push(policy.ordered_late_writes);
+    reviewed_cohorts.extend(policy.ordered_late_write_alternatives);
+    Ok(QualificationAndroidOrderedWritePreflight {
+        netd_source_profile: policy.netd_source_profile,
+        candidate: policy.candidate,
+        reviewed_cohorts: reviewed_cohorts.into_boxed_slice(),
+    })
+}
+
 /// Both independently reviewed aspects after exact selection and topology binding.
 #[derive(Debug, Eq, PartialEq)]
 pub struct BoundReviewedAndroidPlatformProfile {

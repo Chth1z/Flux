@@ -183,6 +183,17 @@ The bounded, read-only Android fwmark census requires an explicit ADB device and
 cargo --quiet xtask collect-android-arm64-fwmark-census --serial SERIAL --adb PROGRAM
 ```
 
+Before freezing any authority-bearing Android production-canary run, perform the exact
+qualification-only ordered-cohort preflight on the same boot:
+
+```text
+cargo --quiet xtask preflight-functional-canary-android --serial SERIAL --adb PROGRAM
+```
+
+This preflight is read-only and credential-free. It consumes no subscription input, creates no
+facility or run ID, and grants no planning or networking mutation authority; a rejected cohort
+must stop the later canary transaction.
+
 Run device probes only against a recoverable test device after reviewing the command's mutation and
 cleanup boundaries.
 

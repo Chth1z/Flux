@@ -14,9 +14,11 @@ use toml::Value;
 use super::ANDROID_RUSTFLAGS;
 use super::android_artifact::AndroidArtifactIdentity;
 use super::android_canary::{
-    DeviceProfile, Options as AndroidTargetOptions, adb_root_shell_output, command_output_bounded,
-    device_identity_function, push_artifact, revalidate_device, verify_device,
+    DeviceProfile, Options as AndroidTargetOptions, adb_root_shell_output,
+    adb_root_shell_output_with_limit, command_output_bounded, device_identity_function,
+    push_artifact, revalidate_device, verify_device,
 };
+use super::android_qualification_cohort_frame;
 use super::android_remote::{
     FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec,
     normalize_adb_shell_newlines, normalize_adb_shell_output,
@@ -30,6 +32,7 @@ use super::{
 };
 
 pub(super) const COMMAND: &str = "qualify-functional-canary-android";
+pub(super) const PREFLIGHT_COMMAND: &str = "preflight-functional-canary-android";
 
 const CLANG_TARGET: &str = "aarch64-linux-android";
 const LINKER_ENV: &str = "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER";
@@ -40,6 +43,13 @@ const QUALIFICATION_RUSTFLAGS: &str = concat!(
     "-C link-arg=-Wl,-z,common-page-size=16384 ",
     "--cfg flux_android_qualification"
 );
+const QUALIFICATION_HOST_RUSTFLAGS: &str = "--cfg flux_android_qualification";
+const QUALIFICATION_COHORT_HELPER: &str = "android-qualification-fwmark-cohort";
+const QUALIFICATION_COHORT_TARGET_DIRECTORY: &str =
+    "target/android-functional-qualification/cohort-host";
+const QUALIFICATION_COHORT_PASS: &[u8] = b"FLUX_ANDROID_Q11_COHORT_PREFLIGHT_PASS\n";
+const QUALIFICATION_COHORT_CAPTURE_LIMIT: usize =
+    android_qualification_cohort_frame::MAX_SNAPSHOT_BYTES + 1;
 
 const REMOTE_DIRECTORY_SPEC: OwnedRemoteDirectorySpec = OwnedRemoteDirectorySpec::new(
     "/data/local/tmp/flux-q11.",
@@ -75,6 +85,7 @@ const QUALIFICATION_DOWNLOAD_TIMEOUT_SECS: i64 = 60;
 const MAX_CARGO_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ADB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+const ADB_COHORT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_NAMESPACE_ABSENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const ADB_EXECUTION_TIMEOUT: Duration = Duration::from_secs(180);
 const ADB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -220,6 +231,12 @@ pub(super) fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
             .ok_or_else(|| format!("{COMMAND} requires --run-manifest FILE"))?,
         subscription,
     })
+}
+
+pub(super) fn parse_preflight_options(
+    arguments: &[OsString],
+) -> Result<AndroidTargetOptions, String> {
+    AndroidTargetOptions::parse(arguments, PREFLIGHT_COMMAND)
 }
 
 fn require_absolute_path(flag: &str, value: &OsStr) -> Result<PathBuf, String> {
@@ -370,11 +387,18 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         &options.producer,
         "manifest-bound Android Sing-Box producer",
     )?;
-    let stage = QualificationHostStage::new()?;
-    let subscription = match &options.subscription {
-        SubscriptionInput::File(path) => SecretSubscription::read_file(path)?,
-        SubscriptionInput::Stdin => SecretSubscription::read_stdin(&stage)?,
-    };
+    let root = workspace_root()?;
+    let (stage, subscription) = after_ordered_cohort_preflight(
+        || qualification_ordered_cohort_preflight(&options.target, &device, &root),
+        || {
+            let stage = QualificationHostStage::new()?;
+            let subscription = match &options.subscription {
+                SubscriptionInput::File(path) => SecretSubscription::read_file(path)?,
+                SubscriptionInput::Stdin => SecretSubscription::read_stdin(&stage)?,
+            };
+            Ok((stage, subscription))
+        },
+    )?;
 
     let ndk_root = env::var_os("ANDROID_NDK_HOME")
         .or_else(|| env::var_os("ANDROID_NDK_ROOT"))
@@ -384,7 +408,6 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         })?;
     verify_ndk_revision(&ndk_root)?;
     let linker = android_linker(&ndk_root, ANDROID_TARGET, CLANG_TARGET)?;
-    let root = workspace_root()?;
     let qualification_target = root.join(QUALIFICATION_TARGET_DIRECTORY);
     let fluxd = build_qualification_fluxd(&linker, &qualification_target)?;
     validate_aarch64_elf("qualification-only Android fluxd", &fluxd)?;
@@ -455,6 +478,190 @@ pub(super) fn run(options: Options) -> Result<(), String> {
         "Android production-canary qualification completed with exact owned-state cleanup; development evidence only"
     );
     Ok(())
+}
+
+pub(super) fn run_preflight(options: AndroidTargetOptions) -> Result<(), String> {
+    if env::consts::OS != "linux" {
+        return Err("the Android production-canary cohort preflight requires Linux/WSL".to_owned());
+    }
+    let device = verify_device(&options)?;
+    if device.target_rust_target() != ANDROID_TARGET {
+        return Err(
+            "the production-canary cohort preflight accepts only an ARM64 Android kernel and ABI"
+                .to_owned(),
+        );
+    }
+    let root = workspace_root()?;
+    qualification_ordered_cohort_preflight(&options, &device, &root)?;
+    revalidate_device(&options, &device, "after ordered-cohort preflight")?;
+    println!(
+        "Android production-canary ordered-cohort preflight passed; read-only diagnostic only"
+    );
+    Ok(())
+}
+
+fn after_ordered_cohort_preflight<T>(
+    preflight: impl FnOnce() -> Result<(), String>,
+    next: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    preflight()?;
+    next()
+}
+
+fn qualification_ordered_cohort_preflight(
+    target: &AndroidTargetOptions,
+    device: &DeviceProfile,
+    workspace: &Path,
+) -> Result<(), String> {
+    let helper = build_qualification_cohort_helper(workspace)?;
+    let before = collect_qualification_xtables_pair(target, device)?;
+    revalidate_device(target, device, "between ordered-cohort snapshots")?;
+    let after = collect_qualification_xtables_pair(target, device)?;
+    revalidate_device(target, device, "after ordered-cohort snapshots")?;
+    let frame = android_qualification_cohort_frame::encode([
+        &before.ipv4,
+        &before.ipv6,
+        &after.ipv4,
+        &after.ipv6,
+    ])
+    .map_err(|_| "qualification ordered-cohort snapshot frame is invalid".to_owned())?;
+    run_qualification_cohort_helper(&helper, &frame)
+}
+
+struct QualificationXtablesPair {
+    ipv4: Vec<u8>,
+    ipv6: Vec<u8>,
+}
+
+fn collect_qualification_xtables_pair(
+    target: &AndroidTargetOptions,
+    device: &DeviceProfile,
+) -> Result<QualificationXtablesPair, String> {
+    Ok(QualificationXtablesPair {
+        ipv4: collect_qualification_xtables_family(target, device, "iptables-save")?,
+        ipv6: collect_qualification_xtables_family(target, device, "ip6tables-save")?,
+    })
+}
+
+fn collect_qualification_xtables_family(
+    target: &AndroidTargetOptions,
+    device: &DeviceProfile,
+    tool: &'static str,
+) -> Result<Vec<u8>, String> {
+    let script = qualification_xtables_snapshot_script(device, tool);
+    let output = adb_root_shell_output_with_limit(
+        target,
+        script.as_bytes(),
+        ADB_COHORT_SNAPSHOT_TIMEOUT,
+        QUALIFICATION_COHORT_CAPTURE_LIMIT,
+        "collect read-only qualification xtables cohort snapshot",
+    )?;
+    validate_qualification_xtables_stdout(&output.stdout)?;
+    let output = normalize_adb_shell_output(output)
+        .map_err(|_| "qualification xtables cohort snapshot transport failed".to_owned())?;
+    if !output.status.success() || output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err("qualification xtables cohort snapshot was unavailable".to_owned());
+    }
+    Ok(output.stdout)
+}
+
+fn validate_qualification_xtables_stdout(stdout: &[u8]) -> Result<(), String> {
+    if stdout.len() > android_qualification_cohort_frame::MAX_SNAPSHOT_BYTES {
+        return Err(
+            "qualification xtables cohort snapshot exceeded the bounded parser input".to_owned(),
+        );
+    }
+    if stdout.is_empty() {
+        return Err("qualification xtables cohort snapshot was unavailable".to_owned());
+    }
+    Ok(())
+}
+
+fn qualification_xtables_snapshot_script(device: &DeviceProfile, tool: &'static str) -> String {
+    let tool_path = format!("/system/bin/{tool}");
+    format!(
+        "set -eu\n\
+         export PATH='{TRUSTED_ANDROID_PATH}'\n\
+         {}\
+         TOOL='{tool_path}'\n\
+         identity_matches\n\
+         [ -f \"$TOOL\" ] && [ -x \"$TOOL\" ]\n\
+         \"$TOOL\"\n\
+         identity_matches\n",
+        device_identity_function(device),
+    )
+}
+
+fn qualification_cohort_helper_build_command(workspace: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.args([
+        "build",
+        "--quiet",
+        "--release",
+        "-p",
+        "xtask",
+        "--bin",
+        QUALIFICATION_COHORT_HELPER,
+    ]);
+    command.current_dir(workspace);
+    command.env("RUSTFLAGS", QUALIFICATION_HOST_RUSTFLAGS);
+    command.env(
+        "CARGO_TARGET_DIR",
+        workspace.join(QUALIFICATION_COHORT_TARGET_DIRECTORY),
+    );
+    command.env("TMPDIR", LINUX_ANDROID_HOST_BUILD_TMPDIR);
+    command
+}
+
+fn build_qualification_cohort_helper(workspace: &Path) -> Result<PathBuf, String> {
+    let mut command = qualification_cohort_helper_build_command(workspace);
+    let output = command_output_bounded(
+        &mut command,
+        None,
+        CARGO_BUILD_TIMEOUT,
+        MAX_CARGO_CAPTURE_BYTES,
+        "build qualification ordered-cohort helper",
+    )?;
+    if !output.status.success() {
+        return Err("qualification ordered-cohort helper build failed".to_owned());
+    }
+    let helper = workspace
+        .join(QUALIFICATION_COHORT_TARGET_DIRECTORY)
+        .join("release")
+        .join(QUALIFICATION_COHORT_HELPER);
+    if helper.is_file() {
+        Ok(helper)
+    } else {
+        Err("qualification ordered-cohort helper artifact is missing".to_owned())
+    }
+}
+
+fn run_qualification_cohort_helper(helper: &Path, frame: &[u8]) -> Result<(), String> {
+    let mut command = Command::new(helper);
+    let output = command_output_bounded(
+        &mut command,
+        Some(frame),
+        ADB_COHORT_SNAPSHOT_TIMEOUT,
+        MAX_CARGO_CAPTURE_BYTES,
+        "run qualification ordered-cohort helper",
+    )?;
+    if output.status.success()
+        && output.stdout == QUALIFICATION_COHORT_PASS
+        && output.stderr.is_empty()
+    {
+        return Ok(());
+    }
+    let boundary = output
+        .status
+        .code()
+        .and_then(android_qualification_cohort_frame::ValidationBoundary::from_exit_code)
+        .map_or(
+            "helper-failure",
+            android_qualification_cohort_frame::ValidationBoundary::label,
+        );
+    Err(format!(
+        "qualification ordered-cohort preflight rejected at {boundary}"
+    ))
 }
 
 fn build_qualification_fluxd(linker: &Path, target_directory: &Path) -> Result<PathBuf, String> {
@@ -2262,6 +2469,7 @@ fn require_silent_success(output: std::process::Output, description: &str) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::process::Stdio;
 
@@ -2374,6 +2582,52 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn ordered_cohort_preflight_options_require_only_the_explicit_target() {
+        let parsed = parse_preflight_options(&[
+            OsString::from("--serial"),
+            OsString::from("device-1"),
+            OsString::from("--adb"),
+            OsString::from("/tools/adb"),
+        ])
+        .expect("read-only preflight options");
+        assert_eq!(parsed.serial(), "device-1");
+        assert_eq!(parsed.adb(), OsStr::new("/tools/adb"));
+        assert!(parse_preflight_options(&[]).is_err());
+        assert!(
+            parse_preflight_options(&[
+                OsString::from("--serial"),
+                OsString::from("device-1"),
+                OsString::from("--subscription-stdin"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_ordered_cohort_preflight_cannot_consume_the_subscription() {
+        let consumed = Cell::new(false);
+        let result = after_ordered_cohort_preflight(
+            || Err("unreviewed cohort".to_owned()),
+            || {
+                consumed.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("unreviewed cohort".to_owned()));
+        assert!(!consumed.get());
+
+        after_ordered_cohort_preflight(
+            || Ok(()),
+            || {
+                consumed.set(true);
+                Ok(())
+            },
+        )
+        .expect("reviewed cohort opens the later input boundary");
+        assert!(consumed.get());
     }
 
     #[test]
@@ -2515,6 +2769,72 @@ mod tests {
         );
         assert!(QUALIFICATION_RUSTFLAGS.starts_with(ANDROID_RUSTFLAGS));
         assert!(QUALIFICATION_RUSTFLAGS.ends_with("--cfg flux_android_qualification"));
+    }
+
+    #[test]
+    fn ordered_cohort_helper_build_is_host_isolated_and_qualification_only() {
+        let workspace = Path::new("/workspace");
+        let command = qualification_cohort_helper_build_command(workspace);
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "build",
+                "--quiet",
+                "--release",
+                "-p",
+                "xtask",
+                "--bin",
+                QUALIFICATION_COHORT_HELPER,
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(workspace));
+        let environment = command.get_envs().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new("RUSTFLAGS")),
+            Some(&Some(OsStr::new(QUALIFICATION_HOST_RUSTFLAGS)))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("CARGO_TARGET_DIR")),
+            Some(&Some(OsStr::new(
+                "/workspace/target/android-functional-qualification/cohort-host"
+            )))
+        );
+    }
+
+    #[test]
+    fn ordered_cohort_snapshot_script_is_read_only_and_identity_bound() {
+        let device = super::super::android_canary::arm64_test_device_profile();
+        let script = qualification_xtables_snapshot_script(&device, "iptables-save");
+        assert!(script.contains("identity_matches"));
+        assert!(script.contains("TOOL='/system/bin/iptables-save'"));
+        assert!(script.contains("\"$TOOL\""));
+        for mutation in [
+            "iptables-restore",
+            "ip6tables-restore",
+            " ip ",
+            " rm ",
+            "mkdir",
+        ] {
+            assert!(
+                !script.contains(mutation),
+                "unexpected mutation token {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_cohort_snapshot_rejects_raw_capture_overflow_before_normalization() {
+        let exact = vec![b'x'; android_qualification_cohort_frame::MAX_SNAPSHOT_BYTES];
+        validate_qualification_xtables_stdout(&exact).expect("parser-sized snapshot");
+        let oversized = vec![b'x'; android_qualification_cohort_frame::MAX_SNAPSHOT_BYTES + 1];
+        let error = validate_qualification_xtables_stdout(&oversized)
+            .expect_err("raw overflow must fail before CR/LF normalization");
+        assert!(error.contains("exceeded"));
+        assert!(validate_qualification_xtables_stdout(&[]).is_err());
     }
 
     #[test]

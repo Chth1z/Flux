@@ -17,6 +17,7 @@ mod android_kernel;
 mod android_mark_preflight;
 mod android_production_canary;
 mod android_profile;
+mod android_qualification_cohort_frame;
 mod android_remote;
 mod hash;
 mod platform_glue;
@@ -268,6 +269,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         android_production_canary::COMMAND => {
             android_production_canary::run(android_production_canary::parse_options(&arguments)?)
         }
+        android_production_canary::PREFLIGHT_COMMAND => android_production_canary::run_preflight(
+            android_production_canary::parse_preflight_options(&arguments)?,
+        ),
         "preflight-android-arm64-mark-ordering" => {
             android_mark_preflight::run(android_mark_preflight::parse_options(&arguments)?)
         }
@@ -2577,6 +2581,7 @@ fn print_help() {
 fn help_text() -> String {
     let android_canary_command = android_canary::COMMAND;
     let android_production_canary_command = android_production_canary::COMMAND;
+    let android_production_canary_preflight_command = android_production_canary::PREFLIGHT_COMMAND;
     format!(
         "Flux build tasks\n\n\
          Usage: cargo xtask <COMMAND>\n\n\
@@ -2596,6 +2601,7 @@ fn help_text() -> String {
            build-sing-box-producer  Validate, patch, test, and reproducibly build pinned Sing-Box; requires --source DIR --go-sdk FILE --target linux-amd64|android-arm64 --output FILE\n\
            {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial; --producer FILE adds the manifest-bound ARM64 report attempt\n\
            {android_production_canary_command}  Run the exact non-shipping production-canary path on one explicit rooted ARM64 serial; requires --producer FILE --run-manifest FILE and --subscription-file FILE|--subscription-stdin\n\
+           {android_production_canary_preflight_command}  Read-only exact reviewed ordered-cohort preflight for the non-shipping Android production canary\n\
            preflight-android-arm64-mark-ordering  Read-only ADR-0013 target viability report for one explicit rooted ARM64 Android serial\n\
            collect-android-arm64-profile  Run the production profile collector in one cleaned explicit-serial ARM64 test directory\n\
            collect-android-arm64-fwmark-census  Run the coherent read-only fwmark census in one cleaned explicit-serial ARM64 test directory\n\

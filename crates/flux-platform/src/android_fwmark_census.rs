@@ -1230,7 +1230,7 @@ impl ParsedRuleset {
             FwmarkNetfilterBuiltinHook::Input => "INPUT",
             FwmarkNetfilterBuiltinHook::Postrouting => "POSTROUTING",
         };
-        let references = self.references_to(occurrence.chain);
+        let references = self.references_to(occurrence.table, occurrence.chain);
         if references.len() != 1 {
             return Ok(None);
         }
@@ -1314,7 +1314,7 @@ impl ParsedRuleset {
         {
             return Ok(None);
         }
-        let references = self.references_to(occurrence.chain);
+        let references = self.references_to(occurrence.table, occurrence.chain);
         if references.len() != 1 {
             return Ok(None);
         }
@@ -1363,14 +1363,15 @@ impl ParsedRuleset {
         Ok(Some(record))
     }
 
-    fn references_to(&self, target: &str) -> Vec<(&str, &str, &ParsedRule)> {
+    fn references_to(&self, table: &str, target: &str) -> Vec<(&str, &str, &ParsedRule)> {
         let mut references = Vec::new();
-        for (table_name, table) in &self.tables {
-            for (chain, rules) in &table.rules {
-                for rule in rules {
-                    if rule_targets(rule, target) {
-                        references.push((table_name.as_ref(), chain.as_ref(), rule));
-                    }
+        let Some((table_name, table)) = self.tables.get_key_value(table) else {
+            return references;
+        };
+        for (chain, rules) in &table.rules {
+            for rule in rules {
+                if rule_targets(rule, target) {
+                    references.push((table_name.as_ref(), chain.as_ref(), rule));
                 }
             }
         }

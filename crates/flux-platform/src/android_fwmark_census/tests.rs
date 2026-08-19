@@ -108,6 +108,30 @@ fn inverted_or_non_prerouting_sentinel_keeps_the_canonical_mark_use_unqualified(
 }
 
 #[test]
+fn same_named_chain_in_another_table_does_not_invalidate_exact_sentinel() {
+    let exact_sentinel_fixture =
+        |family| with_exact_mark_sentinel(fixture(family, ""), "-m mark --mark 0xdeadc1a7 -j DROP");
+    let ipv4 = exact_sentinel_fixture(NetworkAddressFamily::Ipv4)
+        .replace(
+            ":INPUT ACCEPT [17:4096]\n",
+            ":INPUT ACCEPT [17:4096]\n:bw_raw_PREROUTING - [0:0]\n",
+        )
+        .replace(
+            "-A INPUT -d 0.0.0.0/0 -j ACCEPT\n",
+            "-A INPUT -d 0.0.0.0/0 -j ACCEPT\n-A INPUT -j bw_raw_PREROUTING\n",
+        );
+    let observation = observe_android_xtables_fwmarks(
+        ipv4.as_bytes(),
+        exact_sentinel_fixture(NetworkAddressFamily::Ipv6).as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        sentinel_candidate(),
+    )
+    .expect("table-local sentinel chain namespaces remain independent");
+
+    assert_eq!(observation.exact_mark_sentinels().len(), 2);
+}
+
+#[test]
 fn complete_dual_stack_projection_separates_sources_and_qualifies_exact_writes() {
     let observation = observe_android_xtables_fwmarks(
         fixture(NetworkAddressFamily::Ipv4, "").as_bytes(),
@@ -275,6 +299,82 @@ fn one_unqualified_duplicate_mask_keeps_the_whole_mark_use_unqualified() {
             "canonical-use invalidation must retain unrelated {family:?} qualifications"
         );
     }
+}
+
+#[test]
+fn same_named_chain_in_another_table_does_not_invalidate_full_mask_write() {
+    let qcom_fixture = |family| {
+        fixture(family, "").replace("vendor_mangle_POSTROUTING", "qcom_qos_reset_POSTROUTING")
+    };
+    let ipv4 = qcom_fixture(NetworkAddressFamily::Ipv4)
+        .replace(
+            ":INPUT ACCEPT [17:4096]\n",
+            ":INPUT ACCEPT [17:4096]\n:qcom_qos_reset_POSTROUTING - [0:0]\n",
+        )
+        .replace(
+            "-A INPUT -d 0.0.0.0/0 -j ACCEPT\n",
+            "-A INPUT -d 0.0.0.0/0 -j ACCEPT\n-A INPUT -j qcom_qos_reset_POSTROUTING\n",
+        );
+    let observation = observe_android_xtables_fwmarks(
+        ipv4.as_bytes(),
+        qcom_fixture(NetworkAddressFamily::Ipv6).as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        sentinel_candidate(),
+    )
+    .expect("table-local chain namespaces remain independent");
+    let full_mask_write = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::Xtables,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::MaskedWrite,
+        u32::MAX,
+    )
+    .expect("nonzero full-mask xtables write");
+    let qualifications = observation
+        .ordered_late_writes()
+        .iter()
+        .filter(|record| record.mark_use() == full_mask_write)
+        .collect::<Vec<_>>();
+
+    assert_eq!(qualifications.len(), 2);
+    for family in [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6] {
+        assert!(qualifications.iter().any(|record| {
+            record.family() == family
+                && record.hook() == FwmarkNetfilterBuiltinHook::Postrouting
+                && record.child_chain().as_str() == "qcom_qos_reset_POSTROUTING"
+        }));
+    }
+}
+
+#[test]
+fn second_reference_in_the_same_table_invalidates_full_mask_write() {
+    let qcom_fixture = |family| {
+        fixture(family, "").replace("vendor_mangle_POSTROUTING", "qcom_qos_reset_POSTROUTING")
+    };
+    let ipv4 = qcom_fixture(NetworkAddressFamily::Ipv4).replace(
+        "-A POSTROUTING -o wlan0 -j qcom_qos_reset_POSTROUTING\n",
+        "-A POSTROUTING -o wlan0 -j qcom_qos_reset_POSTROUTING\n-A POSTROUTING -o rmnet_data0 -j qcom_qos_reset_POSTROUTING\n",
+    );
+    let observation = observe_android_xtables_fwmarks(
+        ipv4.as_bytes(),
+        qcom_fixture(NetworkAddressFamily::Ipv6).as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        sentinel_candidate(),
+    )
+    .expect("duplicate same-table reference remains modeled as unqualified");
+    let full_mask_write = FwmarkUseRecord::new(
+        FwmarkEvidenceSource::Xtables,
+        FwmarkPlane::Packet,
+        FwmarkUseOperation::MaskedWrite,
+        u32::MAX,
+    )
+    .expect("nonzero full-mask xtables write");
+
+    assert!(
+        observation
+            .ordered_late_writes()
+            .iter()
+            .all(|record| record.mark_use() != full_mask_write)
+    );
 }
 
 #[test]

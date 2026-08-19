@@ -26,7 +26,6 @@ use std::convert::Infallible;
 #[cfg(test)]
 use crate::engine_supervisor::OwnedEngineIdentity;
 use crate::engine_supervisor::{EngineChildAuthority, EngineChildObservationPair};
-use crate::runtime_coordinator::CanaryAttemptObservationAuthority;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::socket_diagnostics::{
     InetSocketProtocol, ProcessSocketDiagnostics, SocketCorrelationError,
@@ -36,12 +35,13 @@ use flux_platform::{
 };
 
 use super::{
-    CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAttemptRequest, CanaryAttemptSocketObserverSession,
-    CanaryAvailability, CanaryCaptureBackend, CanaryCleanupStatus, CanaryErrorKind,
-    CanaryUserNamespaceBinding, FunctionalCanaryError, UnqualifiedCanaryCleanupEvidence,
-    UnqualifiedCanaryCounterEvidence, UnqualifiedCanaryFlowEvidenceSlots,
-    UnqualifiedCanaryGateEvidence, UnqualifiedCanaryLoopEvidence,
-    UnqualifiedFunctionalCanaryExecution, UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
+    CANARY_CREDENTIAL_MAP_DIGEST_BYTES, CanaryAttemptObservationAuthority, CanaryAttemptRequest,
+    CanaryAttemptSocketObserverSession, CanaryAvailability, CanaryCaptureBackend,
+    CanaryCleanupStatus, CanaryErrorKind, CanaryUserNamespaceBinding, FunctionalCanaryError,
+    UnqualifiedCanaryCleanupEvidence, UnqualifiedCanaryCounterEvidence,
+    UnqualifiedCanaryFlowEvidenceSlots, UnqualifiedCanaryGateEvidence,
+    UnqualifiedCanaryLoopEvidence, UnqualifiedFunctionalCanaryExecution,
+    UnqualifiedFunctionalCanaryExecutor, bounded_prefix,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use super::{
@@ -3709,30 +3709,29 @@ mod tests {
         UnqualifiedCanaryNegativeRouteControl,
     };
     use crate::generation_engine_config::EngineSupervisedDeliveryReportContract;
-    use crate::runtime_coordinator::CanarySelectorSession;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use flux_platform::ProcessHandle;
 
     struct ScriptedAttemptAuthority {
-        session: CanarySelectorSession,
+        request: CanaryAttemptRequest,
     }
 
     impl ScriptedAttemptAuthority {
         fn reserved_for(request: &CanaryAttemptRequest) -> Self {
             Self {
-                session: CanarySelectorSession::reserved_for(request),
+                request: request.clone(),
             }
         }
     }
 
     impl CanaryAttemptObservationAuthority for ScriptedAttemptAuthority {
         fn request(&self) -> &CanaryAttemptRequest {
-            self.session.request()
+            &self.request
         }
     }
 
     struct ListenerFirstAttemptAuthority {
-        session: CanarySelectorSession,
+        request: CanaryAttemptRequest,
         route_observations: Arc<AtomicUsize>,
     }
 
@@ -3742,7 +3741,7 @@ mod tests {
             route_observations: Arc<AtomicUsize>,
         ) -> Self {
             Self {
-                session: CanarySelectorSession::reserved_for(request),
+                request: request.clone(),
                 route_observations,
             }
         }
@@ -3750,7 +3749,7 @@ mod tests {
 
     impl CanaryAttemptObservationAuthority for ListenerFirstAttemptAuthority {
         fn request(&self) -> &CanaryAttemptRequest {
-            self.session.request()
+            &self.request
         }
 
         fn observe_negative_route_control(

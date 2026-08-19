@@ -31,7 +31,6 @@ use crate::engine_supervisor::EngineChildAuthority;
 use crate::generation_engine_config::{
     ENGINE_SUPERVISED_DELIVERY_REPORT_SCHEMA_VERSION, EngineCapabilityProfileRevision,
 };
-use crate::runtime_coordinator::CanaryAttemptObservationAuthority;
 use crate::{EngineArtifactSetIdentity, EngineSpec, OwnedEngineIdentity};
 
 pub(crate) const FUNCTIONAL_CANARY_SCHEMA_VERSION: u16 = 2;
@@ -5920,6 +5919,66 @@ impl fmt::Display for FunctionalCanaryError {
 }
 
 impl Error for FunctionalCanaryError {}
+
+/// Execution-scoped access to one exact writer-owned canary attempt.
+///
+/// Implementations hide selector, counter, and retained-facility resource choreography from the
+/// canary executor while keeping every observation bound to the immutable request.
+pub(crate) trait CanaryAttemptObservationAuthority {
+    fn request(&self) -> &CanaryAttemptRequest;
+
+    fn observe_negative_route_control(
+        &mut self,
+        _family: CanaryFlowAddressFamily,
+    ) -> Result<UnqualifiedCanaryNegativeRouteControl, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable("route observation"))
+    }
+
+    fn observe_baseline_counters(&mut self) -> Result<(), FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable("counter observation"))
+    }
+
+    fn take_peer_network_namespace(&mut self) -> Result<std::fs::File, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable(
+            "peer network namespace",
+        ))
+    }
+
+    fn observe_final_counters(
+        &mut self,
+        _client_reaped: ClientReapedCanaryAttemptAuthority,
+    ) -> Result<UnqualifiedCanaryCounterEvidence, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable(
+            "final counter observation",
+        ))
+    }
+
+    fn retire_counters(
+        &mut self,
+    ) -> Result<CanaryAttemptObjectRetirementEvidence, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable("counter retirement"))
+    }
+
+    fn reobserve_retained_facility(
+        &mut self,
+        _peer_reaped: &PeerReapedCanaryAttemptAuthority,
+    ) -> Result<RetainedCanaryFacilityReadback, FunctionalCanaryError> {
+        Err(canary_attempt_authority_unavailable(
+            "retained facility reobservation",
+        ))
+    }
+}
+
+pub(crate) fn canary_attempt_authority_unavailable(
+    authority: &'static str,
+) -> FunctionalCanaryError {
+    let diagnostic = format!("required native canary {authority} authority is unavailable");
+    FunctionalCanaryError::new(
+        CanaryErrorKind::InvalidEvidence,
+        CanaryCleanupStatus::Uncertain,
+        &diagnostic,
+    )
+}
 
 type SupervisedReportInstaller<'a> = Box<
     dyn FnOnce(

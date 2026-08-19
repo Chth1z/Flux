@@ -192,7 +192,9 @@ cargo --quiet xtask preflight-functional-canary-android --serial SERIAL --adb PR
 
 This preflight is read-only and credential-free. It consumes no subscription input, creates no
 facility or run ID, and grants no planning or networking mutation authority; a rejected cohort
-must stop the later canary transaction.
+must stop the later canary transaction. Rejection may include only a fixed relation class and
+bounded observed/expected/missing/additional/tie counts. Those identity-free diagnostics neither
+expose rules nor justify a new cohort or grant.
 
 Run device probes only against a recoverable test device after reviewing the command's mutation and
 cleanup boundaries.

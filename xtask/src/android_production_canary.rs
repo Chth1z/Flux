@@ -5,7 +5,7 @@ use std::io::{BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use toml::Value;
@@ -621,7 +621,8 @@ fn build_qualification_cohort_helper(workspace: &Path) -> Result<PathBuf, String
         CARGO_BUILD_TIMEOUT,
         MAX_CARGO_CAPTURE_BYTES,
         "build qualification ordered-cohort helper",
-    )?;
+    )
+    .map_err(|_| "qualification ordered-cohort helper build failed".to_owned())?;
     if !output.status.success() {
         return Err("qualification ordered-cohort helper build failed".to_owned());
     }
@@ -644,21 +645,47 @@ fn run_qualification_cohort_helper(helper: &Path, frame: &[u8]) -> Result<(), St
         ADB_COHORT_SNAPSHOT_TIMEOUT,
         MAX_CARGO_CAPTURE_BYTES,
         "run qualification ordered-cohort helper",
-    )?;
+    )
+    .map_err(|_| "qualification ordered-cohort preflight rejected at helper-failure".to_owned())?;
+    classify_qualification_cohort_helper_output(&output)
+}
+
+fn classify_qualification_cohort_helper_output(output: &Output) -> Result<(), String> {
     if output.status.success()
         && output.stdout == QUALIFICATION_COHORT_PASS
         && output.stderr.is_empty()
     {
         return Ok(());
     }
-    let boundary = output
-        .status
-        .code()
-        .and_then(android_qualification_cohort_frame::ValidationBoundary::from_exit_code)
-        .map_or(
-            "helper-failure",
-            android_qualification_cohort_frame::ValidationBoundary::label,
-        );
+    if !output.stderr.is_empty() {
+        return Err("qualification ordered-cohort preflight rejected at helper-failure".to_owned());
+    }
+    let boundary = output.status.code().and_then(|code| {
+        let boundary =
+            android_qualification_cohort_frame::ValidationBoundary::from_exit_code(code)?;
+        if boundary == android_qualification_cohort_frame::ValidationBoundary::UnreviewedCohort {
+            let summary =
+                android_qualification_cohort_frame::parse_mismatch_receipt(&output.stdout)?;
+            if summary.relation() == android_qualification_cohort_frame::MismatchRelation::Exact {
+                return None;
+            }
+            Some(format!(
+                "{}-{}-observed-{}-expected-{}-missing-{}-additional-{}-ties-{}",
+                boundary.label(),
+                summary.relation().label(),
+                summary.observed_count(),
+                summary.expected_count(),
+                summary.missing_count(),
+                summary.additional_count(),
+                summary.equally_close_cohort_count(),
+            ))
+        } else if output.stdout.is_empty() {
+            Some(boundary.label().to_owned())
+        } else {
+            None
+        }
+    });
+    let boundary = boundary.as_deref().unwrap_or("helper-failure");
     Err(format!(
         "qualification ordered-cohort preflight rejected at {boundary}"
     ))
@@ -2471,6 +2498,8 @@ fn require_silent_success(output: std::process::Output, description: &str) -> Re
 mod tests {
     use std::cell::Cell;
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt as _;
     use std::process::Stdio;
 
     use super::*;
@@ -2835,6 +2864,60 @@ mod tests {
             .expect_err("raw overflow must fail before CR/LF normalization");
         assert!(error.contains("exceeded"));
         assert!(validate_qualification_xtables_stdout(&[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordered_cohort_helper_result_accepts_only_the_closed_mismatch_receipt() {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(73 << 8),
+            stdout: b"FLUX_ANDROID_Q11_COHORT_MISMATCH=missing-only:6:10:4:0:1\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            classify_qualification_cohort_helper_output(&output),
+            Err("qualification ordered-cohort preflight rejected at unreviewed-ordered-cohort-missing-only-observed-6-expected-10-missing-4-additional-0-ties-1".to_owned())
+        );
+
+        for (stdout, stderr) in [
+            (b"raw rule detail\n".as_slice(), b"".as_slice()),
+            (
+                b"FLUX_ANDROID_Q11_COHORT_MISMATCH=missing-only:06:10:4:0:1\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                b"FLUX_ANDROID_Q11_COHORT_MISMATCH=missing-only:6:10:4:0:1\n".as_slice(),
+                b"private stderr".as_slice(),
+            ),
+        ] {
+            let malformed = Output {
+                status: std::process::ExitStatus::from_raw(73 << 8),
+                stdout: stdout.to_vec(),
+                stderr: stderr.to_vec(),
+            };
+            let error = classify_qualification_cohort_helper_output(&malformed)
+                .expect_err("malformed helper output must fail closed");
+            assert_eq!(
+                error,
+                "qualification ordered-cohort preflight rejected at helper-failure"
+            );
+            assert!(!error.contains("raw rule"));
+            assert!(!error.contains("private stderr"));
+        }
+    }
+
+    #[test]
+    fn ordered_cohort_helper_execution_errors_are_redacted() {
+        let error = run_qualification_cohort_helper(
+            Path::new("/definitely-missing-flux-qualification-helper"),
+            &[],
+        )
+        .expect_err("missing helper must fail closed");
+        assert_eq!(
+            error,
+            "qualification ordered-cohort preflight rejected at helper-failure"
+        );
+        assert!(!error.contains("definitely-missing"));
     }
 
     #[test]

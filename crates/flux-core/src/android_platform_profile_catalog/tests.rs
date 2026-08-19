@@ -713,15 +713,72 @@ fn qualification_preflight_accepts_only_one_complete_reviewed_ordered_write_coho
     assert!(contract.accepts(&alternative));
     assert!(!contract.accepts(&primary[..primary.len() - 1]));
 
-    let mut reordered = primary.into_vec();
+    let exact = contract.compare(&primary);
+    assert_eq!(
+        exact.relation(),
+        QualificationAndroidOrderedWriteRelation::Exact
+    );
+    assert_eq!(exact.observed_count(), 10);
+    assert_eq!(exact.expected_count(), 10);
+    assert_eq!(exact.missing_count(), 0);
+    assert_eq!(exact.additional_count(), 0);
+    assert_eq!(exact.equally_close_cohort_count(), 1);
+
+    let missing = contract.compare(&primary[..primary.len() - 1]);
+    assert_eq!(
+        missing.relation(),
+        QualificationAndroidOrderedWriteRelation::MissingOnly
+    );
+    assert_eq!(missing.missing_count(), 1);
+    assert_eq!(missing.additional_count(), 0);
+
+    let mut additional = primary.to_vec();
+    additional.push(primary[0].clone());
+    let additional = contract.compare(&additional);
+    assert_eq!(
+        additional.relation(),
+        QualificationAndroidOrderedWriteRelation::AdditionalOnly
+    );
+    assert_eq!(additional.missing_count(), 0);
+    assert_eq!(additional.additional_count(), 1);
+
+    let mut reordered = primary.to_vec();
     reordered.swap(0, 1);
     assert!(!contract.accepts(&reordered));
+    assert_eq!(
+        contract.compare(&reordered).relation(),
+        QualificationAndroidOrderedWriteRelation::OrderOnly
+    );
 
-    let mut hybrid = alternative.into_vec();
+    let mut substituted = primary.to_vec();
+    substituted.pop();
+    substituted.push(substituted[0].clone());
+    let substituted = contract.compare(&substituted);
+    assert_eq!(
+        substituted.relation(),
+        QualificationAndroidOrderedWriteRelation::Substitution
+    );
+    assert_eq!(substituted.missing_count(), 1);
+    assert_eq!(substituted.additional_count(), 1);
+
+    let mut hybrid = alternative.to_vec();
     hybrid.pop();
     hybrid.push(reordered[0].clone());
     hybrid.sort_unstable();
     assert!(!contract.accepts(&hybrid));
+
+    let extra = alternative
+        .iter()
+        .find(|record| !primary.contains(record))
+        .expect("alternative-only record")
+        .clone();
+    let mut ambiguous = primary.to_vec();
+    ambiguous.push(extra);
+    ambiguous.sort_unstable();
+    assert_eq!(
+        contract.compare(&ambiguous).relation(),
+        QualificationAndroidOrderedWriteRelation::Ambiguous
+    );
 }
 
 #[cfg(flux_android_qualification)]

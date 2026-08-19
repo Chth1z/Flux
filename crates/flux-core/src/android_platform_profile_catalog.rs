@@ -623,6 +623,65 @@ impl ReviewedAndroidPlatformProfileSelection {
 /// consumes credentials or creates a boot facility. It cannot select a platform profile, bind a
 /// topology, construct an [`AndroidMarkDevicePolicy`], or grant planning or mutation authority.
 #[cfg(flux_android_qualification)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QualificationAndroidOrderedWriteRelation {
+    Exact,
+    MissingOnly,
+    AdditionalOnly,
+    OrderOnly,
+    Substitution,
+    Ambiguous,
+}
+
+/// Identity-free difference from the nearest reviewed ordered-write cohort.
+///
+/// Counts are bounded by the ordered-write constructor limit. No record, chain, selector, device,
+/// or namespace identity crosses this qualification-only diagnostic boundary.
+#[cfg(flux_android_qualification)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QualificationAndroidOrderedWriteComparison {
+    relation: QualificationAndroidOrderedWriteRelation,
+    observed_count: usize,
+    expected_count: usize,
+    missing_count: usize,
+    additional_count: usize,
+    equally_close_cohort_count: usize,
+}
+
+#[cfg(flux_android_qualification)]
+impl QualificationAndroidOrderedWriteComparison {
+    #[must_use]
+    pub const fn relation(self) -> QualificationAndroidOrderedWriteRelation {
+        self.relation
+    }
+
+    #[must_use]
+    pub const fn observed_count(self) -> usize {
+        self.observed_count
+    }
+
+    #[must_use]
+    pub const fn expected_count(self) -> usize {
+        self.expected_count
+    }
+
+    #[must_use]
+    pub const fn missing_count(self) -> usize {
+        self.missing_count
+    }
+
+    #[must_use]
+    pub const fn additional_count(self) -> usize {
+        self.additional_count
+    }
+
+    #[must_use]
+    pub const fn equally_close_cohort_count(self) -> usize {
+        self.equally_close_cohort_count
+    }
+}
+
+#[cfg(flux_android_qualification)]
 #[derive(Debug, Eq, PartialEq)]
 pub struct QualificationAndroidOrderedWritePreflight {
     netd_source_profile: AndroidNetdSourceProfile,
@@ -653,6 +712,116 @@ impl QualificationAndroidOrderedWritePreflight {
             .iter()
             .any(|cohort| cohort.as_ref() == observed)
     }
+
+    /// Reduces an exact rejection to bounded counts and one fixed relation class.
+    ///
+    /// The closest cohort minimizes the total missing-plus-additional multiset distance. A tie is
+    /// deliberately ambiguous; the result never exposes either cohort's records.
+    #[must_use]
+    pub fn compare(
+        &self,
+        observed: &[FwmarkOrderedLateWriteQualification],
+    ) -> QualificationAndroidOrderedWriteComparison {
+        if let Some(exact) = self
+            .reviewed_cohorts
+            .iter()
+            .find(|cohort| cohort.as_ref() == observed)
+        {
+            return QualificationAndroidOrderedWriteComparison {
+                relation: QualificationAndroidOrderedWriteRelation::Exact,
+                observed_count: observed.len(),
+                expected_count: exact.len(),
+                missing_count: 0,
+                additional_count: 0,
+                equally_close_cohort_count: 1,
+            };
+        }
+
+        let mut sorted_observed = observed.to_vec();
+        sorted_observed.sort_unstable();
+        let mut nearest: Option<(
+            usize,
+            usize,
+            usize,
+            usize,
+            QualificationAndroidOrderedWriteRelation,
+        )> = None;
+        let mut equally_close_cohort_count = 0_usize;
+        for cohort in &self.reviewed_cohorts {
+            let (missing_count, additional_count) =
+                ordered_write_multiset_difference(cohort, &sorted_observed);
+            let distance = missing_count + additional_count;
+            let relation = if distance == 0 {
+                QualificationAndroidOrderedWriteRelation::OrderOnly
+            } else if missing_count == 0 {
+                QualificationAndroidOrderedWriteRelation::AdditionalOnly
+            } else if additional_count == 0 {
+                QualificationAndroidOrderedWriteRelation::MissingOnly
+            } else {
+                QualificationAndroidOrderedWriteRelation::Substitution
+            };
+            match nearest {
+                Some((nearest_distance, _, _, _, _)) if distance > nearest_distance => {}
+                Some((nearest_distance, _, _, _, _)) if distance == nearest_distance => {
+                    equally_close_cohort_count += 1;
+                }
+                _ => {
+                    nearest = Some((
+                        distance,
+                        cohort.len(),
+                        missing_count,
+                        additional_count,
+                        relation,
+                    ));
+                    equally_close_cohort_count = 1;
+                }
+            }
+        }
+        let (_, expected_count, missing_count, additional_count, nearest_relation) =
+            nearest.expect("qualification contract always contains its primary reviewed cohort");
+        QualificationAndroidOrderedWriteComparison {
+            relation: if equally_close_cohort_count == 1 {
+                nearest_relation
+            } else {
+                QualificationAndroidOrderedWriteRelation::Ambiguous
+            },
+            observed_count: observed.len(),
+            expected_count,
+            missing_count,
+            additional_count,
+            equally_close_cohort_count,
+        }
+    }
+}
+
+#[cfg(flux_android_qualification)]
+fn ordered_write_multiset_difference(
+    expected: &[FwmarkOrderedLateWriteQualification],
+    observed: &[FwmarkOrderedLateWriteQualification],
+) -> (usize, usize) {
+    let mut expected_index = 0_usize;
+    let mut observed_index = 0_usize;
+    let mut missing_count = 0_usize;
+    let mut additional_count = 0_usize;
+    while expected_index < expected.len() && observed_index < observed.len() {
+        match expected[expected_index].cmp(&observed[observed_index]) {
+            std::cmp::Ordering::Less => {
+                missing_count += 1;
+                expected_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                expected_index += 1;
+                observed_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                additional_count += 1;
+                observed_index += 1;
+            }
+        }
+    }
+    missing_count += expected.len().saturating_sub(expected_index);
+    additional_count += observed.len().saturating_sub(observed_index);
+    (missing_count, additional_count)
 }
 
 /// Builds the read-only exact-cohort contract from the same validated catalog entry used by the

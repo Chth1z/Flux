@@ -60,9 +60,9 @@ pub use android_mark_authority::{
     FwmarkUseOperation, FwmarkUseRecord, FwmarkUseRecordError,
     MAX_ANDROID_MARK_DEVICE_POLICY_NAME_BYTES, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
     MAX_EXACT_MARK_SENTINEL_QUALIFICATIONS, MAX_FWMARK_NETFILTER_CHAIN_NAME_BYTES,
-    MAX_ORDERED_LATE_PACKET_WRITES, OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity,
-    OwnershipJournalIdentityError, OwnershipJournalRevision, ReviewedPolicyCatalogEntryId,
-    authorize_android_mark_planning,
+    MAX_ORDERED_LATE_PACKET_WRITES, MAX_REVIEWED_ORDERED_LATE_WRITE_COHORTS,
+    OWNERSHIP_JOURNAL_IDENTITY_BYTES, OwnershipJournalIdentity, OwnershipJournalIdentityError,
+    OwnershipJournalRevision, ReviewedPolicyCatalogEntryId, authorize_android_mark_planning,
 };
 pub use android_netd::AndroidNetdSourceProfile;
 pub use android_platform_profile_catalog::{
@@ -72,7 +72,8 @@ pub use android_platform_profile_catalog::{
 };
 #[cfg(flux_android_qualification)]
 pub use android_platform_profile_catalog::{
-    QualificationAndroidOrderedWritePreflight, qualification_android_ordered_write_preflight,
+    QualificationAndroidOrderedWriteComparison, QualificationAndroidOrderedWritePreflight,
+    QualificationAndroidOrderedWriteRelation, qualification_android_ordered_write_preflight,
     qualification_selector_mismatch_fields,
 };
 pub use android_rpdb::{

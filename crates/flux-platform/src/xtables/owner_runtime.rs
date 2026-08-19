@@ -36,7 +36,7 @@ use crate::xtables::native_capture::{
     NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterRetirement,
     NativeCaptureCanaryCounterSnapshot, NativeCaptureCanaryRouteOutcome,
     NativeCaptureCanaryRouteQuery, NativeCaptureCanarySelector, NativeCaptureOwnershipObservation,
-    NativeCaptureTargetIdentity,
+    NativeCaptureRetainedOwner, NativeCaptureTargetIdentity,
 };
 
 const OWNER_PAYLOAD_SCHEMA: u16 = 3;
@@ -2012,7 +2012,7 @@ where
         if self.durable.load_attempt()?.is_some() {
             return Err(NativeXtablesOwnerError::AttemptRecoveryRequired);
         }
-        Ok(Some(public_ownership_observation(before, identity)))
+        Ok(Some(public_ownership_observation(before, &target)))
     }
 
     fn populate_canary_selector(
@@ -3946,16 +3946,30 @@ where
 
 fn public_ownership_observation(
     observation: NativeXtablesJournalObservation,
-    target: NativeXtablesTargetIdentity,
+    target: &NativeXtablesAdmittedTarget,
 ) -> NativeCaptureOwnershipObservation {
     let binding = observation.record().binding();
+    let identity = target.identity();
+    let public_target = NativeCaptureTargetIdentity::new(
+        identity.generation(),
+        identity.target_digest(),
+        identity.tool_digest(),
+        identity.routing_digest(),
+    );
+    let retained_owner = NativeCaptureRetainedOwner::new(
+        public_target,
+        target
+            .topology()
+            .family(XtablesRestoreFamily::Ipv4)
+            .map(|family| family.active_state().clone()),
+        target
+            .topology()
+            .family(XtablesRestoreFamily::Ipv6)
+            .map(|family| family.active_state().clone()),
+        target.routing().iter().copied(),
+    );
     NativeCaptureOwnershipObservation::new(
-        NativeCaptureTargetIdentity::new(
-            target.generation(),
-            target.target_digest(),
-            target.tool_digest(),
-            target.routing_digest(),
-        ),
+        public_target,
         binding.boot_identity().clone(),
         binding.network_namespace(),
         binding.journal_identity(),
@@ -3965,6 +3979,7 @@ fn public_ownership_observation(
         observation.file_device(),
         observation.file_inode(),
         observation.digest(),
+        retained_owner,
     )
 }
 
@@ -4170,6 +4185,7 @@ pub use runtime_writer::{
 pub(crate) use target_archive::{
     DurableNativeXtablesTargetResolver, NativeXtablesTargetArchiveError,
     NativeXtablesTargetArchiveObservation, observe_native_xtables_target_archive,
+    observe_native_xtables_target_archive_for_active_owner,
 };
 
 #[cfg(test)]

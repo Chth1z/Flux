@@ -11,18 +11,24 @@ mod restore;
 #[allow(dead_code)]
 mod save;
 
-pub(crate) use save::is_flux_owned_chain;
+#[cfg(test)]
+pub(crate) use save::XtablesExpectedStatePhase;
+pub(crate) use save::{
+    XtablesExpectedState, XtablesRetainedMatcher, is_flux_owned_chain, project_xtables_save,
+};
 
 pub(crate) use native::collect_android_xtables_save_snapshots;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use owner::{
     NativeXtablesTargetArchiveObservation, observe_native_xtables_target_archive,
+    observe_native_xtables_target_archive_for_active_owner,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use owner_durable::{
-    NativeXtablesDurableReadOnlyObservation, NativeXtablesDurableRootIdentity,
-    NativeXtablesDurableStore,
+    NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION, NativeXtablesDurableReadOnlyObservation,
+    NativeXtablesDurableRootIdentity, NativeXtablesDurableStore, NativeXtablesJournalObservation,
+    NativeXtablesJournalPhase, NativeXtablesLeaseScope,
 };
 
 pub use lowering::{
@@ -41,6 +47,8 @@ pub use lowering::{
     XtablesTransparentListenerRequirement, lower_xtables_capture,
 };
 
+#[cfg(test)]
+pub(crate) use native_capture::NativeCaptureRetainedOwner;
 pub use native_capture::{
     NativeCaptureCanaryAttempt, NativeCaptureCanaryCounterRetirement,
     NativeCaptureCanaryCounterSnapshot, NativeCaptureCanaryRouteObservation,

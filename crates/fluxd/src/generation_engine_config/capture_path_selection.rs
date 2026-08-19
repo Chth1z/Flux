@@ -3,9 +3,10 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use flux_core::{
-    AddressHostFamilySelection, CAPTURE_PATH_COUNT, CaptureConfig, CapturePathBehavioralEvidence,
-    CapturePathId, CapturePathQualificationState, CapturePathQualifications, CapturePathRequest,
-    CaptureTrafficDomain, CaptureTransportProtocol, ImplementedCaptureAdapters,
+    AddressHostFamilySelection, CAPTURE_PATH_COUNT, CapabilityProfile, CaptureConfig,
+    CapturePathBehavioralEvidence, CapturePathId, CapturePathQualificationState,
+    CapturePathQualifications, CapturePathRequest, CaptureTrafficDomain, CaptureTransportProtocol,
+    ImplementedCaptureAdapters, NetworkNamespaceIdentity,
 };
 use flux_platform::{
     AndroidCapturePathState, AndroidKernelConfigSnapshot, AndroidKernelFeature,
@@ -142,6 +143,21 @@ impl CapturePathQualificationEvidence {
             }
             #[cfg(test)]
             CapturePathQualificationSource::HostInspection(_) => None,
+        }
+    }
+
+    pub(crate) fn matches_runtime_context(
+        &self,
+        capability_profile: &CapabilityProfile,
+        network_namespace: NetworkNamespaceIdentity,
+    ) -> bool {
+        match &self.source {
+            CapturePathQualificationSource::Android(evidence) => {
+                evidence.capability_profile_digest() == capability_profile.digest()
+                    && evidence.network_namespace() == network_namespace
+            }
+            #[cfg(test)]
+            CapturePathQualificationSource::HostInspection(_) => true,
         }
     }
 }

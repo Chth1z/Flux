@@ -4,10 +4,10 @@ use std::num::{NonZeroI32, NonZeroU32};
 
 use flux_core::{
     FwmarkCandidate, FwmarkRole, InterfaceIndex, InterfaceName, NetworkAddressFamily,
-    NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath, RoutePreference, RoutePrefix,
-    RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RpdbFamilyPlacement,
-    RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority, RuleProperties, RuleProtocol,
-    RuleTableId,
+    NetworkInventory, NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath,
+    RoutePreference, RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId,
+    RouteType, RpdbFamilyPlacement, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority,
+    RuleProperties, RuleProtocol, RuleTableId,
 };
 
 use super::route::{InterfaceRouteEvent, RouteEventDecodeErrorKind, RtnetlinkRouteEventDecoder};
@@ -344,6 +344,26 @@ impl ManagedPolicyRoutingIdentity {
     #[must_use]
     pub(crate) const fn rule(self) -> ManagedFwmarkRuleIdentity {
         self.rule
+    }
+
+    /// Returns whether a semantic inventory route is the complete managed route identity.
+    ///
+    /// This intentionally compares the complete canonical record, including path, protocol,
+    /// scope, type, metric, and family-specific preference.  Callers must still count matching
+    /// and conflicting occurrences; one exact match does not make duplicate state safe.
+    #[must_use]
+    pub(crate) fn matches_route_record(self, record: &NetworkRouteRecord) -> bool {
+        expected_route_record(self.route) == *record
+    }
+
+    /// Returns whether a semantic inventory rule is the complete managed rule identity.
+    ///
+    /// Extra selectors, attributes, and rule actions are therefore conflicts rather than a
+    /// partially matching owner.  Callers must still count every occurrence at the managed
+    /// priority or table.
+    #[must_use]
+    pub(crate) fn matches_rule_record(self, record: &NetworkRuleRecord) -> bool {
+        expected_rule_record(self.rule) == *record
     }
 
     pub(crate) fn from_recovery(
@@ -1104,6 +1124,100 @@ impl ManagedPolicyRoutingObservation {
     pub(crate) const fn rule(self) -> ManagedObjectObservation {
         self.rule
     }
+
+    #[must_use]
+    pub(crate) const fn exact(self) -> bool {
+        self.route.exact_count == 1
+            && self.route.conflict_count == 0
+            && self.rule.exact_count == 1
+            && self.rule.conflict_count == 0
+    }
+}
+
+/// Counts exact and conflicting semantic route/rule occurrences for one retained owner.
+///
+/// Network inventories retain route/rule order and multiplicity.  This helper deliberately does
+/// not deduplicate them: an active owner is consumable only when both its route and rule occur
+/// exactly once and no same-coordinate conflict is present.
+pub(crate) fn observe_managed_policy_routing_inventory(
+    inventory: &NetworkInventory,
+    identity: ManagedPolicyRoutingIdentity,
+) -> ManagedPolicyRoutingObservation {
+    let route_exact = inventory
+        .routes()
+        .iter()
+        .filter(|record| identity.matches_route_record(record))
+        .count();
+    let route_candidates = inventory
+        .routes()
+        .iter()
+        .filter(|record| {
+            record.destination().family() == identity.family()
+                && record.properties().table() == identity.route().table()
+        })
+        .count();
+    let rule_exact = inventory
+        .rules()
+        .iter()
+        .filter(|record| identity.matches_rule_record(record))
+        .count();
+    let rule_candidates = inventory
+        .rules()
+        .iter()
+        .filter(|record| {
+            record.destination().family() == identity.family()
+                && (record.priority() == identity.rule().priority()
+                    || record.properties().table().get() == identity.rule().table().get())
+        })
+        .count();
+
+    ManagedPolicyRoutingObservation {
+        route: ManagedObjectObservation {
+            exact_count: route_exact,
+            conflict_count: route_candidates.saturating_sub(route_exact),
+        },
+        rule: ManagedObjectObservation {
+            exact_count: rule_exact,
+            conflict_count: rule_candidates.saturating_sub(rule_exact),
+        },
+    }
+}
+
+/// Returns the one semantic RPDB rule index consumable by an exact retained owner.
+///
+/// The route is checked as part of the same observation.  A duplicate exact rule, a same-table
+/// route substitution, or any other same-coordinate conflict returns `None`, so callers cannot
+/// accidentally hide ambiguous state by removing the first matching rule.
+pub(crate) fn exact_managed_rule_index(
+    inventory: &NetworkInventory,
+    identity: ManagedPolicyRoutingIdentity,
+) -> Option<usize> {
+    let observation = observe_managed_policy_routing_inventory(inventory, identity);
+    if !observation.exact() {
+        return None;
+    }
+    inventory
+        .rules()
+        .iter()
+        .position(|record| identity.matches_rule_record(record))
+}
+
+/// Returns the one semantic route index consumable by an exact retained owner.
+///
+/// The rule is checked as part of the same observation.  A duplicate exact route, a same-coordinate
+/// rule substitution, or any other same-coordinate conflict returns `None`.
+pub(crate) fn exact_managed_route_index(
+    inventory: &NetworkInventory,
+    identity: ManagedPolicyRoutingIdentity,
+) -> Option<usize> {
+    let observation = observe_managed_policy_routing_inventory(inventory, identity);
+    if !observation.exact() {
+        return None;
+    }
+    inventory
+        .routes()
+        .iter()
+        .position(|record| identity.matches_route_record(record))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

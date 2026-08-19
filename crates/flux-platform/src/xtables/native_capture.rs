@@ -5,9 +5,12 @@ use std::num::{NonZeroI32, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::time::Instant;
 
 use flux_core::{
-    BootIdentity, GenerationId, NetworkNamespaceIdentity, OwnershipJournalIdentity,
-    OwnershipJournalRevision, RouteTableId,
+    BootIdentity, GenerationId, NetworkAddressFamily, NetworkNamespaceIdentity,
+    OwnershipJournalIdentity, OwnershipJournalRevision, RouteTableId,
 };
+
+use super::save::XtablesExpectedState;
+use crate::netlink::policy_routing::ManagedPolicyRoutingIdentity;
 
 /// Opaque identity of one exact native capture target.
 ///
@@ -62,7 +65,7 @@ impl NativeCaptureTargetIdentity {
 ///
 /// Construction remains platform-private. The value carries no writer, lease, target, or cleanup
 /// authority and can only be observed through [`NativeCaptureConvergence`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NativeCaptureOwnershipObservation {
     target: NativeCaptureTargetIdentity,
     boot_identity: BootIdentity,
@@ -73,6 +76,76 @@ pub struct NativeCaptureOwnershipObservation {
     record_device: u64,
     record_inode: NonZeroU64,
     record_digest: [u8; 32],
+    retained_owner: NativeCaptureRetainedOwner,
+}
+
+impl fmt::Debug for NativeCaptureOwnershipObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeCaptureOwnershipObservation")
+            .field("target", &self.target)
+            .field("boot_identity", &self.boot_identity)
+            .field("network_namespace", &self.network_namespace)
+            .field("journal_identity", &self.journal_identity)
+            .field("journal_revision", &self.journal_revision)
+            .field("record_schema_version", &self.record_schema_version)
+            .field("record_device", &self.record_device)
+            .field("record_inode", &self.record_inode)
+            .field("record_digest", &self.record_digest)
+            .field("retained_owner", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Opaque, read-only ownership cohort minted only after an exact active native readback.
+///
+/// The cohort carries the target's private xtables expectations and exact managed routing
+/// identities. It is intentionally non-authorizing: it can only narrow a census projection, and
+/// it cannot be used to restore, converge, or open any durable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeCaptureRetainedOwner {
+    target: NativeCaptureTargetIdentity,
+    ipv4: Option<XtablesExpectedState>,
+    ipv6: Option<XtablesExpectedState>,
+    routing: Box<[ManagedPolicyRoutingIdentity]>,
+}
+
+impl NativeCaptureRetainedOwner {
+    pub(crate) fn new(
+        target: NativeCaptureTargetIdentity,
+        ipv4: Option<XtablesExpectedState>,
+        ipv6: Option<XtablesExpectedState>,
+        routing: impl IntoIterator<Item = ManagedPolicyRoutingIdentity>,
+    ) -> Self {
+        Self {
+            target,
+            ipv4,
+            ipv6,
+            routing: routing.into_iter().collect(),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn target(&self) -> NativeCaptureTargetIdentity {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn xtables_expected_state(
+        &self,
+        family: NetworkAddressFamily,
+    ) -> Option<&XtablesExpectedState> {
+        match family {
+            NetworkAddressFamily::Ipv4 => self.ipv4.as_ref(),
+            NetworkAddressFamily::Ipv6 => self.ipv6.as_ref(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn routing(&self) -> &[ManagedPolicyRoutingIdentity] {
+        &self.routing
+    }
 }
 
 impl NativeCaptureOwnershipObservation {
@@ -88,6 +161,7 @@ impl NativeCaptureOwnershipObservation {
         record_device: u64,
         record_inode: NonZeroU64,
         record_digest: [u8; 32],
+        retained_owner: NativeCaptureRetainedOwner,
     ) -> Self {
         Self {
             target,
@@ -99,6 +173,7 @@ impl NativeCaptureOwnershipObservation {
             record_device,
             record_inode,
             record_digest,
+            retained_owner,
         }
     }
 
@@ -145,6 +220,11 @@ impl NativeCaptureOwnershipObservation {
     #[must_use]
     pub const fn record_digest(&self) -> [u8; 32] {
         self.record_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn retained_owner(&self) -> &NativeCaptureRetainedOwner {
+        &self.retained_owner
     }
 }
 

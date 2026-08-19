@@ -6,7 +6,9 @@ use crate::android_mark_authority::{
     FwmarkUseRecord, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
 };
 use crate::android_netd::AndroidNetdSourceProfile;
-use crate::android_rpdb::AndroidRpdbClassificationReport;
+use crate::android_rpdb::{
+    AndroidRpdbClassificationReport, AndroidRpdbRetainedOwner, AndroidRpdbRetainedOwnerError,
+};
 use crate::fwmark_audit::{ANDROID_NET_ID_FWMARK_MASK, FwmarkEvidenceSource};
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 
@@ -192,6 +194,7 @@ pub enum RpdbFwmarkCensusFragmentError {
         maximum: usize,
         required_at_least: usize,
     },
+    RetainedOwner(AndroidRpdbRetainedOwnerError),
 }
 
 impl fmt::Display for RpdbFwmarkCensusFragmentError {
@@ -217,6 +220,7 @@ impl fmt::Display for RpdbFwmarkCensusFragmentError {
                 formatter,
                 "RPDB fwmark census fragment has at least {required_at_least} raw mark-use records but its limit is {maximum}"
             ),
+            Self::RetainedOwner(error) => error.fmt(formatter),
         }
     }
 }
@@ -276,7 +280,7 @@ impl Error for StaleRpdbFwmarkCensusFragment {}
 pub fn project_rpdb_fwmark_census_fragment(
     inventory: &NetworkInventory,
 ) -> Result<RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError> {
-    project_rpdb_fwmark_census_fragment_with_exclusions(inventory, &[])
+    project_rpdb_fwmark_census_fragment_with_exclusions(inventory, &[], None)
 }
 
 /// Projects RPDB mark uses while excluding only the exact reviewed canary peer-rule cohort
@@ -300,19 +304,30 @@ pub fn project_rpdb_fwmark_census_fragment_with_classification(
     project_rpdb_fwmark_census_fragment_with_exclusions(
         inventory,
         classification.reviewed_canary_rule_indices(),
+        classification.retained_owner(),
     )
 }
 
 fn project_rpdb_fwmark_census_fragment_with_exclusions(
     inventory: &NetworkInventory,
     excluded_reviewed_canary_rule_indices: &[usize],
+    retained_owner: Option<&AndroidRpdbRetainedOwner>,
 ) -> Result<RpdbFwmarkCensusFragment, RpdbFwmarkCensusFragmentError> {
     let mut raw_mark_uses = Vec::new();
     let mut has_selector = false;
     let mut has_opaque_rule = false;
 
+    if let Some(retained_owner) = retained_owner {
+        retained_owner
+            .ensure_current(inventory)
+            .map_err(RpdbFwmarkCensusFragmentError::RetainedOwner)?;
+    }
+
     for (dump_index, rule) in inventory.rules().iter().enumerate() {
         has_opaque_rule |= !rule.has_complete_attribute_coverage();
+        if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
+            continue;
+        }
         if excluded_reviewed_canary_rule_indices
             .binary_search(&dump_index)
             .is_ok()

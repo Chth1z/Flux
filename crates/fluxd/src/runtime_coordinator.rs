@@ -10,7 +10,7 @@ use flux_core::{
     AddressResyncDisposition, ControlError, DispatcherCompletion, GenerationId, Reason,
     RouteTableId, RuntimeDispatcher, RuntimeIntent,
 };
-use flux_platform::NetworkInventoryRefreshDisposition;
+use flux_platform::{NetworkInventoryRefreshDisposition, ProcessIdentity};
 
 use crate::engine_supervisor::{
     EngineCanaryReportHandoffError, EngineChildAuthority, EngineChildAuthorityError,
@@ -161,11 +161,6 @@ impl PreparedGeneration {
     }
 
     #[must_use]
-    pub(crate) const fn active_capture_plan_digest(&self) -> Option<ActiveCapturePlanDigest> {
-        self.active_capture_plan_digest
-    }
-
-    #[must_use]
     pub(crate) const fn prepared_canary_generation(
         &self,
     ) -> Option<&PreparedCanaryGenerationBinding> {
@@ -232,23 +227,35 @@ impl PreparedGeneration {
 ///
 /// The coordinator retains the old deadline as the hard transaction bound and verifies that the
 /// engine snapshot is unchanged before and after the writer call. The writer receives no
-/// preparation, convergence, or publication authority through this request.
+/// preparation, convergence, publication, or canary authority through this request.
 pub(crate) struct ActiveCaptureAuditRequest<'a> {
-    active: &'a PreparedGeneration,
+    active: RuntimeGenerationBinding,
+    active_capture_plan_digest: Option<ActiveCapturePlanDigest>,
     fresh_inputs: &'a AddressReconciledGenerationInputs,
+    engine_process: ProcessIdentity,
     started_at: Instant,
     complete_before: Instant,
 }
 
 impl<'a> ActiveCaptureAuditRequest<'a> {
     #[must_use]
-    pub(crate) const fn active(&self) -> &PreparedGeneration {
+    pub(crate) const fn active(&self) -> RuntimeGenerationBinding {
         self.active
+    }
+
+    #[must_use]
+    pub(crate) const fn active_capture_plan_digest(&self) -> Option<ActiveCapturePlanDigest> {
+        self.active_capture_plan_digest
     }
 
     #[must_use]
     pub(crate) const fn fresh_inputs(&self) -> &AddressReconciledGenerationInputs {
         self.fresh_inputs
+    }
+
+    #[must_use]
+    pub(crate) const fn engine_process(&self) -> ProcessIdentity {
+        self.engine_process
     }
 
     #[must_use]
@@ -279,7 +286,6 @@ impl ActiveCaptureAudit {
     #[must_use]
     pub(crate) const fn new(
         generation: RuntimeGenerationBinding,
-        _prior_deadline: Instant,
         observed_at: Instant,
         valid_until: Instant,
     ) -> Self {
@@ -288,6 +294,27 @@ impl ActiveCaptureAudit {
             observed_at,
             valid_until,
         }
+    }
+}
+
+/// An active audit can fail because its source could not produce fresh evidence, or because the
+/// live capture safety bracket itself became untrustworthy. Only the latter is an immediate
+/// fail-open condition; source/planning failures retain the old deadline for a bounded retry.
+#[derive(Debug)]
+pub(crate) enum ActiveCaptureAuditError<E> {
+    Retryable(E),
+    SafetyInvalidated(E),
+}
+
+impl<E> ActiveCaptureAuditError<E> {
+    #[cfg(test)]
+    fn retryable(error: E) -> Self {
+        Self::Retryable(error)
+    }
+
+    #[cfg(test)]
+    fn safety_invalidated(error: E) -> Self {
+        Self::SafetyInvalidated(error)
     }
 }
 
@@ -380,18 +407,16 @@ impl CaptureSafetyLease {
 
     fn accepts_extension(
         &self,
-        expected_generation: RuntimeGenerationBinding,
-        requested_at: Instant,
-        prior_deadline: Instant,
+        pending: &PendingActiveCaptureAudit,
         completed_at: Instant,
         audited_generation: RuntimeGenerationBinding,
         observed_at: Instant,
         valid_until: Instant,
     ) -> bool {
-        audited_generation == expected_generation
-            && observed_at >= requested_at
+        audited_generation == pending.generation
+            && observed_at >= pending.requested_at
             && observed_at <= completed_at
-            && valid_until > prior_deadline
+            && valid_until > pending.prior_deadline
             && valid_until > completed_at
             && observed_at
                 .checked_add(CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE)
@@ -998,6 +1023,15 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     ) -> Result<Option<PreparedGeneration>, Self::Error> {
         Ok(None)
     }
+    /// Prepare one ordinary immutable successor after an active audit proves that the current
+    /// Capture Path plan cannot retain authority. This remains separate from the non-mutating
+    /// audit itself and is allowed to force a candidate even when address inspection is unchanged.
+    fn prepare_audit_successor(
+        &mut self,
+        inputs: &crate::generation_engine_config::AddressReconciledGenerationInputs,
+    ) -> Result<Option<PreparedGeneration>, Self::Error> {
+        self.prepare_address_successor(inputs)
+    }
     fn prepare_subscription(
         &mut self,
         _config: &ValidatedSubscriptionEngineConfig,
@@ -1027,10 +1061,12 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     fn audit_active_capture(
         &mut self,
         request: ActiveCaptureAuditRequest<'_>,
-    ) -> Result<ActiveCaptureAudit, Self::Error> {
+    ) -> Result<ActiveCaptureAudit, ActiveCaptureAuditError<Self::Error>> {
         let _ = (
             request.active(),
+            request.active_capture_plan_digest(),
             request.fresh_inputs(),
+            request.engine_process(),
             request.started_at(),
             request.complete_before(),
         );
@@ -1645,6 +1681,7 @@ pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
     capture_safety_lease: CaptureSafetyLease,
     address_reconciler: Option<AddressReconciler>,
     address_reconciliation_pending: bool,
+    forced_audit_successor_pending: bool,
     capture_path_refresh: CapturePathRefreshState,
     capture_path_evidence_clock: Box<dyn CapturePathEvidenceClock>,
     runtime: RuntimeSnapshotSource,
@@ -1686,6 +1723,7 @@ where
             capture_safety_lease: CaptureSafetyLease::new(),
             address_reconciler: None,
             address_reconciliation_pending: false,
+            forced_audit_successor_pending: false,
             capture_path_refresh: CapturePathRefreshState::Current,
             capture_path_evidence_clock: Box::new(SystemCapturePathEvidenceClock),
             runtime,
@@ -2639,6 +2677,7 @@ where
         };
         let Some((binding, prior_deadline)) = active else {
             self.capture_safety_lease.clear_pending();
+            self.forced_audit_successor_pending = false;
             return Ok(());
         };
         if self
@@ -2774,14 +2813,24 @@ where
             ));
         }
 
+        let engine_identity = engine_before
+            .owned_identity()
+            .expect("Ready engine identity was checked immediately above");
+        let engine_process = ProcessIdentity::new(
+            NonZeroU32::new(engine_identity.pid()).expect("owned engine PID is nonzero"),
+            NonZeroU64::new(engine_identity.start_time_ticks())
+                .expect("owned engine start time is nonzero"),
+        );
         let audit = self.writer.audit_active_capture(ActiveCaptureAuditRequest {
-            active: &generation,
+            active: pending.generation,
+            active_capture_plan_digest: generation.active_capture_plan_digest,
             fresh_inputs,
+            engine_process,
             started_at: pending.requested_at,
             complete_before: pending.complete_before,
         });
-        let completed_at = self.capture_path_evidence_clock.now();
         let engine_after = self.engine.snapshot();
+        let completed_at = self.capture_path_evidence_clock.now();
 
         if self
             .capture_safety_lease
@@ -2815,7 +2864,7 @@ where
 
         let audit = match audit {
             Ok(audit) => audit,
-            Err(source) => {
+            Err(ActiveCaptureAuditError::Retryable(source)) => {
                 self.ownership = RuntimeOwnership::Engine {
                     generation,
                     capture: CaptureObservation::Published,
@@ -2826,6 +2875,19 @@ where
                     source,
                     "retain the prior deadline, retry within its bounded window, and fail open if it expires",
                 ));
+            }
+            Err(ActiveCaptureAuditError::SafetyInvalidated(_source)) => {
+                self.ownership = RuntimeOwnership::Engine {
+                    generation,
+                    capture: CaptureObservation::Published,
+                };
+                self.address_reconciliation_pending = false;
+                self.invalidate_latest_capture_path_decision();
+                return self
+                    .expire_capture_path_selection(
+                        "active Capture Path audit confirmed live-safety invalidation",
+                    )
+                    .map(|()| true);
             }
         };
         let ActiveCaptureAudit::Extended {
@@ -2842,12 +2904,11 @@ where
             // plan without proving a new lease.  Keep the predecessor published, but hand the
             // same fresh reconciliation transaction to the ordinary address-successor path.
             self.address_reconciliation_pending = true;
+            self.forced_audit_successor_pending = true;
             return Ok(false);
         };
         if !self.capture_safety_lease.accepts_extension(
-            pending.generation,
-            pending.requested_at,
-            pending.prior_deadline,
+            &pending,
             completed_at,
             audited_generation,
             observed_at,
@@ -2867,12 +2928,28 @@ where
             ));
         }
 
+        if self.capture_safety_lease.deadline_expired(
+            pending.complete_before,
+            self.capture_path_evidence_clock.now(),
+        ) {
+            self.ownership = RuntimeOwnership::Engine {
+                generation,
+                capture: CaptureObservation::Published,
+            };
+            self.address_reconciliation_pending = false;
+            return self
+                .expire_capture_path_selection(
+                    "active Capture Path audit expired before final authority commit",
+                )
+                .map(|()| true);
+        }
         generation.capture_path_evidence_deadline = valid_until;
         self.ownership = RuntimeOwnership::Engine {
             generation,
             capture: CaptureObservation::Published,
         };
         self.address_reconciliation_pending = false;
+        self.forced_audit_successor_pending = false;
         Ok(true)
     }
 
@@ -2986,6 +3063,7 @@ where
         }
         if selection_evidence_lost {
             self.capture_safety_lease.clear_pending();
+            self.forced_audit_successor_pending = false;
             self.invalidate_latest_capture_path_decision();
             if active_generation.is_some() {
                 return self
@@ -3047,20 +3125,46 @@ where
                     "wait for a fresh complete network inventory snapshot",
                 )
             })?;
+        let force_audit_successor = self.forced_audit_successor_pending;
         self.address_reconciliation_pending = false;
-        let candidate = self
-            .writer
-            .prepare_address_successor(&reconciled)
-            .map_err(|source| {
-                runtime_writer_error(
-                    "prepare address-driven runtime Generation",
-                    source,
-                    "retain the active Generation and retry after fresh complete inventory",
-                )
-            })?;
+        let candidate = if force_audit_successor {
+            self.writer
+                .prepare_audit_successor(&reconciled)
+                .map_err(|source| {
+                    self.address_reconciliation_pending = true;
+                    self.forced_audit_successor_pending = true;
+                    runtime_writer_error(
+                        "prepare active Capture Path audit successor",
+                        source,
+                        "retain the active Generation and retry after fresh complete inventory",
+                    )
+                })?
+        } else {
+            self.writer
+                .prepare_address_successor(&reconciled)
+                .map_err(|source| {
+                    runtime_writer_error(
+                        "prepare address-driven runtime Generation",
+                        source,
+                        "retain the active Generation and retry after fresh complete inventory",
+                    )
+                })?
+        };
         let Some(candidate) = candidate else {
+            if force_audit_successor {
+                self.address_reconciliation_pending = true;
+                self.forced_audit_successor_pending = true;
+                return Err(ControlError::runtime(
+                    "prepare active Capture Path audit successor",
+                    io::Error::other(
+                        "audit successor seam did not produce an ordinary immutable candidate",
+                    ),
+                    "retain the active Generation and retry successor preparation",
+                ));
+            }
             return Ok(());
         };
+        self.forced_audit_successor_pending = false;
         let (capture_state, active_generation) = self.ownership_summary();
         self.publish_runtime(
             RuntimePhase::Preparing,
@@ -4933,7 +5037,7 @@ mod tests {
     use std::net::IpAddr;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -5099,7 +5203,6 @@ mod tests {
             .with_deadlines([prior_deadline]),
             audits: VecDeque::from([Ok(ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 extended_deadline,
             ))]),
@@ -5199,7 +5302,7 @@ mod tests {
         let overlong_deadline = audit_time
             .checked_add(Duration::from_secs(5 * 60 + 1))
             .expect("overlong deadline");
-        let (
+        let StartedAuditCoordinator {
             _fixture,
             mut coordinator,
             events,
@@ -5208,12 +5311,11 @@ mod tests {
             _config_directory,
             inventory_source,
             mut inventory_tracker,
-        ) = started_audit_coordinator(
+        } = started_audit_coordinator(
             now,
             prior_deadline,
             [Ok(ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 overlong_deadline,
             ))],
@@ -5235,13 +5337,13 @@ mod tests {
 
         assert_eq!(calls.lock().expect("audit calls lock").len(), 1);
         let RuntimeOwnership::Engine {
-            generation,
+            generation: active,
             capture: CaptureObservation::Published,
         } = &coordinator.ownership
         else {
             panic!("invalid audit must retain the old published authority until expiry");
         };
-        assert_eq!(generation.capture_path_evidence_deadline(), prior_deadline);
+        assert_eq!(active.capture_path_evidence_deadline(), prior_deadline);
         assert!(!events.lock().expect("events lock").iter().any(|event| {
             matches!(
                 event,
@@ -5291,7 +5393,6 @@ mod tests {
             .with_deadlines([prior_deadline]),
             audits: VecDeque::from([Ok(ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 extended_deadline,
             ))]),
@@ -5371,21 +5472,20 @@ mod tests {
         let extended_deadline = audit_time
             .checked_add(Duration::from_secs(5 * 60))
             .expect("extended deadline");
-        let (
+        let StartedAuditCoordinator {
             _fixture,
             mut coordinator,
-            _events,
+            events: _events,
             calls,
             clock,
             _config_directory,
             inventory_source,
             mut inventory_tracker,
-        ) = started_audit_coordinator(
+        } = started_audit_coordinator(
             now,
             prior_deadline,
             [Ok(ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 extended_deadline,
             ))],
@@ -5417,6 +5517,64 @@ mod tests {
     }
 
     #[test]
+    fn capture_path_audit_post_engine_snapshot_at_prior_deadline_fails_open() {
+        let now = Instant::now();
+        let prior_deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("prior deadline");
+        let audit_time = now
+            .checked_add(Duration::from_secs(50))
+            .expect("audit time");
+        let extended_deadline = audit_time
+            .checked_add(Duration::from_secs(5 * 60))
+            .expect("extended deadline");
+        let StartedAuditCoordinator {
+            _fixture,
+            mut coordinator,
+            events: _events,
+            calls,
+            clock,
+            _config_directory,
+            inventory_source,
+            mut inventory_tracker,
+        } = started_audit_coordinator(
+            now,
+            prior_deadline,
+            [Ok(ActiveCaptureAudit::new(
+                RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
+                audit_time,
+                extended_deadline,
+            ))],
+        );
+
+        coordinator
+            .engine
+            .advance_clock_after_post_audit_snapshot(clock.clone(), prior_deadline);
+        clock.set(audit_time);
+        coordinator
+            .maintain_runtime()
+            .expect("audit requests fresh inventory");
+        inventory_source.publish(Some(Arc::new(
+            inventory_tracker
+                .publish_complete([], [])
+                .expect("publish causally fresh complete inventory")
+                .clone(),
+        )));
+
+        coordinator
+            .maintain_address_reconciliation()
+            .expect_err("post-snapshot deadline crossing must fail open");
+
+        assert_eq!(calls.lock().expect("audit calls lock").len(), 1);
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+        let snapshot = coordinator.runtime_snapshot_source().snapshot();
+        assert_eq!(snapshot.phase, RuntimePhase::Stopped);
+        assert_eq!(snapshot.capture, RuntimeCaptureState::Detached);
+        assert_eq!(snapshot.generation(), None);
+    }
+
+    #[test]
     fn capture_path_audit_writer_failure_preserves_deadline_and_rate_limits_retry() {
         let now = Instant::now();
         let prior_deadline = now
@@ -5425,19 +5583,21 @@ mod tests {
         let audit_time = now
             .checked_add(Duration::from_secs(50))
             .expect("audit time");
-        let (
+        let StartedAuditCoordinator {
             _fixture,
             mut coordinator,
-            _events,
+            events: _events,
             calls,
             clock,
             _config_directory,
             inventory_source,
             mut inventory_tracker,
-        ) = started_audit_coordinator(
+        } = started_audit_coordinator(
             now,
             prior_deadline,
-            [Err(io::Error::other("injected audit failure"))],
+            [Err(ActiveCaptureAuditError::retryable(io::Error::other(
+                "injected audit failure",
+            )))],
         );
         clock.set(audit_time);
         coordinator
@@ -5489,6 +5649,59 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_active_capture_safety_invalidation_fails_open_immediately() {
+        let now = Instant::now();
+        let prior_deadline = now
+            .checked_add(Duration::from_secs(60))
+            .expect("prior deadline");
+        let audit_time = now
+            .checked_add(Duration::from_secs(50))
+            .expect("audit time");
+        let StartedAuditCoordinator {
+            _fixture,
+            mut coordinator,
+            events,
+            calls,
+            clock,
+            _config_directory,
+            inventory_source,
+            mut inventory_tracker,
+        } = started_audit_coordinator(
+            now,
+            prior_deadline,
+            [Err(ActiveCaptureAuditError::safety_invalidated(
+                io::Error::other("injected owner readback invalidation"),
+            ))],
+        );
+        clock.set(audit_time);
+
+        coordinator
+            .maintain_runtime()
+            .expect("audit requests fresh inventory");
+        inventory_source.publish(Some(Arc::new(
+            inventory_tracker
+                .publish_complete([], [])
+                .expect("publish causally fresh complete inventory")
+                .clone(),
+        )));
+
+        coordinator
+            .maintain_address_reconciliation()
+            .expect_err("confirmed owner invalidation must fail open immediately");
+
+        assert_eq!(calls.lock().expect("audit calls lock").len(), 1);
+        assert!(matches!(coordinator.ownership, RuntimeOwnership::Stopped));
+        assert!(coordinator.capture_path_refresh.requires_fresh_evidence());
+        assert!(
+            events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .any(|event| { matches!(event, Event::CaptureStopped | Event::EngineStopped(_)) })
+        );
+    }
+
+    #[test]
     fn audit_proof_for_a_different_generation_is_rejected() {
         let now = Instant::now();
         let prior_deadline = now
@@ -5507,7 +5720,6 @@ mod tests {
             audit_time,
             ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(2), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 extended_deadline,
             ),
@@ -5530,7 +5742,6 @@ mod tests {
             audit_time,
             ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 prior_deadline,
             ),
@@ -5538,7 +5749,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_semantic_change_falls_through_to_address_successor_preparation() {
+    fn audit_semantic_change_forces_an_ordinary_successor_generation() {
         let now = Instant::now();
         let prior_deadline = now
             .checked_add(Duration::from_secs(60))
@@ -5546,7 +5757,7 @@ mod tests {
         let audit_time = now
             .checked_add(Duration::from_secs(50))
             .expect("audit time");
-        let (
+        let StartedAuditCoordinator {
             _fixture,
             mut coordinator,
             events,
@@ -5555,7 +5766,7 @@ mod tests {
             _config_directory,
             inventory_source,
             mut inventory_tracker,
-        ) = started_audit_coordinator(
+        } = started_audit_coordinator(
             now,
             prior_deadline,
             [Ok(ActiveCaptureAudit::SuccessorRequired)],
@@ -5574,20 +5785,44 @@ mod tests {
 
         coordinator
             .maintain_address_reconciliation()
-            .expect("semantic change is delegated to normal successor planning");
+            .expect("semantic change is delegated to ordinary successor planning");
 
         assert_eq!(calls.lock().expect("audit calls lock").len(), 1);
         let RuntimeOwnership::Engine {
-            generation,
+            generation: active,
             capture: CaptureObservation::Published,
         } = &coordinator.ownership
         else {
             panic!("successor planning must leave the predecessor published");
         };
-        assert_eq!(generation.capture_path_evidence_deadline(), prior_deadline);
         assert_eq!(
-            events.lock().expect("events lock").as_slice(),
-            [Event::AddressSuccessorPrepared]
+            active.id(),
+            GenerationId::new(2).expect("successor generation")
+        );
+        assert!(
+            events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .any(|event| { matches!(event, Event::Prepared(Reason::Automation)) })
+        );
+        assert!(
+            events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    Event::Published(PublishedRuntimeState::Running { generation })
+                        if *generation == GenerationId::new(2).expect("successor generation")
+                ))
+        );
+        assert!(
+            events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .any(|event| matches!(event, Event::CaptureStarted))
         );
     }
 
@@ -5632,7 +5867,6 @@ mod tests {
             .with_deadlines([prior_deadline]),
             audits: VecDeque::from([Ok(ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 extended_deadline,
             ))]),
@@ -5728,21 +5962,20 @@ mod tests {
         let extended_deadline = audit_time
             .checked_add(Duration::from_secs(5 * 60))
             .expect("extended deadline");
-        let (
+        let StartedAuditCoordinator {
             _fixture,
             mut coordinator,
-            _events,
+            events: _events,
             calls,
             clock,
             _config_directory,
             inventory_source,
-            _inventory_tracker,
-        ) = started_audit_coordinator(
+            inventory_tracker: _inventory_tracker,
+        } = started_audit_coordinator(
             now,
             prior_deadline,
             [Ok(ActiveCaptureAudit::new(
                 RuntimeGenerationBinding::new(generation(1), test_xtables_capture_path_selection()),
-                prior_deadline,
                 audit_time,
                 extended_deadline,
             ))],
@@ -11130,27 +11363,30 @@ mod tests {
 
     struct AuditScriptedWriter {
         inner: CapturePathDecisionWriter,
-        audits: VecDeque<Result<ActiveCaptureAudit, io::Error>>,
+        audits: VecDeque<Result<ActiveCaptureAudit, ActiveCaptureAuditError<io::Error>>>,
         calls: Arc<Mutex<Vec<(GenerationId, Instant)>>>,
         engine_drift: Option<Arc<AtomicBool>>,
     }
 
     type AuditTestCoordinator = RuntimeCoordinator<AuditScriptedWriter, ReadyScriptedEngine>;
+    type AuditTestError = ActiveCaptureAuditError<io::Error>;
+
+    struct StartedAuditCoordinator {
+        _fixture: EngineFixture,
+        coordinator: AuditTestCoordinator,
+        events: Arc<Mutex<Vec<Event>>>,
+        calls: Arc<Mutex<Vec<(GenerationId, Instant)>>>,
+        clock: ReplayCapturePathEvidenceClock,
+        _config_directory: tempfile::TempDir,
+        inventory_source: crate::generation_engine_config::ReplayNetworkInventorySource,
+        inventory_tracker: NetworkInventoryTracker,
+    }
 
     fn started_audit_coordinator(
         now: Instant,
         prior_deadline: Instant,
-        audits: impl IntoIterator<Item = Result<ActiveCaptureAudit, io::Error>>,
-    ) -> (
-        EngineFixture,
-        AuditTestCoordinator,
-        Arc<Mutex<Vec<Event>>>,
-        Arc<Mutex<Vec<(GenerationId, Instant)>>>,
-        ReplayCapturePathEvidenceClock,
-        tempfile::TempDir,
-        crate::generation_engine_config::ReplayNetworkInventorySource,
-        NetworkInventoryTracker,
-    ) {
+        audits: impl IntoIterator<Item = Result<ActiveCaptureAudit, AuditTestError>>,
+    ) -> StartedAuditCoordinator {
         let fixture = EngineFixture::new();
         let (config_directory, desired_state_path) = desired_state_fixture();
         let (inventory_source, mut reconciler) = AddressReconciler::replay(desired_state_path);
@@ -11170,7 +11406,7 @@ mod tests {
         let writer = AuditScriptedWriter {
             inner: CapturePathDecisionWriter::new(ScriptedWriter {
                 events: Arc::clone(&events),
-                prepared: VecDeque::from([fixture.spec.clone()]),
+                prepared: VecDeque::from([fixture.spec.clone(), fixture.spec.clone()]),
                 next_generation_id: 1,
                 capture_start_failure: false,
                 capture_stop_failures: 0,
@@ -11200,16 +11436,16 @@ mod tests {
             })
             .expect("initial Generation converges");
         events.lock().expect("events lock").clear();
-        (
-            fixture,
+        StartedAuditCoordinator {
+            _fixture: fixture,
             coordinator,
             events,
             calls,
             clock,
-            config_directory,
+            _config_directory: config_directory,
             inventory_source,
             inventory_tracker,
-        )
+        }
     }
 
     fn assert_invalid_audit_result(
@@ -11218,16 +11454,16 @@ mod tests {
         audit_time: Instant,
         result: ActiveCaptureAudit,
     ) {
-        let (
+        let StartedAuditCoordinator {
             _fixture,
             mut coordinator,
-            _events,
+            events: _events,
             calls,
             clock,
             _config_directory,
             inventory_source,
             mut inventory_tracker,
-        ) = started_audit_coordinator(now, prior_deadline, [Ok(result)]);
+        } = started_audit_coordinator(now, prior_deadline, [Ok(result)]);
         clock.set(audit_time);
         coordinator
             .maintain_runtime()
@@ -11603,6 +11839,13 @@ mod tests {
             self.inner.prepare_address_successor(inputs)
         }
 
+        fn prepare_audit_successor(
+            &mut self,
+            _inputs: &AddressReconciledGenerationInputs,
+        ) -> Result<Option<PreparedGeneration>, Self::Error> {
+            self.inner.prepare(Reason::Automation).map(Some)
+        }
+
         fn latest_capture_path_decision(&self) -> Option<CapturePathDecision> {
             self.inner.latest_capture_path_decision()
         }
@@ -11630,11 +11873,11 @@ mod tests {
         fn audit_active_capture(
             &mut self,
             request: ActiveCaptureAuditRequest<'_>,
-        ) -> Result<ActiveCaptureAudit, Self::Error> {
-            self.calls.lock().expect("audit calls lock").push((
-                request.active().id(),
-                request.active().capture_path_evidence_deadline(),
-            ));
+        ) -> Result<ActiveCaptureAudit, ActiveCaptureAuditError<Self::Error>> {
+            self.calls
+                .lock()
+                .expect("audit calls lock")
+                .push((request.active().generation(), request.complete_before()));
             if let Some(engine_drift) = &self.engine_drift {
                 engine_drift.store(true, Ordering::SeqCst);
             }
@@ -11769,6 +12012,8 @@ mod tests {
     struct ReadyScriptedEngine {
         inner: ScriptedEngine,
         snapshot: Arc<EngineSnapshot>,
+        advance_clock_after_snapshot: Option<(ReplayCapturePathEvidenceClock, Instant, usize)>,
+        snapshot_calls: Arc<AtomicUsize>,
     }
 
     impl ReadyScriptedEngine {
@@ -11785,7 +12030,24 @@ mod tests {
                     table: PathBuf::from("/proc/1/net/tcp"),
                 },
             ));
-            Self { inner, snapshot }
+            Self {
+                inner,
+                snapshot,
+                advance_clock_after_snapshot: None,
+                snapshot_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn advance_clock_after_post_audit_snapshot(
+            &mut self,
+            clock: ReplayCapturePathEvidenceClock,
+            deadline: Instant,
+        ) {
+            // The active-audit transaction takes one engine snapshot before invoking the writer
+            // and one immediately after it. Record a relative target so this helper remains
+            // correct even if the fixture's startup path gains another snapshot later.
+            let target_call = self.snapshot_calls.load(Ordering::SeqCst).saturating_add(2);
+            self.advance_clock_after_snapshot = Some((clock, deadline, target_call));
         }
     }
 
@@ -11872,6 +12134,12 @@ mod tests {
         }
 
         fn snapshot(&self) -> Arc<EngineSnapshot> {
+            let call = self.snapshot_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some((clock, deadline, target_call)) = &self.advance_clock_after_snapshot
+                && call == *target_call
+            {
+                clock.set(*deadline);
+            }
             Arc::clone(&self.snapshot)
         }
 

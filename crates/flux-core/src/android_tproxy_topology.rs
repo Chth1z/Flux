@@ -367,6 +367,8 @@ pub enum AndroidTproxySelectorDisjointReason {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AndroidTproxyRuleDisposition {
     OtherFamily,
+    /// One exact rule occurrence retained by the active native Flux owner.
+    RetainedFluxOwner,
     /// Android policy remains before any candidate in the reported open interval.
     AndroidFirst,
     /// Flux would run before this overlapping Android selection and therefore needs a handoff.
@@ -887,6 +889,7 @@ fn digest_topology_report(
             }
             AndroidTproxyRuleDisposition::Unknown => digest.tag(4),
             AndroidTproxyRuleDisposition::ReviewedCanaryFacility => digest.tag(5),
+            AndroidTproxyRuleDisposition::RetainedFluxOwner => digest.tag(6),
         }
     }
     digest.u32(report.unknown_rule_count);
@@ -1279,6 +1282,15 @@ pub fn assess_android_tproxy_topology(
     classification: &AndroidRpdbClassificationReport,
     anchor_dump_index: usize,
 ) -> Result<AndroidTproxyTopologyFeasibilityReport, AndroidTproxyTopologyError> {
+    assess_android_tproxy_topology_inner(inventory, classification, anchor_dump_index)
+}
+
+fn assess_android_tproxy_topology_inner(
+    inventory: &NetworkInventory,
+    classification: &AndroidRpdbClassificationReport,
+    anchor_dump_index: usize,
+) -> Result<AndroidTproxyTopologyFeasibilityReport, AndroidTproxyTopologyError> {
+    let retained_owner = classification.retained_owner();
     ensure_classifier_matches_inventory(inventory, classification)?;
 
     let rule = inventory.rules().get(anchor_dump_index).ok_or(
@@ -1382,6 +1394,8 @@ pub fn assess_android_tproxy_topology(
     for (dump_index, candidate) in inventory.rules().iter().enumerate() {
         let disposition = if candidate.destination().family() != selector.family() {
             AndroidTproxyRuleDisposition::OtherFamily
+        } else if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
+            AndroidTproxyRuleDisposition::RetainedFluxOwner
         } else if classification.audit().classifications()[dump_index]
             == RpdbRuleClassification::Unknown
         {
@@ -1450,6 +1464,14 @@ pub fn assess_android_tproxy_topology_scope(
     classification: &AndroidRpdbClassificationReport,
     request: &AndroidTproxyTopologyScopeRequest,
 ) -> Result<AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeError> {
+    assess_android_tproxy_topology_scope_inner(inventory, classification, request)
+}
+
+fn assess_android_tproxy_topology_scope_inner(
+    inventory: &NetworkInventory,
+    classification: &AndroidRpdbClassificationReport,
+    request: &AndroidTproxyTopologyScopeRequest,
+) -> Result<AndroidTproxyTopologyScopeReport, AndroidTproxyTopologyScopeError> {
     ensure_classifier_matches_inventory(inventory, classification)
         .map_err(AndroidTproxyTopologyScopeError::Topology)?;
 
@@ -1469,8 +1491,9 @@ pub fn assess_android_tproxy_topology_scope(
                     required_at_least: MAX_ANDROID_TPROXY_SCOPE_ANCHORS + 1,
                 });
             }
-            let report = assess_android_tproxy_topology(inventory, classification, dump_index)
-                .map_err(AndroidTproxyTopologyScopeError::Topology)?;
+            let report =
+                assess_android_tproxy_topology_inner(inventory, classification, dump_index)
+                    .map_err(AndroidTproxyTopologyScopeError::Topology)?;
             let structural_feasibility = report.structural_feasibility(request.shape());
             match structural_feasibility {
                 AndroidTproxyStructuralFeasibility::IncompatibleTrafficDomain { .. }
@@ -1574,8 +1597,10 @@ fn reject_ambiguous_anchor(
     selector: AndroidTproxyDomainSelector,
     anchor_table: RuleTableId,
 ) -> Result<(), AndroidTproxyTopologyError> {
+    let retained_owner = classification.retained_owner();
     for (dump_index, candidate) in inventory.rules().iter().enumerate() {
         if dump_index == anchor_dump_index
+            || retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index))
             || classification.roles()[dump_index] != Some(anchor_role)
             || classification.audit().classifications()[dump_index]
                 == RpdbRuleClassification::Unknown

@@ -38,10 +38,10 @@ use crate::functional_canary::{
 use crate::generation_engine_config::EngineCapabilityProfileRevision;
 use crate::generation_engine_config::{AddressReconciledGenerationInputs, CapturePathDecision};
 use crate::runtime_coordinator::{
-    ActiveCaptureAudit, ActiveCaptureAuditRequest, AddressResyncStrategy, CanaryCounterReadback,
-    CanaryCounterRetirementReadback, CanaryRouteReadback, CanarySelectorSession,
-    PreparedGeneration, PublishedRuntimeState, RetiredCanarySelectorSession, RuntimeCoordinator,
-    RuntimeFunctionalCanary, RuntimeWriter,
+    ActiveCaptureAudit, ActiveCaptureAuditError, ActiveCaptureAuditRequest, AddressResyncStrategy,
+    CanaryCounterReadback, CanaryCounterRetirementReadback, CanaryRouteReadback,
+    CanarySelectorSession, PreparedGeneration, PublishedRuntimeState, RetiredCanarySelectorSession,
+    RuntimeCoordinator, RuntimeFunctionalCanary, RuntimeWriter,
 };
 use crate::subscription::ValidatedSubscriptionEngineConfig;
 
@@ -101,6 +101,75 @@ fn verify_live_capture_observation<E>(
     }
 }
 
+/// Close the native ownership bracket before classifying the source audit result.
+///
+/// The post-readback is deliberately evaluated before the source result is mapped. A planning
+/// error is retryable only when the exact owner remained stable for the whole bounded transaction;
+/// a post-readback failure or owner drift invalidates the safety proof immediately.
+fn close_active_capture_audit_bracket<O, S, E>(
+    ownership_before: &O,
+    audit: Result<ActiveCaptureAudit, S>,
+    post_readback: impl FnOnce() -> Result<O, E>,
+    map_source_error: impl FnOnce(S) -> E,
+    drift_error: impl FnOnce() -> E,
+) -> Result<ActiveCaptureAudit, ActiveCaptureAuditError<E>>
+where
+    O: Eq,
+{
+    let ownership_after = post_readback().map_err(ActiveCaptureAuditError::SafetyInvalidated)?;
+    if ownership_after != *ownership_before {
+        return Err(ActiveCaptureAuditError::SafetyInvalidated(drift_error()));
+    }
+    audit.map_err(|source| ActiveCaptureAuditError::Retryable(map_source_error(source)))
+}
+
+fn require_active_capture_audit_time<E>(
+    complete_before: Instant,
+    now: Instant,
+    deadline_error: impl FnOnce() -> E,
+) -> Result<(), ActiveCaptureAuditError<E>> {
+    if now >= complete_before {
+        Err(ActiveCaptureAuditError::Retryable(deadline_error()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Close the native ownership bracket only while the immutable audit deadline remains usable.
+///
+/// The deadline check immediately before the post-readback is intentionally separate from the
+/// final check after the bracket: once the old lease has expired, another ownership readback no
+/// longer contributes to a safe extension and the coordinator will fail open. A safety
+/// invalidation already proved by the bracket still takes precedence over lateness.
+fn close_active_capture_audit_bracket_until<O, E>(
+    ownership_before: &O,
+    complete_before: Instant,
+    mut now: impl FnMut() -> Instant,
+    audit: Result<ActiveCaptureAudit, E>,
+    post_readback: impl FnOnce() -> Result<O, E>,
+    deadline_error: impl Fn() -> E,
+    drift_error: impl FnOnce() -> E,
+) -> Result<ActiveCaptureAudit, ActiveCaptureAuditError<E>>
+where
+    O: Eq,
+{
+    require_active_capture_audit_time(complete_before, now(), &deadline_error)?;
+    let result = close_active_capture_audit_bracket(
+        ownership_before,
+        audit,
+        post_readback,
+        |source| source,
+        drift_error,
+    );
+    if matches!(result, Err(ActiveCaptureAuditError::SafetyInvalidated(_))) {
+        return result;
+    }
+    if now() >= complete_before {
+        return Err(ActiveCaptureAuditError::Retryable(deadline_error()));
+    }
+    result
+}
+
 pub(crate) struct PreparedNativeGeneration<T> {
     runtime: PreparedGeneration,
     target: T,
@@ -140,6 +209,16 @@ pub(crate) trait NativeGenerationSource<T, I>: Send + 'static {
         inputs: &AddressReconciledGenerationInputs,
         prior: I,
     ) -> Result<Option<PreparedNativeGeneration<T>>, Self::Error>;
+
+    /// Prepare an ordinary immutable successor forced by an active Capture Path audit. Unlike
+    /// address-driven reconciliation, this must not collapse an unchanged inspection into `None`.
+    fn prepare_audit_successor(
+        &mut self,
+        inputs: &AddressReconciledGenerationInputs,
+        prior: I,
+    ) -> Result<Option<PreparedNativeGeneration<T>>, Self::Error> {
+        self.prepare_address_successor(inputs, prior)
+    }
 
     fn prepare_subscription(
         &mut self,
@@ -1109,6 +1188,27 @@ where
             .transpose()
     }
 
+    fn prepare_audit_successor(
+        &mut self,
+        inputs: &AddressReconciledGenerationInputs,
+    ) -> Result<Option<PreparedGeneration>, Self::Error> {
+        let Some(prior) = self.prior_identity() else {
+            return Ok(None);
+        };
+        let prepared = self
+            .source
+            .prepare_audit_successor(inputs, prior)
+            .map_err(|source| {
+                NativeCoordinatorWriterError::preparation(
+                    "prepare active Capture Path audit successor",
+                    source,
+                )
+            })?;
+        prepared
+            .map(|prepared| self.retain_candidate(prepared))
+            .transpose()
+    }
+
     fn prepare_subscription(
         &mut self,
         config: &ValidatedSubscriptionEngineConfig,
@@ -1174,48 +1274,77 @@ where
     fn audit_active_capture(
         &mut self,
         request: ActiveCaptureAuditRequest<'_>,
-    ) -> Result<ActiveCaptureAudit, Self::Error> {
+    ) -> Result<ActiveCaptureAudit, ActiveCaptureAuditError<Self::Error>> {
         if self.recovery_required {
-            return Err(NativeCoordinatorWriterError::Invariant(
-                "active Capture Path audit requires capture recovery",
+            return Err(ActiveCaptureAuditError::Retryable(
+                NativeCoordinatorWriterError::Invariant(
+                    "active Capture Path audit requires capture recovery",
+                ),
             ));
         }
         if self.active_canary_selector_session.is_some() {
-            return Err(NativeCoordinatorWriterError::Invariant(
-                "active Capture Path audit overlapped an active canary selector session",
+            return Err(ActiveCaptureAuditError::Retryable(
+                NativeCoordinatorWriterError::Invariant(
+                    "active Capture Path audit overlapped an active canary selector session",
+                ),
             ));
         }
 
         let generation = request.active();
-        if self.committed_generation != Some(generation.id()) {
-            return Err(NativeCoordinatorWriterError::Invariant(
-                "active Capture Path audit does not identify the committed Generation",
+        if self.committed_generation != Some(generation.generation()) {
+            return Err(ActiveCaptureAuditError::Retryable(
+                NativeCoordinatorWriterError::Invariant(
+                    "active Capture Path audit does not identify the committed Generation",
+                ),
             ));
         }
-        let expected = C::target_identity(&self.retained(generation.id())?.target);
-        if expected.coordinator_generation() != Some(generation.id())
+        let expected = C::target_identity(
+            &self
+                .retained(generation.generation())
+                .map_err(ActiveCaptureAuditError::Retryable)?
+                .target,
+        );
+        if expected.coordinator_generation() != Some(generation.generation())
             || self.converged_identity != Some(expected)
         {
-            return Err(NativeCoordinatorWriterError::Invariant(
-                "active Capture Path audit has no exact active committed target",
+            return Err(ActiveCaptureAuditError::Retryable(
+                NativeCoordinatorWriterError::Invariant(
+                    "active Capture Path audit has no exact active committed target",
+                ),
             ));
         }
 
         if request.started_at() >= request.complete_before() {
-            return Err(NativeCoordinatorWriterError::Invariant(
-                "active Capture Path audit began at or after its prior deadline",
+            return Err(ActiveCaptureAuditError::Retryable(
+                NativeCoordinatorWriterError::Invariant(
+                    "active Capture Path audit began at or after its prior deadline",
+                ),
             ));
         }
+
+        require_active_capture_audit_time(request.complete_before(), Instant::now(), || {
+            NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit reached its prior deadline before ownership readback",
+            )
+        })?;
 
         let Some(expected_native) = expected.native_capture_target_identity() else {
             // A synthetic convergence identity has no descriptor-anchored ownership evidence and
             // therefore cannot authorize a live evidence lease extension.
             return Ok(ActiveCaptureAudit::SuccessorRequired);
         };
-        let ownership_before = self.observe_exact_native_ownership(
-            expected_native,
-            "observe native ownership before active Capture Path audit",
-        )?;
+        let ownership_before = self
+            .observe_exact_native_ownership(
+                expected_native,
+                "observe native ownership before active Capture Path audit",
+            )
+            .map_err(ActiveCaptureAuditError::SafetyInvalidated)?;
+
+        require_active_capture_audit_time(request.complete_before(), Instant::now(), || {
+            NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit reached its prior deadline before source planning",
+            )
+        })?;
 
         let audit = self
             .source
@@ -1223,39 +1352,58 @@ where
 
         // Always close the readback bracket, including after a planning error. A source failure
         // cannot hide simultaneous native ownership drift.
-        let ownership_after = self.observe_exact_native_ownership(
-            expected_native,
-            "observe native ownership after active Capture Path audit",
-        )?;
-        if ownership_after != ownership_before {
+        let audit = close_active_capture_audit_bracket_until(
+            &ownership_before,
+            request.complete_before(),
+            Instant::now,
+            audit.map_err(|source| {
+                NativeCoordinatorWriterError::preparation(
+                    "audit committed native Capture Path evidence",
+                    source,
+                )
+            }),
+            || {
+                self.observe_exact_native_ownership(
+                    expected_native,
+                    "observe native ownership after active Capture Path audit",
+                )
+            },
+            || {
+                NativeCoordinatorWriterError::Invariant(
+                    "active Capture Path audit reached its prior deadline before ownership post-readback",
+                )
+            },
+            || {
+                NativeCoordinatorWriterError::Invariant(
+                    "descriptor-anchored native ownership changed during active Capture Path audit",
+                )
+            },
+        );
+        if matches!(audit, Err(ActiveCaptureAuditError::SafetyInvalidated(_))) {
             self.recovery_required = true;
-            return Err(NativeCoordinatorWriterError::Invariant(
-                "descriptor-anchored native ownership changed during active Capture Path audit",
-            ));
         }
+        let audit = audit?;
 
-        let audit = audit.map_err(|source| {
-            NativeCoordinatorWriterError::preparation(
-                "audit committed native Capture Path evidence",
-                source,
+        require_active_capture_audit_time(request.complete_before(), Instant::now(), || {
+            NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit completed after its prior deadline",
             )
         })?;
+
         if let ActiveCaptureAudit::Extended {
             generation: audited_generation,
             observed_at,
             valid_until,
         } = audit
-        {
-            if audited_generation != generation.runtime_binding()
+            && (audited_generation != request.active()
                 || observed_at < request.started_at()
-                || observed_at >= request.complete_before()
-                || valid_until <= request.complete_before()
-                || valid_until <= observed_at
-            {
-                return Err(NativeCoordinatorWriterError::Invariant(
+                || valid_until <= observed_at)
+        {
+            return Err(ActiveCaptureAuditError::Retryable(
+                NativeCoordinatorWriterError::Invariant(
                     "native source returned mismatched active Capture Path audit",
-                ));
-            }
+                ),
+            ));
         }
         Ok(audit)
     }
@@ -1728,6 +1876,7 @@ impl Error for NativeCoordinatorWriterError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
@@ -2404,6 +2553,154 @@ mod tests {
                 "injected readback failure"
             ))
         );
+    }
+
+    #[test]
+    fn active_audit_bracket_closes_after_a_source_failure() {
+        let post_readbacks = Cell::new(0);
+        let result = close_active_capture_audit_bracket(
+            &17_u64,
+            Err::<ActiveCaptureAudit, _>("source failure"),
+            || {
+                post_readbacks.set(post_readbacks.get() + 1);
+                Ok(17_u64)
+            },
+            |source| source,
+            || "owner drift",
+        );
+
+        assert_eq!(post_readbacks.get(), 1);
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::Retryable("source failure"))
+        ));
+    }
+
+    #[test]
+    fn active_audit_bracket_classifies_post_readback_failure_as_safety_invalidation() {
+        let result = close_active_capture_audit_bracket(
+            &17_u64,
+            Ok::<_, &str>(ActiveCaptureAudit::SuccessorRequired),
+            || Err("post-readback failure"),
+            |source| source,
+            || "owner drift",
+        );
+
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::SafetyInvalidated(
+                "post-readback failure"
+            ))
+        ));
+    }
+
+    #[test]
+    fn active_audit_bracket_classifies_owner_drift_as_safety_invalidation() {
+        let result = close_active_capture_audit_bracket(
+            &17_u64,
+            Ok::<_, &str>(ActiveCaptureAudit::SuccessorRequired),
+            || Ok(18_u64),
+            |source| source,
+            || "owner drift",
+        );
+
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::SafetyInvalidated("owner drift"))
+        ));
+    }
+
+    #[test]
+    fn active_audit_deadline_rejects_before_first_ownership_readback() {
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let readbacks = Cell::new(0);
+        let result = require_active_capture_audit_time(deadline, deadline, || "expired")
+            .map(|()| readbacks.set(readbacks.get() + 1));
+
+        assert_eq!(readbacks.get(), 0);
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::Retryable("expired"))
+        ));
+    }
+
+    #[test]
+    fn active_audit_deadline_does_not_start_post_readback_after_expiry() {
+        let deadline = Instant::now();
+        let post_readbacks = Cell::new(0);
+        let result = close_active_capture_audit_bracket_until(
+            &17_u64,
+            deadline,
+            || deadline,
+            Ok::<_, &str>(ActiveCaptureAudit::SuccessorRequired),
+            || {
+                post_readbacks.set(post_readbacks.get() + 1);
+                Ok(17_u64)
+            },
+            || "expired",
+            || "owner drift",
+        );
+
+        assert_eq!(post_readbacks.get(), 0);
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::Retryable("expired"))
+        ));
+    }
+
+    #[test]
+    fn active_audit_deadline_preserves_post_readback_on_source_error() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let post_readbacks = Cell::new(0);
+        let result = close_active_capture_audit_bracket_until(
+            &17_u64,
+            deadline,
+            || now,
+            Err::<ActiveCaptureAudit, _>("source failure"),
+            || {
+                post_readbacks.set(post_readbacks.get() + 1);
+                Ok(17_u64)
+            },
+            || "expired",
+            || "owner drift",
+        );
+
+        assert_eq!(post_readbacks.get(), 1);
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::Retryable("source failure"))
+        ));
+    }
+
+    #[test]
+    fn active_audit_deadline_rejects_a_result_that_finishes_late() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let now_calls = Cell::new(0);
+        let post_readbacks = Cell::new(0);
+        let result = close_active_capture_audit_bracket_until(
+            &17_u64,
+            deadline,
+            || {
+                let call = now_calls.get();
+                now_calls.set(call + 1);
+                if call == 0 { now } else { deadline }
+            },
+            Ok::<_, &str>(ActiveCaptureAudit::SuccessorRequired),
+            || {
+                post_readbacks.set(post_readbacks.get() + 1);
+                Ok(17_u64)
+            },
+            || "expired",
+            || "owner drift",
+        );
+
+        assert_eq!(post_readbacks.get(), 1);
+        assert!(matches!(
+            result,
+            Err(ActiveCaptureAuditError::Retryable("expired"))
+        ));
     }
 
     #[test]

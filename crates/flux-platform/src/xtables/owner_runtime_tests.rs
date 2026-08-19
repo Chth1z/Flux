@@ -8,8 +8,9 @@ use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureInterfaceSelector,
     CaptureIpPrefix, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    EngineCredentials, FwmarkCandidate, GenerationId, InterfaceIndex, InterfaceName, RouteProtocol,
-    RouteTableId, RulePriority, RuleProtocol, compile_capture_program,
+    EngineCredentials, FwmarkCandidate, GenerationId, InterfaceIndex, InterfaceName,
+    NetworkAddressFamily, RouteProtocol, RouteTableId, RulePriority, RuleProtocol,
+    compile_capture_program,
 };
 use tempfile::TempDir;
 
@@ -1455,6 +1456,68 @@ fn active_ownership_observation_binds_exact_journal_descriptor_and_live_target()
         observation.record_digest(),
         <[u8; 32]>::from(Sha256::digest(encoded))
     );
+    let retained = observation.retained_owner();
+    assert_eq!(retained.target(), observation.target());
+    assert_eq!(
+        retained.xtables_expected_state(NetworkAddressFamily::Ipv4),
+        target
+            .topology()
+            .family(XtablesRestoreFamily::Ipv4)
+            .map(|family| family.active_state())
+    );
+    assert_eq!(
+        retained.xtables_expected_state(NetworkAddressFamily::Ipv6),
+        None
+    );
+    assert_eq!(
+        retained.routing(),
+        target.routing(),
+        "retained owner must preserve exact active route/rule identities"
+    );
+}
+
+#[test]
+fn active_ownership_observation_debug_redacts_retained_runtime_material() {
+    let target = target(7, AddressHostFamilySelection::Ipv4, false);
+    let fixture = Fixture::new([target.clone()]);
+    let mut owner = fixture.owner();
+    owner
+        .converge(NativeXtablesDesiredTarget::Active(target.clone()))
+        .expect("activate target before Debug redaction check");
+    let observation = owner
+        .observe_active_ownership()
+        .expect("observe exact active ownership")
+        .expect("active target has ownership evidence");
+
+    let sensitive_rule = target
+        .topology()
+        .family(XtablesRestoreFamily::Ipv4)
+        .and_then(|family| {
+            family.private_chains().iter().find_map(|chain_name| {
+                family
+                    .active_state()
+                    .projection()
+                    .chain(chain_name)
+                    .and_then(|chain| {
+                        chain
+                            .rules()
+                            .iter()
+                            .find(|rule| rule.as_str().contains("--uid-owner 1000"))
+                    })
+                    .map(|rule| rule.as_str())
+            })
+        })
+        .expect("active target must retain a raw xtables rule");
+    assert!(
+        sensitive_rule.contains("--uid-owner 1000"),
+        "fixture rule must contain distinctive sensitive material"
+    );
+
+    let formatted = format!("{observation:?}");
+    assert!(!formatted.contains(sensitive_rule));
+    assert!(formatted.contains("NativeCaptureOwnershipObservation"));
+    assert!(formatted.contains("retained_owner: \"<redacted>\""));
+    assert!(formatted.len() < 2_048, "Debug output must remain bounded");
 }
 
 #[test]

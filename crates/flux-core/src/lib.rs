@@ -78,11 +78,13 @@ pub use android_platform_profile_catalog::{
 };
 pub use android_rpdb::{
     AndroidRpdbClassificationReport, AndroidRpdbPlacementPlanError, AndroidRpdbPriorityBand,
-    AndroidRpdbPriorityContract, AndroidRpdbProfileIssue, AndroidRpdbRuleRole,
-    AndroidRpdbUnknownReason, AndroidRpdbUnknownRule, MAX_ANDROID_RPDB_UNKNOWN_RULES,
-    ReviewedCanaryRpdbClassificationError, ReviewedCanaryRpdbPlacementError, classify_android_rpdb,
-    classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
-    plan_android_rpdb_placement_with_reviewed_canary_facility,
+    AndroidRpdbPriorityContract, AndroidRpdbProfileIssue, AndroidRpdbRetainedOwner,
+    AndroidRpdbRetainedOwnerError, AndroidRpdbRuleRole, AndroidRpdbUnknownReason,
+    AndroidRpdbUnknownRule, MAX_ANDROID_RPDB_UNKNOWN_RULES, ReviewedCanaryRpdbClassificationError,
+    ReviewedCanaryRpdbPlacementError, classify_android_rpdb,
+    classify_android_rpdb_with_retained_owner, classify_android_rpdb_with_reviewed_canary_facility,
+    classify_android_rpdb_with_reviewed_canary_facility_and_retained_owner,
+    plan_android_rpdb_placement, plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 pub use android_tproxy_topology::{
     AndroidTproxyDomainSelector, AndroidTproxyEvidenceCoverage, AndroidTproxyPriorityInterval,

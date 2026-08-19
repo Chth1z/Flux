@@ -33,6 +33,7 @@ pub use coordinator::{
     AndroidFwmarkCensusExternalSnapshotDigest, AndroidFwmarkCensusPlanningEvidence,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, coordinate_android_fwmark_census,
     coordinate_android_fwmark_census_for_inventory,
+    coordinate_android_fwmark_census_for_inventory_with_active_owner,
 };
 pub use report::{
     AndroidFwmarkCensusProbeReports, AndroidFwmarkCensusReportPhase,

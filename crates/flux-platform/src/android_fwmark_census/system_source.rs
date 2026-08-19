@@ -20,12 +20,16 @@ use super::{
     AndroidTrafficControlBpfFwmarkObservationError, AndroidXfrmFwmarkObservationError,
     AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, collect_android_existing_flux_ownership,
-    collect_android_existing_flux_ownership_for_current_daemon, collect_android_xfrm_fwmarks,
-    observe_android_xtables_fwmarks,
+    collect_android_existing_flux_ownership_for_active_owner,
+    collect_android_existing_flux_ownership_for_current_daemon,
+    collect_android_existing_flux_ownership_for_current_daemon_and_active_owner,
+    collect_android_xfrm_fwmarks, observe_android_xtables_fwmarks,
+    observe_android_xtables_fwmarks_for_active_owner,
 };
+use crate::xtables::NativeCaptureOwnershipObservation;
 use crate::xtables::collect_android_xtables_save_snapshots;
 use crate::{
-    SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorClass,
+    ProcessIdentity, SystemAndroidKernelConfigError, SystemAndroidKernelConfigErrorClass,
     SystemAndroidKernelConfigErrorKind, SystemAndroidKernelConfigSource,
     SystemCapabilityProfileSource, collect_network_inventory_once,
 };
@@ -318,63 +322,42 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
 
     fn collect_external_snapshot(
         &mut self,
-        _phase: AndroidFwmarkCensusExternalPhase,
+        phase: AndroidFwmarkCensusExternalPhase,
         netd_source_profile: AndroidNetdSourceProfile,
         candidate: FwmarkCandidate,
         reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
         bound: Duration,
     ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
-        let deadline = stage_deadline(bound)?;
-        let kernel_config = self
-            .kernel_config
-            .collect()
-            .map_err(SystemAndroidFwmarkCensusSourceError::with_kernel_config_source)?;
-        ensure_before(deadline)?;
-        let nftables_gate = kernel_config
-            .nftables_observation_gate()
-            .map_err(|source| {
-                SystemAndroidFwmarkCensusSourceError::with_source(
-                    SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate,
-                    source,
-                )
-            })?;
-        let saves = collect_android_xtables_save_snapshots(
-            Path::new(SYSTEM_XTABLES_TOOL_ROOT),
-            remaining(deadline)?,
-        )
-        .map_err(|source| {
-            SystemAndroidFwmarkCensusSourceError::with_source(
-                SystemAndroidFwmarkCensusSourceErrorKind::XtablesProcess,
-                source,
-            )
-        })?;
-        let xtables = observe_android_xtables_fwmarks(
-            saves.ipv4(),
-            saves.ipv6(),
+        collect_external_snapshot_inner(
+            self,
+            phase,
             netd_source_profile,
             candidate,
-        )
-        .map_err(map_xtables_observation)?;
-        ensure_before(deadline)?;
-        let nftables = collect_android_nftables_fwmarks(nftables_gate, remaining(deadline)?)
-            .map_err(map_nftables_observation)?;
-        let traffic_control_bpf = collect_android_traffic_control_bpf_fwmarks_for_reviewed_policy(
-            remaining(deadline)?,
             reviewed_policy,
+            bound,
+            None,
         )
-        .map_err(map_traffic_control_bpf_observation)?;
-        let xfrm =
-            collect_android_xfrm_fwmarks(remaining(deadline)?).map_err(map_xfrm_observation)?;
-        ensure_before(deadline)?;
-        Ok(AndroidFwmarkCensusExternalSnapshot::new(
-            Arc::new(kernel_config),
-            xtables,
-            nftables,
-            traffic_control_bpf,
-            xfrm,
-        ))
     }
 
+    fn collect_external_snapshot_for_active_owner(
+        &mut self,
+        phase: AndroidFwmarkCensusExternalPhase,
+        netd_source_profile: AndroidNetdSourceProfile,
+        candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
+        active_owner: &NativeCaptureOwnershipObservation,
+        bound: Duration,
+    ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
+        collect_external_snapshot_inner(
+            self,
+            phase,
+            netd_source_profile,
+            candidate,
+            reviewed_policy,
+            bound,
+            Some(active_owner),
+        )
+    }
     fn collect_network_inventory(
         &mut self,
         bound: Duration,
@@ -408,6 +391,100 @@ impl AndroidFwmarkCensusCoordinatorSource for SystemAndroidFwmarkCensusSource {
         )
         .map_err(SystemAndroidFwmarkCensusSourceError::with_existing_flux_source)
     }
+
+    fn collect_existing_flux_ownership_for_active_owner(
+        &mut self,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        active_owner: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error> {
+        let collect = if self.exclude_current_daemon {
+            collect_android_existing_flux_ownership_for_current_daemon_and_active_owner
+        } else {
+            collect_android_existing_flux_ownership_for_active_owner
+        };
+        collect(
+            &self.durable_root,
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+            active_owner,
+            expected_engine,
+        )
+        .map_err(SystemAndroidFwmarkCensusSourceError::with_existing_flux_source)
+    }
+}
+
+fn collect_external_snapshot_inner(
+    source: &mut SystemAndroidFwmarkCensusSource,
+    _phase: AndroidFwmarkCensusExternalPhase,
+    netd_source_profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
+    reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
+    bound: Duration,
+    active_owner: Option<&NativeCaptureOwnershipObservation>,
+) -> Result<AndroidFwmarkCensusExternalSnapshot, SystemAndroidFwmarkCensusSourceError> {
+    let deadline = stage_deadline(bound)?;
+    let kernel_config = source
+        .kernel_config
+        .collect()
+        .map_err(SystemAndroidFwmarkCensusSourceError::with_kernel_config_source)?;
+    ensure_before(deadline)?;
+    let nftables_gate = kernel_config
+        .nftables_observation_gate()
+        .map_err(|source| {
+            SystemAndroidFwmarkCensusSourceError::with_source(
+                SystemAndroidFwmarkCensusSourceErrorKind::NftablesGate,
+                source,
+            )
+        })?;
+    let saves = collect_android_xtables_save_snapshots(
+        Path::new(SYSTEM_XTABLES_TOOL_ROOT),
+        remaining(deadline)?,
+    )
+    .map_err(|source| {
+        SystemAndroidFwmarkCensusSourceError::with_source(
+            SystemAndroidFwmarkCensusSourceErrorKind::XtablesProcess,
+            source,
+        )
+    })?;
+    let xtables = match active_owner {
+        Some(active_owner) => observe_android_xtables_fwmarks_for_active_owner(
+            saves.ipv4(),
+            saves.ipv6(),
+            netd_source_profile,
+            candidate,
+            active_owner,
+        ),
+        None => observe_android_xtables_fwmarks(
+            saves.ipv4(),
+            saves.ipv6(),
+            netd_source_profile,
+            candidate,
+        ),
+    }
+    .map_err(map_xtables_observation)?;
+    ensure_before(deadline)?;
+    let nftables = collect_android_nftables_fwmarks(nftables_gate, remaining(deadline)?)
+        .map_err(map_nftables_observation)?;
+    let traffic_control_bpf = collect_android_traffic_control_bpf_fwmarks_for_reviewed_policy(
+        remaining(deadline)?,
+        reviewed_policy,
+    )
+    .map_err(map_traffic_control_bpf_observation)?;
+    let xfrm = collect_android_xfrm_fwmarks(remaining(deadline)?).map_err(map_xfrm_observation)?;
+    ensure_before(deadline)?;
+    Ok(AndroidFwmarkCensusExternalSnapshot::new(
+        Arc::new(kernel_config),
+        xtables,
+        nftables,
+        traffic_control_bpf,
+        xfrm,
+    ))
 }
 
 fn stage_deadline(bound: Duration) -> Result<Instant, SystemAndroidFwmarkCensusSourceError> {

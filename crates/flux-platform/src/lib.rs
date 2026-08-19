@@ -52,6 +52,7 @@ pub use android_fwmark_census::{
     AndroidXtablesFwmarkObservationErrorKind, AndroidXtablesSnapshotDigest,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, assemble_android_fwmark_census_projection,
     coordinate_android_fwmark_census, coordinate_android_fwmark_census_for_inventory,
+    coordinate_android_fwmark_census_for_inventory_with_active_owner,
     observe_android_xtables_fwmarks, parse_android_fwmark_census_probe_reports,
     validate_android_fwmark_census_probe_reports, validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,

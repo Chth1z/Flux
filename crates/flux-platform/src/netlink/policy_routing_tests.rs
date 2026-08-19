@@ -4,7 +4,10 @@ use flux_core::{
     AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
     CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureIpPrefix,
     CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope, CaptureUserId,
-    EngineCredentials, FwmarkCandidate, GenerationId, compile_capture_program,
+    EngineCredentials, FwmarkCandidate, GenerationId, InterfaceName, NetworkAddressFamily,
+    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, RouteFlags, RoutePath,
+    RoutePrefix, RouteProperties, RuleAction, RuleFlags, RuleProperties, RuleTableId,
+    compile_capture_program,
 };
 
 use super::*;
@@ -449,6 +452,140 @@ fn readback_preserves_duplicate_exact_objects() {
     assert_eq!(observed.route().conflict_count(), 0);
     assert_eq!(observed.rule().exact_count(), 2);
     assert_eq!(observed.rule().conflict_count(), 0);
+}
+
+#[test]
+fn semantic_inventory_matching_requires_one_exact_route_and_rule() {
+    let identity = identity(NetworkAddressFamily::Ipv4, TEST_TABLE);
+    let exact_route = expected_route_record(identity.route());
+    let exact_rule = expected_rule_record(identity.rule());
+    let mut tracker = NetworkInventoryTracker::new();
+    let inventory = tracker
+        .publish_complete_with_routing(
+            [],
+            [],
+            [exact_route.clone(), exact_route],
+            [exact_rule.clone(), exact_rule],
+        )
+        .unwrap();
+    let observed = observe_managed_policy_routing_inventory(inventory, identity);
+
+    assert_eq!(observed.route().exact_count(), 2);
+    assert_eq!(observed.route().conflict_count(), 0);
+    assert_eq!(observed.rule().exact_count(), 2);
+    assert_eq!(observed.rule().conflict_count(), 0);
+    assert_eq!(exact_managed_rule_index(inventory, identity), None);
+}
+
+#[test]
+fn semantic_inventory_matching_returns_only_exact_rule_index() {
+    let identity = identity(NetworkAddressFamily::Ipv4, TEST_TABLE);
+    let mut tracker = NetworkInventoryTracker::new();
+    let inventory = tracker
+        .publish_complete_with_routing(
+            [],
+            [],
+            [expected_route_record(identity.route())],
+            [expected_rule_record(identity.rule())],
+        )
+        .unwrap();
+
+    assert_eq!(exact_managed_rule_index(inventory, identity), Some(0));
+}
+
+#[test]
+fn semantic_inventory_matching_does_not_consume_foreign_cross_table_objects() {
+    let identity = identity(NetworkAddressFamily::Ipv4, TEST_TABLE);
+    let foreign_route = NetworkRouteRecord::new(
+        identity.route().destination(),
+        RoutePrefix::unspecified(identity.family()),
+        RouteProperties::new(
+            0,
+            RouteTableId::from_raw(TEST_TABLE + 1),
+            identity.route().protocol(),
+            identity.route().scope(),
+            identity.route().route_type(),
+            RouteFlags::from_raw(0),
+        ),
+        identity.route().metric().get(),
+        RoutePath::Single {
+            output_interface: Some(identity.route().output_interface()),
+            gateway: None,
+        },
+    )
+    .unwrap();
+    let foreign_rule = NetworkRuleRecord::new(
+        RulePrefix::unspecified(identity.family()),
+        RulePrefix::unspecified(identity.family()),
+        RuleProperties::new(
+            0,
+            RuleTableId::from_raw(TEST_TABLE + 1),
+            RuleAction::TO_TABLE,
+            identity.rule().protocol(),
+            RuleFlags::from_raw(0),
+        ),
+        RulePriority::from_raw(TEST_PRIORITY + 1),
+        None,
+    )
+    .unwrap()
+    .with_fwmark(identity.rule().mark());
+    let mut tracker = NetworkInventoryTracker::new();
+    let inventory = tracker
+        .publish_complete_with_routing(
+            [],
+            [],
+            [expected_route_record(identity.route()), foreign_route],
+            [expected_rule_record(identity.rule()), foreign_rule],
+        )
+        .unwrap();
+    let observed = observe_managed_policy_routing_inventory(inventory, identity);
+
+    assert!(observed.exact());
+    assert_eq!(exact_managed_rule_index(inventory, identity), Some(0));
+}
+
+#[test]
+fn semantic_inventory_matching_keeps_same_coordinate_substitutions_as_conflicts() {
+    let identity = identity(NetworkAddressFamily::Ipv4, TEST_TABLE);
+    let exact_route = expected_route_record(identity.route());
+    let conflicting_route = NetworkRouteRecord::new(
+        identity.route().destination(),
+        RoutePrefix::unspecified(identity.family()),
+        RouteProperties::new(
+            0,
+            identity.route().table(),
+            identity.route().protocol(),
+            identity.route().scope(),
+            identity.route().route_type(),
+            RouteFlags::from_raw(0),
+        ),
+        identity.route().metric().get() + 1,
+        RoutePath::Single {
+            output_interface: Some(identity.route().output_interface()),
+            gateway: None,
+        },
+    )
+    .unwrap();
+    let exact_rule = expected_rule_record(identity.rule());
+    let conflicting_rule = exact_rule
+        .clone()
+        .with_output_interface(InterfaceName::new(b"eth0").unwrap());
+    let mut tracker = NetworkInventoryTracker::new();
+    let inventory = tracker
+        .publish_complete_with_routing(
+            [],
+            [],
+            [exact_route, conflicting_route],
+            [exact_rule, conflicting_rule],
+        )
+        .unwrap();
+    let observed = observe_managed_policy_routing_inventory(inventory, identity);
+
+    assert_eq!(observed.route().exact_count(), 1);
+    assert_eq!(observed.route().conflict_count(), 1);
+    assert_eq!(observed.rule().exact_count(), 1);
+    assert_eq!(observed.rule().conflict_count(), 1);
+    assert_eq!(exact_managed_rule_index(inventory, identity), None);
 }
 
 #[test]

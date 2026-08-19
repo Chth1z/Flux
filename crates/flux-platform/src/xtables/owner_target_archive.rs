@@ -25,10 +25,10 @@ use super::super::super::{
 };
 use super::super::XtablesStableFamilyRecoveryMaterial;
 use super::{
-    NativePolicyRoutingAudit, NativePolicyRoutingAuditError, NativeXtablesAdmittedTarget,
-    NativeXtablesConvergedState, NativeXtablesTargetError, NativeXtablesTargetIdentity,
-    NativeXtablesTargetResolver, XtablesStableFamilyPlan, XtablesStableTopologyError,
-    XtablesStableTopologyPlan,
+    NativeCaptureTargetIdentity, NativePolicyRoutingAudit, NativePolicyRoutingAuditError,
+    NativeXtablesAdmittedTarget, NativeXtablesConvergedState, NativeXtablesTargetError,
+    NativeXtablesTargetIdentity, NativeXtablesTargetResolver, XtablesStableFamilyPlan,
+    XtablesStableTopologyError, XtablesStableTopologyPlan,
 };
 
 const ARCHIVE_MAGIC: &[u8] = b"flux-native-xtables-target-archive\0";
@@ -79,6 +79,35 @@ pub(crate) fn observe_native_xtables_target_archive(
         target_count: targets.len(),
         digest: Sha256::digest(encoded).into(),
     })
+}
+
+/// Requires a durable target archive to contain exactly the authenticated active target.
+///
+/// An active-owner census may retain this one archive, but it must not hide a replacement,
+/// duplicate, or second target by filtering the decoded list. The archive parser already rejects
+/// duplicate identities; this helper additionally rejects every non-singleton or mismatched list.
+pub(crate) fn observe_native_xtables_target_archive_for_active_owner(
+    encoded: Option<&[u8]>,
+    active_target: NativeCaptureTargetIdentity,
+) -> Result<(), NativeXtablesTargetArchiveError> {
+    let Some(encoded) = encoded else {
+        return Err(NativeXtablesTargetArchiveError::Invalid(
+            "active owner target archive is absent",
+        ));
+    };
+    let targets = decode_archive(encoded)?;
+    let expected_target = NativeXtablesTargetIdentity {
+        generation: active_target.generation(),
+        target_digest: active_target.target_digest(),
+        tool_digest: active_target.tool_digest(),
+        routing_digest: active_target.routing_digest(),
+    };
+    if targets.len() != 1 || targets[0].identity() != expected_target {
+        return Err(NativeXtablesTargetArchiveError::Invalid(
+            "active owner target archive is not exactly the authenticated target",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]

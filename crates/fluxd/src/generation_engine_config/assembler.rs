@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use flux_core::{
-    AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidUserSelection,
+    AddressHostFamilySelection, AndroidMarkPlanningAuthority, AndroidNetdSourceProfile,
+    AndroidTproxyRoutingShape, AndroidTproxyTrafficDomainRequest, AndroidUserSelection,
     CapabilityProfile, CaptureApplicationMode, CaptureInterfaceSelectorKind, CapturePathId,
-    CapturePathRequest, CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig,
-    FwmarkCandidate, GenerationId, NetworkAddressFamily, NetworkEpoch, NetworkInventory,
-    NetworkInventorySnapshotId, NetworkNamespaceIdentity, RpdbPlacementLease,
-    StaleRpdbPlacementLease,
+    CapturePathQualificationState, CapturePathRequest, CaptureProgramCompilation,
+    CaptureTrafficDomain, CaptureTransportProtocol, FluxConfig, FwmarkCandidate, GenerationId,
+    NetworkAddressFamily, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
+    NetworkNamespaceIdentity, RpdbPlacementLease, StaleRpdbPlacementLease,
 };
 use flux_platform::{
     AndroidFwmarkCensusPlanningEvidence, AndroidKernelConfigSnapshot, SingBoxPrivilege,
@@ -45,6 +46,8 @@ const GENERATION_PLANNING_DIGEST_DOMAIN: &[u8] =
     b"Flux complete Generation planning authority\0canonical-schema-v2\0sha256-v1\0";
 const PRODUCT_DESIRED_STATE_DIGEST_DOMAIN: &[u8] =
     b"Flux product Desired State\0schema-v5\0sha256-v1\0";
+const ACTIVE_CAPTURE_PLAN_DIGEST_DOMAIN: &[u8] =
+    b"Flux active Capture Path safety plan\0canonical-schema-v1\0sha256-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -82,6 +85,14 @@ impl GenerationPlanningDigest {
         &self.0
     }
 }
+
+/// Stable facts that make one already-selected Capture Path safe to keep active.
+///
+/// Observation IDs, inventory epochs, timestamps, deadlines, engine config paths, and Generation
+/// lineage deliberately stay outside this value.  The digest is private to the fluxd crate; the
+/// native writer only carries it between the assembler and its private source transaction.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ActiveCapturePlanDigest([u8; GENERATION_ASSEMBLY_DIGEST_BYTES]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AdmittedGenerationIdentity {
@@ -309,6 +320,7 @@ pub(crate) struct AdmittedGeneration {
     capture_path_selection: CapturePathSelection,
     capture_path_evidence_deadline: Instant,
     functional_canary_mode: FunctionalCanaryGateMode,
+    active_capture_plan_digest: ActiveCapturePlanDigest,
     planning: GenerationPlanningAuthority,
 }
 
@@ -408,6 +420,11 @@ impl AdmittedGeneration {
     #[must_use]
     pub(crate) const fn capture_path_evidence_deadline(&self) -> Instant {
         self.capture_path_evidence_deadline
+    }
+
+    #[must_use]
+    pub(crate) const fn active_capture_plan_digest(&self) -> ActiveCapturePlanDigest {
+        self.active_capture_plan_digest
     }
 
     pub(crate) fn prepared_canary_generation_binding(
@@ -533,9 +550,17 @@ pub(crate) enum GenerationPlanningErrorKind {
     InventorySnapshotMismatch,
     InventoryEpochMismatch,
     StalePlacement,
+    CapturePathNotQualified {
+        path: CapturePathId,
+        state: CapturePathQualificationState,
+    },
+    CapturePathQualificationContextMismatch,
+    MissingBehavioralCapturePathEvidence,
     MissingLocalOutputRouting,
     UnexpectedLocalOutputRouting,
-    RoutingFamilyMismatch { family: NetworkAddressFamily },
+    RoutingFamilyMismatch {
+        family: NetworkAddressFamily,
+    },
 }
 
 #[derive(Debug)]
@@ -544,9 +569,17 @@ pub(crate) enum GenerationPlanningError {
     InventorySnapshotMismatch,
     InventoryEpochMismatch,
     StalePlacement(StaleRpdbPlacementLease),
+    CapturePathNotQualified {
+        path: CapturePathId,
+        state: CapturePathQualificationState,
+    },
+    CapturePathQualificationContextMismatch,
+    MissingBehavioralCapturePathEvidence,
     MissingLocalOutputRouting,
     UnexpectedLocalOutputRouting,
-    RoutingFamilyMismatch { family: NetworkAddressFamily },
+    RoutingFamilyMismatch {
+        family: NetworkAddressFamily,
+    },
 }
 
 impl GenerationPlanningError {
@@ -562,6 +595,18 @@ impl GenerationPlanningError {
             }
             Self::InventoryEpochMismatch => GenerationPlanningErrorKind::InventoryEpochMismatch,
             Self::StalePlacement(_) => GenerationPlanningErrorKind::StalePlacement,
+            Self::CapturePathNotQualified { path, state } => {
+                GenerationPlanningErrorKind::CapturePathNotQualified {
+                    path: *path,
+                    state: *state,
+                }
+            }
+            Self::CapturePathQualificationContextMismatch => {
+                GenerationPlanningErrorKind::CapturePathQualificationContextMismatch
+            }
+            Self::MissingBehavioralCapturePathEvidence => {
+                GenerationPlanningErrorKind::MissingBehavioralCapturePathEvidence
+            }
             Self::MissingLocalOutputRouting => {
                 GenerationPlanningErrorKind::MissingLocalOutputRouting
             }
@@ -586,6 +631,17 @@ impl fmt::Display for GenerationPlanningError {
             Self::InventoryEpochMismatch => formatter
                 .write_str("planning evidence identifies a different Network Inventory epoch"),
             Self::StalePlacement(source) => source.fmt(formatter),
+            Self::CapturePathNotQualified { path, state } => write!(
+                formatter,
+                "selected Capture Path {} has fresh {state:?} qualification instead of Qualified evidence",
+                path.as_token(),
+            ),
+            Self::CapturePathQualificationContextMismatch => formatter.write_str(
+                "fresh Capture Path qualification identifies a different runtime context",
+            ),
+            Self::MissingBehavioralCapturePathEvidence => formatter.write_str(
+                "active Android Capture Path audit has no behavioral qualification evidence",
+            ),
             Self::MissingLocalOutputRouting => {
                 formatter.write_str("local-OUTPUT capture requires snapshot-bound routing evidence")
             }
@@ -744,6 +800,9 @@ impl GenerationAssembler {
             planning_context,
             capture_path_selection,
         });
+        let active_capture_plan_digest =
+            digest_active_capture_plan(&desired_state, &capture, &planning, capture_path_selection)
+                .map_err(GenerationAssemblyError::Planning)?;
 
         Ok(AdmittedGeneration {
             identity: AdmittedGenerationIdentity { generation, digest },
@@ -758,6 +817,7 @@ impl GenerationAssembler {
             capture_path_selection,
             capture_path_evidence_deadline: capture_path_evidence.valid_until(),
             functional_canary_mode,
+            active_capture_plan_digest,
             planning,
         })
     }
@@ -1066,6 +1126,278 @@ pub(crate) fn bind_engine_spec_to_desired_state(
     Ok(spec.with_restart_policy(restart))
 }
 
+fn digest_active_capture_plan(
+    desired_state: &FluxConfig,
+    capture: &CaptureProgramCompilation,
+    planning: &GenerationPlanningAuthority,
+    selection: CapturePathSelection,
+) -> Result<ActiveCapturePlanDigest, GenerationPlanningError> {
+    let qualification_state = planning
+        .capture_path_evidence()
+        .qualifications()
+        .state(selection.selected());
+    if qualification_state != CapturePathQualificationState::Qualified {
+        return Err(GenerationPlanningError::CapturePathNotQualified {
+            path: selection.selected(),
+            state: qualification_state,
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(ACTIVE_CAPTURE_PLAN_DIGEST_DOMAIN);
+    update_field(&mut digest, capture.program().digest().as_bytes());
+    update_capture_scope(&mut digest, desired_state.capture().scope());
+    update_capture_protocols(&mut digest, desired_state.capture().protocols());
+    update_capture_path_request(&mut digest, selection.request());
+    update_capture_path_id(&mut digest, selection.selected());
+    match planning {
+        #[cfg(test)]
+        GenerationPlanningAuthority::HostInspection(authority) => {
+            validate_routing_shape(
+                desired_state
+                    .capture()
+                    .scope()
+                    .includes_domain(CaptureTrafficDomain::LocalOutput),
+                desired_state.capture().scope().families(),
+                authority.routing,
+            )?;
+            digest.update([0]);
+            update_field(
+                &mut digest,
+                authority.capability_profile.digest().as_bytes(),
+            );
+            update_field(&mut digest, authority.kernel_config.digest().as_bytes());
+            update_capture_path_evidence(&mut digest, &authority.capture_path_evidence);
+            update_field(
+                &mut digest,
+                &authority.network_namespace.device().to_be_bytes(),
+            );
+            update_field(
+                &mut digest,
+                &authority.network_namespace.inode().to_be_bytes(),
+            );
+            update_mark(&mut digest, authority.mark);
+            update_routing(&mut digest, authority.routing);
+        }
+        GenerationPlanningAuthority::Android {
+            mark,
+            kernel_config,
+            capture_path_evidence,
+            placement,
+        } => {
+            if capture_path_evidence.behavioral_digest().is_none() {
+                return Err(GenerationPlanningError::MissingBehavioralCapturePathEvidence);
+            }
+            if !capture_path_evidence
+                .matches_runtime_context(mark.capability_profile(), mark.network_namespace())
+            {
+                return Err(GenerationPlanningError::CapturePathQualificationContextMismatch);
+            }
+            digest.update([1]);
+            update_field(&mut digest, mark.capability_profile().digest().as_bytes());
+            update_field(&mut digest, kernel_config.digest().as_bytes());
+            update_capture_path_evidence(&mut digest, capture_path_evidence);
+            update_field(
+                &mut digest,
+                &mark.network_namespace().device().to_be_bytes(),
+            );
+            update_field(&mut digest, &mark.network_namespace().inode().to_be_bytes());
+            update_mark(&mut digest, mark.candidate());
+            update_android_topology_scope(&mut digest, mark.topology_scope());
+            update_android_policy_identity(&mut digest, mark.policy_identity());
+            update_field(&mut digest, &mark.policy_revision().get().to_be_bytes());
+            update_field(&mut digest, &[mark.planes().bits()]);
+            let census = mark.census();
+            update_field(
+                &mut digest,
+                &census.collector_revision().get().to_be_bytes(),
+            );
+            update_effective_android_routing(&mut digest, desired_state, *placement)?;
+        }
+    }
+    Ok(ActiveCapturePlanDigest(digest.finalize().into()))
+}
+
+pub(crate) fn active_capture_plan_digest_for_audit(
+    desired_state: &FluxConfig,
+    capture: &CaptureProgramCompilation,
+    planning: &GenerationPlanningAuthority,
+    selection: CapturePathSelection,
+) -> Result<ActiveCapturePlanDigest, GenerationPlanningError> {
+    digest_active_capture_plan(desired_state, capture, planning, selection)
+}
+
+fn update_capture_scope(digest: &mut Sha256, scope: flux_core::CaptureTrafficScope) {
+    digest.update([
+        family_tag(scope.families()),
+        u8::from(scope.includes_domain(CaptureTrafficDomain::LocalOutput)),
+        u8::from(scope.includes_domain(CaptureTrafficDomain::ForwardedIngress)),
+    ]);
+}
+
+fn update_capture_protocols(digest: &mut Sha256, protocols: flux_core::CaptureProtocolSet) {
+    digest.update([
+        u8::from(protocols.contains(CaptureTransportProtocol::Tcp)),
+        u8::from(protocols.contains(CaptureTransportProtocol::Udp)),
+    ]);
+}
+
+fn update_capture_path_request(digest: &mut Sha256, request: CapturePathRequest) {
+    match request {
+        CapturePathRequest::Auto => digest.update([0]),
+        CapturePathRequest::Exact(path) => {
+            digest.update([1]);
+            update_capture_path_id(digest, path);
+        }
+    }
+}
+
+fn update_capture_path_id(digest: &mut Sha256, path: CapturePathId) {
+    digest.update([match path {
+        CapturePathId::NftablesTproxy => 0,
+        CapturePathId::XtablesTproxy => 1,
+        CapturePathId::ManagedTun => 2,
+    }]);
+}
+
+fn update_capture_path_evidence(digest: &mut Sha256, evidence: &CapturePathQualificationEvidence) {
+    if let Some(behavioral_digest) = evidence.behavioral_digest() {
+        digest.update([1]);
+        update_field(digest, &behavioral_digest);
+    } else {
+        digest.update([0]);
+        update_capture_path_qualifications(digest, evidence.qualifications());
+    }
+}
+
+fn update_capture_path_qualifications(
+    digest: &mut Sha256,
+    qualifications: flux_core::CapturePathQualifications,
+) {
+    for path in CapturePathId::ALL {
+        digest.update([
+            match path {
+                CapturePathId::NftablesTproxy => 0,
+                CapturePathId::XtablesTproxy => 1,
+                CapturePathId::ManagedTun => 2,
+            },
+            capture_path_qualification_state_tag(qualifications.state(path)),
+        ]);
+    }
+}
+
+const fn capture_path_qualification_state_tag(state: CapturePathQualificationState) -> u8 {
+    match state {
+        CapturePathQualificationState::Qualified => 0,
+        CapturePathQualificationState::Unsupported => 1,
+        CapturePathQualificationState::Denied => 2,
+        CapturePathQualificationState::Conflicting => 3,
+        CapturePathQualificationState::Broken => 4,
+        CapturePathQualificationState::Unqualified => 5,
+    }
+}
+
+fn update_android_topology_scope(
+    digest: &mut Sha256,
+    scope: &flux_core::AndroidTproxyTopologyScopeReport,
+) {
+    update_field(digest, &scope.classifier_revision().get().to_be_bytes());
+    update_android_netd_source_profile(digest, scope.profile());
+    update_android_topology_request(digest, scope.request());
+}
+
+fn update_android_netd_source_profile(digest: &mut Sha256, profile: AndroidNetdSourceProfile) {
+    digest.update([match profile {
+        AndroidNetdSourceProfile::AospAndroid12R1 => 0,
+        AndroidNetdSourceProfile::AospAndroid13R1 => 1,
+        AndroidNetdSourceProfile::AospNetd20250324 => 2,
+    }]);
+}
+
+fn update_android_topology_request(
+    digest: &mut Sha256,
+    request: &flux_core::AndroidTproxyTopologyScopeRequest,
+) {
+    digest.update([match request.shape() {
+        AndroidTproxyRoutingShape::DedicatedAddressBypassRule => 0,
+        AndroidTproxyRoutingShape::PreMarkAddressHostSet => 1,
+    }]);
+    update_field(digest, &(request.domains().len() as u64).to_be_bytes());
+    for domain in request.domains() {
+        match *domain {
+            AndroidTproxyTrafficDomainRequest::ResidualLocalOutput { family } => {
+                digest.update([0, network_family_tag(family)]);
+            }
+            AndroidTproxyTrafficDomainRequest::TetherIngress {
+                family,
+                input_interface,
+            } => {
+                digest.update([1, network_family_tag(family)]);
+                update_field(digest, input_interface.as_bytes());
+            }
+        }
+    }
+}
+
+fn update_android_policy_identity(
+    digest: &mut Sha256,
+    identity: &flux_core::AndroidMarkDevicePolicyIdentity,
+) {
+    digest.update([match identity.kind() {
+        flux_core::AndroidMarkDevicePolicyKind::GenericAospNoGrant => 0,
+        flux_core::AndroidMarkDevicePolicyKind::DeviceQualifiedCooperative => 1,
+    }]);
+    match identity.assurance_class() {
+        Some(flux_core::AndroidMarkPolicyAssuranceClass::AuthenticatedSource) => {
+            digest.update([1, 0])
+        }
+        Some(flux_core::AndroidMarkPolicyAssuranceClass::ExactArtifactObservedBehavior) => {
+            digest.update([1, 1])
+        }
+        None => digest.update([0]),
+    }
+    update_optional_text(digest, identity.catalog_entry().map(|entry| entry.as_str()));
+    update_optional_text(digest, identity.name().map(|name| name.as_str()));
+    match identity.artifact_digest() {
+        Some(artifact) => {
+            digest.update([1]);
+            update_field(digest, artifact.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn update_optional_text(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            update_field(digest, value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn update_effective_android_routing(
+    digest: &mut Sha256,
+    desired_state: &FluxConfig,
+    placement: Option<RpdbPlacementLease>,
+) -> Result<(), GenerationPlanningError> {
+    let local_output = desired_state
+        .capture()
+        .scope()
+        .includes_domain(CaptureTrafficDomain::LocalOutput);
+    if !local_output {
+        if placement.is_some() {
+            return Err(GenerationPlanningError::UnexpectedLocalOutputRouting);
+        }
+        update_routing(digest, None);
+        return Ok(());
+    }
+    let placement = placement.ok_or(GenerationPlanningError::MissingLocalOutputRouting)?;
+    let routing = routing_from_placement(placement, desired_state.capture().scope().families())?;
+    update_routing(digest, Some(routing));
+    Ok(())
+}
+
 struct GenerationDigestInput<'a> {
     generation: GenerationId,
     prior_owned: Option<AdmittedGenerationIdentity>,
@@ -1369,6 +1701,13 @@ fn family_tag(families: AddressHostFamilySelection) -> u8 {
         AddressHostFamilySelection::Ipv4 => 0,
         AddressHostFamilySelection::Ipv6 => 1,
         AddressHostFamilySelection::DualStack => 2,
+    }
+}
+
+const fn network_family_tag(family: NetworkAddressFamily) -> u8 {
+    match family {
+        NetworkAddressFamily::Ipv4 => 4,
+        NetworkAddressFamily::Ipv6 => 6,
     }
 }
 

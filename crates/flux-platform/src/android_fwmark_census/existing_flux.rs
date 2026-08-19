@@ -319,10 +319,17 @@ mod implementation {
     };
     use sha2::{Digest, Sha256};
 
+    use crate::ProcessIdentity;
+    use crate::netlink::policy_routing::{
+        ManagedPolicyRoutingIdentity, observe_managed_policy_routing_inventory,
+    };
     use crate::xtables::{
+        NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION, NativeCaptureOwnershipObservation,
         NativeXtablesDurableReadOnlyObservation, NativeXtablesDurableRootIdentity,
-        NativeXtablesDurableStore, NativeXtablesTargetArchiveObservation,
+        NativeXtablesDurableStore, NativeXtablesJournalObservation, NativeXtablesJournalPhase,
+        NativeXtablesLeaseScope, NativeXtablesTargetArchiveObservation,
         observe_native_xtables_target_archive,
+        observe_native_xtables_target_archive_for_active_owner,
     };
 
     use super::{
@@ -396,6 +403,56 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         )
     }
 
+    /// Collects a proof that no *foreign* native Flux owner remains while retaining exactly one
+    /// already-authenticated active owner. The active owner's durable records, one engine process,
+    /// xtables projection, and route/rule identities are checked exactly; every replacement,
+    /// duplicate, or additional Flux-like record remains a conflict.
+    pub fn collect_android_existing_flux_ownership_for_active_owner(
+        durable_root: impl AsRef<Path>,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: flux_core::NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        active_owner: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
+        collect_from_roots_with_active_owner(
+            durable_root.as_ref(),
+            Path::new("/proc"),
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+            None,
+            active_owner,
+            expected_engine,
+        )
+    }
+
+    /// In-daemon variant of [`collect_android_existing_flux_ownership_for_active_owner`].
+    /// Only the exact current daemon PID is excluded; another daemon is foreign state.
+    pub fn collect_android_existing_flux_ownership_for_current_daemon_and_active_owner(
+        durable_root: impl AsRef<Path>,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: flux_core::NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        active_owner: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
+        collect_from_roots_with_active_owner(
+            durable_root.as_ref(),
+            Path::new("/proc"),
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+            Some(std::process::id()),
+            active_owner,
+            expected_engine,
+        )
+    }
+
     fn collect_from_roots(
         durable_root: &Path,
         proc_root: &Path,
@@ -404,6 +461,53 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         network_namespace: flux_core::NetworkNamespaceIdentity,
         xtables: &AndroidXtablesFwmarkObservation,
         excluded_daemon_pid: Option<u32>,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
+        collect_from_roots_inner(
+            durable_root,
+            proc_root,
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+            excluded_daemon_pid,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_from_roots_with_active_owner(
+        durable_root: &Path,
+        proc_root: &Path,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: flux_core::NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        excluded_daemon_pid: Option<u32>,
+        active_owner: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
+        collect_from_roots_inner(
+            durable_root,
+            proc_root,
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+            excluded_daemon_pid,
+            Some((active_owner, expected_engine)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_from_roots_inner(
+        durable_root: &Path,
+        proc_root: &Path,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: flux_core::NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        excluded_daemon_pid: Option<u32>,
+        active_owner: Option<(&NativeCaptureOwnershipObservation, ProcessIdentity)>,
     ) -> Result<AndroidExistingFluxOwnershipObservation, AndroidExistingFluxOwnershipError> {
         if !durable_root.is_absolute() {
             return Err(AndroidExistingFluxOwnershipError::new(
@@ -421,11 +525,16 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         }
 
         let store = NativeXtablesDurableStore::new(durable_root);
-        let durable_before = observe_durable(&store)?;
-        let processes_before = observe_flux_processes(proc_root, excluded_daemon_pid)?;
-        let policy_routing = observe_policy_routing(inventory);
-        let processes_after = observe_flux_processes(proc_root, excluded_daemon_pid)?;
-        let durable_after = observe_durable(&store)?;
+        let durable_before =
+            observe_durable_for_owner(&store, active_owner.map(|(owner, _)| owner))?;
+        let processes_before =
+            observe_flux_processes_for_owner(proc_root, excluded_daemon_pid, active_owner)?;
+        let policy_routing =
+            observe_policy_routing_for_owner(inventory, active_owner.map(|(owner, _)| owner))?;
+        let processes_after =
+            observe_flux_processes_for_owner(proc_root, excluded_daemon_pid, active_owner)?;
+        let durable_after =
+            observe_durable_for_owner(&store, active_owner.map(|(owner, _)| owner))?;
 
         if durable_before != durable_after {
             return Err(AndroidExistingFluxOwnershipError::new(
@@ -446,13 +555,13 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             routes: policy_routing.route_total(),
             rules: policy_routing.rule_total(),
         };
-        if counts.durable_artifacts != 0 {
+        if active_owner.is_none() && counts.durable_artifacts != 0 {
             return Err(AndroidExistingFluxOwnershipError::with_count(
                 AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent,
                 counts.durable_artifacts,
             ));
         }
-        if counts.processes != 0 {
+        if active_owner.is_none() && counts.processes != 0 {
             return Err(AndroidExistingFluxOwnershipError::with_count(
                 AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent,
                 counts.processes,
@@ -464,7 +573,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
                 counts.chains,
             ));
         }
-        if counts.routes.saturating_add(counts.rules) != 0 {
+        if active_owner.is_none() && counts.routes.saturating_add(counts.rules) != 0 {
             return Err(AndroidExistingFluxOwnershipError::with_count(
                 AndroidExistingFluxOwnershipErrorKind::PolicyRoutingOwnershipPresent,
                 counts.routes.saturating_add(counts.rules),
@@ -478,6 +587,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             network_namespace,
             xtables,
             &durable_before,
+            &processes_before,
             counts,
         );
         let mut journal_digest = Sha256::new();
@@ -523,7 +633,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         )
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     struct DurableSnapshot {
         root_identity: Option<NativeXtablesDurableRootIdentity>,
         journal_present: bool,
@@ -531,10 +641,12 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         attempt_present: bool,
         writer_lock_present: bool,
         archive: NativeXtablesTargetArchiveObservation,
+        journal: Option<NativeXtablesJournalObservation>,
+        lease: Option<NativeXtablesLeaseScope>,
     }
 
     impl DurableSnapshot {
-        fn ownership_artifact_count(self) -> usize {
+        fn ownership_artifact_count(&self) -> usize {
             usize::from(self.journal_present)
                 + usize::from(self.lease_present)
                 + usize::from(self.attempt_present)
@@ -570,7 +682,99 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             attempt_present: observed.attempt_present(),
             writer_lock_present: observed.writer_lock_present(),
             archive,
+            journal: None,
+            lease: None,
         })
+    }
+
+    fn observe_durable_for_owner(
+        store: &NativeXtablesDurableStore,
+        active_owner: Option<&NativeCaptureOwnershipObservation>,
+    ) -> Result<DurableSnapshot, AndroidExistingFluxOwnershipError> {
+        let Some(active_owner) = active_owner else {
+            return observe_durable(store);
+        };
+        let observed = store.observe_read_only().map_err(|_| {
+            AndroidExistingFluxOwnershipError::new(
+                AndroidExistingFluxOwnershipErrorKind::DurableObservationFailed,
+            )
+        })?;
+        let mut snapshot = durable_snapshot(&observed)?;
+
+        let Some(journal) = store.observe_journal().map_err(|_| {
+            AndroidExistingFluxOwnershipError::new(
+                AndroidExistingFluxOwnershipErrorKind::DurableObservationFailed,
+            )
+        })?
+        else {
+            return Err(AndroidExistingFluxOwnershipError::with_count(
+                AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent,
+                1,
+            ));
+        };
+        let Some(lease) = store.load_lease().map_err(|_| {
+            AndroidExistingFluxOwnershipError::new(
+                AndroidExistingFluxOwnershipErrorKind::DurableObservationFailed,
+            )
+        })?
+        else {
+            return Err(AndroidExistingFluxOwnershipError::with_count(
+                AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent,
+                1,
+            ));
+        };
+        if !journal_matches_active_owner(&journal, active_owner)
+            || !lease_matches_active_owner(&lease, active_owner)
+            || snapshot.attempt_present
+            || snapshot.writer_lock_present
+            || !snapshot.journal_present
+            || !snapshot.lease_present
+        {
+            return Err(AndroidExistingFluxOwnershipError::with_count(
+                AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent,
+                snapshot.ownership_artifact_count().max(1),
+            ));
+        }
+        observe_native_xtables_target_archive_for_active_owner(
+            observed.target_archive(),
+            active_owner.target(),
+        )
+        .map_err(|_| {
+            AndroidExistingFluxOwnershipError::with_count(
+                AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent,
+                snapshot.archive.target_count().max(1),
+            )
+        })?;
+        snapshot.journal = Some(journal);
+        snapshot.lease = Some(lease);
+        Ok(snapshot)
+    }
+
+    fn journal_matches_active_owner(
+        observation: &NativeXtablesJournalObservation,
+        active_owner: &NativeCaptureOwnershipObservation,
+    ) -> bool {
+        let record = observation.record();
+        let binding = record.binding();
+        binding.boot_identity() == active_owner.boot_identity()
+            && binding.network_namespace() == active_owner.network_namespace()
+            && binding.generation() == active_owner.target().generation()
+            && binding.journal_identity() == active_owner.journal_identity()
+            && record.revision() == active_owner.journal_revision()
+            && record.phase() == NativeXtablesJournalPhase::Active
+            && active_owner.record_schema_version().get() == NATIVE_XTABLES_JOURNAL_SCHEMA_VERSION
+            && observation.file_device() == active_owner.record_device()
+            && observation.file_inode() == active_owner.record_inode()
+            && observation.digest() == active_owner.record_digest()
+    }
+
+    fn lease_matches_active_owner(
+        lease: &NativeXtablesLeaseScope,
+        active_owner: &NativeCaptureOwnershipObservation,
+    ) -> bool {
+        lease.boot_identity() == active_owner.boot_identity()
+            && lease.network_namespace() == active_owner.network_namespace()
+            && lease.journal_identity() == active_owner.journal_identity()
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -612,6 +816,56 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             }
         }
         observation
+    }
+
+    fn observe_policy_routing_for_owner(
+        inventory: &NetworkInventory,
+        active_owner: Option<&NativeCaptureOwnershipObservation>,
+    ) -> Result<PolicyRoutingOwnership, AndroidExistingFluxOwnershipError> {
+        let observation = observe_policy_routing(inventory);
+        let Some(active_owner) = active_owner else {
+            return Ok(observation);
+        };
+
+        let mut seen = Vec::<ManagedPolicyRoutingIdentity>::new();
+        for identity in active_owner.retained_owner().routing() {
+            if seen.iter().any(|seen| seen == identity) {
+                return Err(AndroidExistingFluxOwnershipError::with_count(
+                    AndroidExistingFluxOwnershipErrorKind::PolicyRoutingOwnershipPresent,
+                    1,
+                ));
+            }
+            let exact = observe_managed_policy_routing_inventory(inventory, *identity);
+            if !exact.exact() {
+                return Err(AndroidExistingFluxOwnershipError::with_count(
+                    AndroidExistingFluxOwnershipErrorKind::PolicyRoutingOwnershipPresent,
+                    exact
+                        .route()
+                        .exact_count()
+                        .saturating_add(exact.route().conflict_count())
+                        .saturating_add(exact.rule().exact_count())
+                        .saturating_add(exact.rule().conflict_count())
+                        .max(1),
+                ));
+            }
+            seen.push(*identity);
+        }
+
+        // Native managed records use these fixed protocols. A different record at one of the
+        // same coordinates is already rejected by the exact observation above; this count catches
+        // an additional Flux-like route/rule elsewhere in the inventory.
+        let expected = seen.len();
+        if observation.routes != expected || observation.rules != expected {
+            return Err(AndroidExistingFluxOwnershipError::with_count(
+                AndroidExistingFluxOwnershipErrorKind::PolicyRoutingOwnershipPresent,
+                observation
+                    .routes
+                    .saturating_add(observation.rules)
+                    .saturating_sub(expected.saturating_mul(2))
+                    .max(1),
+            ));
+        }
+        Ok(observation)
     }
 
     fn is_native_flux_route(inventory: &NetworkInventory, route: &NetworkRouteRecord) -> bool {
@@ -678,6 +932,49 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
             .map_err(AndroidExistingFluxOwnershipError::process_observation)
     }
 
+    fn observe_flux_processes_for_owner(
+        proc_root: &Path,
+        excluded_daemon_pid: Option<u32>,
+        active_owner: Option<(&NativeCaptureOwnershipObservation, ProcessIdentity)>,
+    ) -> Result<FluxProcessSnapshot, AndroidExistingFluxOwnershipError> {
+        let snapshot = if active_owner.is_some() {
+            scan_flux_processes_for_active_owner(proc_root, excluded_daemon_pid)
+        } else {
+            return observe_flux_processes(proc_root, excluded_daemon_pid);
+        }
+        .map_err(AndroidExistingFluxOwnershipError::process_observation)?;
+        if let Some((_, expected_engine)) = active_owner {
+            let engine_count = snapshot
+                .flux_processes
+                .iter()
+                .filter(|process| process.kind == FluxProcessKind::Engine)
+                .count();
+            let daemon_count = snapshot
+                .flux_processes
+                .iter()
+                .filter(|process| process.kind == FluxProcessKind::Daemon)
+                .count();
+            if engine_count != 1 || daemon_count != 0 {
+                return Err(AndroidExistingFluxOwnershipError::with_count(
+                    AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent,
+                    engine_count.saturating_add(daemon_count).max(1),
+                ));
+            }
+            let engine_matches = snapshot.flux_processes.iter().any(|process| {
+                process.kind == FluxProcessKind::Engine
+                    && process.pid == expected_engine.pid().get()
+                    && process.start_time_ticks == expected_engine.start_time_ticks().get()
+            });
+            if !engine_matches {
+                return Err(AndroidExistingFluxOwnershipError::with_count(
+                    AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent,
+                    engine_count,
+                ));
+            }
+        }
+        Ok(snapshot)
+    }
+
     fn scan_flux_processes(
         proc_root: &Path,
         excluded_daemon_pid: Option<u32>,
@@ -685,7 +982,34 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         scan_flux_processes_bounded(proc_root, MAX_SYSTEM_PROCESS_ENTRIES, excluded_daemon_pid)
     }
 
+    fn scan_flux_processes_for_active_owner(
+        proc_root: &Path,
+        excluded_daemon_pid: Option<u32>,
+    ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
+        scan_flux_processes_bounded_for_active_owner(
+            proc_root,
+            MAX_SYSTEM_PROCESS_ENTRIES,
+            excluded_daemon_pid,
+        )
+    }
+
     fn scan_flux_processes_bounded(
+        proc_root: &Path,
+        max_entries: usize,
+        excluded_daemon_pid: Option<u32>,
+    ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
+        scan_flux_processes_bounded_inner(proc_root, max_entries, excluded_daemon_pid)
+    }
+
+    fn scan_flux_processes_bounded_for_active_owner(
+        proc_root: &Path,
+        max_entries: usize,
+        excluded_daemon_pid: Option<u32>,
+    ) -> Result<FluxProcessSnapshot, AndroidExistingFluxProcessObservationErrorClass> {
+        scan_flux_processes_bounded_inner(proc_root, max_entries, excluded_daemon_pid)
+    }
+
+    fn scan_flux_processes_bounded_inner(
         proc_root: &Path,
         max_entries: usize,
         excluded_daemon_pid: Option<u32>,
@@ -875,6 +1199,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn digest_absence(
         durable_root: &Path,
         inventory: &NetworkInventory,
@@ -882,6 +1207,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         network_namespace: flux_core::NetworkNamespaceIdentity,
         xtables: &AndroidXtablesFwmarkObservation,
         durable: &DurableSnapshot,
+        processes: &FluxProcessSnapshot,
         counts: ExistingFluxOwnershipCounts,
     ) -> AndroidExistingFluxOwnershipDigest {
         let mut digest = Sha256::new();
@@ -914,6 +1240,25 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
         ]);
         digest_count(&mut digest, durable.archive.target_count());
         digest.update(durable.archive.digest());
+        match durable.journal.as_ref() {
+            Some(journal) => {
+                digest.update([1]);
+                digest.update(journal.file_device().to_be_bytes());
+                digest.update(journal.file_inode().get().to_be_bytes());
+                digest.update(journal.digest());
+                digest.update(journal.record().revision().get().to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+        digest_count(&mut digest, processes.flux_processes.len());
+        for process in &processes.flux_processes {
+            digest.update([match process.kind {
+                FluxProcessKind::Daemon => 0,
+                FluxProcessKind::Engine => 1,
+            }]);
+            digest.update(process.pid.to_be_bytes());
+            digest.update(process.start_time_ticks.to_be_bytes());
+        }
         digest.update(ABSENCE_COUNT_SIGNATURE);
         for count in [
             counts.durable_artifacts,
@@ -949,5 +1294,7 @@ flux-process-count\0flux-chain-count\0flux-route-count\0flux-rule-count\0";
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use implementation::{
     collect_android_existing_flux_ownership,
+    collect_android_existing_flux_ownership_for_active_owner,
     collect_android_existing_flux_ownership_for_current_daemon,
+    collect_android_existing_flux_ownership_for_current_daemon_and_active_owner,
 };

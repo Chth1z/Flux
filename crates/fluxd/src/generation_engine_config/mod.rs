@@ -24,7 +24,9 @@ pub(crate) use assembler::*;
     reason = "the Generation facade is intentionally disconnected until planning authority exists"
 )]
 pub(crate) use candidate::*;
-pub(crate) use capture_path_selection::CapturePathQualificationEvidenceError;
+pub(crate) use capture_path_selection::{
+    CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE, CapturePathQualificationEvidenceError,
+};
 pub use capture_path_selection::{
     CAPTURE_PATH_SELECTION_EVIDENCE_DIGEST_BYTES, CapturePathCandidateStatus, CapturePathDecision,
     CapturePathKernelGap, CapturePathRejection, CapturePathRejectionReason, CapturePathSelection,

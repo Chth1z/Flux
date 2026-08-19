@@ -1,5 +1,10 @@
 use super::*;
 
+use crate::xtables::XtablesExpectedStatePhase;
+use crate::{
+    XtablesRestoreAction, XtablesRestoreContext, XtablesRestoreFamily, parse_xtables_restore,
+};
+
 const CANDIDATE_MASK: u32 = 0x0300_0000;
 
 fn candidate() -> FwmarkCandidate {
@@ -181,6 +186,103 @@ fn complete_dual_stack_projection_separates_sources_and_qualifies_exact_writes()
             .filter(|record| record.hook() == FwmarkNetfilterBuiltinHook::Postrouting)
             .count(),
         2
+    );
+}
+
+#[test]
+fn retained_exact_active_projection_filters_only_target_mark_evidence_and_preserves_snapshot_digest()
+ {
+    const TARGET_CHAIN: &str = "FLX4P0000000007";
+    const TARGET_WRITE: &str = "0x01000000/0x03000000";
+    let ipv4 = format!(
+        "*filter\n:INPUT ACCEPT [17:4096]\nCOMMIT\n*mangle\n\
+:PREROUTING ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:{TARGET_CHAIN} - [0:0]\n\
+-A PREROUTING -j {TARGET_CHAIN}\n\
+-A {TARGET_CHAIN} -m mark --mark 0x0/0xff -j MARK --set-xmark {TARGET_WRITE}\n\
+-A OUTPUT -m mark --mark 0x0/0xff -j ACCEPT\nCOMMIT\n"
+    );
+    let ipv6 = "*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n*mangle\n:INPUT ACCEPT [0:0]\nCOMMIT\n";
+    let expected_artifact = parse_xtables_restore(
+        format!(
+            "*mangle\n:{TARGET_CHAIN} - [0:0]\n\
+             -A {TARGET_CHAIN} -m mark --mark 0x0/0xff -j MARK --set-xmark {TARGET_WRITE}\n\
+             -I PREROUTING -j {TARGET_CHAIN}\nCOMMIT\n"
+        )
+        .as_bytes(),
+        XtablesRestoreContext::new(XtablesRestoreAction::Apply, XtablesRestoreFamily::Ipv4),
+    )
+    .expect("active retained target artifact");
+    let expected = XtablesExpectedState::from_apply_artifacts(
+        XtablesRestoreFamily::Ipv4,
+        XtablesExpectedStatePhase::Active,
+        [&expected_artifact],
+    )
+    .expect("active retained target state");
+    let retained = RetainedXtablesExpectedStates::new(Some(&expected), None);
+
+    let baseline = observe_android_xtables_fwmarks(
+        ipv4.as_bytes(),
+        ipv6.as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        candidate(),
+    )
+    .expect("complete snapshots");
+    let filtered = observe_android_xtables_fwmarks_with_retained(
+        ipv4.as_bytes(),
+        ipv6.as_bytes(),
+        AndroidNetdSourceProfile::AospNetd20250324,
+        candidate(),
+        &retained,
+    )
+    .expect("exact active projection is retained");
+
+    assert_eq!(baseline.digest(), filtered.digest());
+    assert_eq!(baseline.table_count(), filtered.table_count());
+    assert_eq!(baseline.chain_count(), filtered.chain_count());
+    assert_eq!(baseline.rule_count(), filtered.rule_count());
+    assert_eq!(baseline.flux_owned_chain_count(), 1);
+    assert_eq!(filtered.flux_owned_chain_count(), 0);
+    assert_eq!(
+        baseline.legacy_mark_uses(),
+        [
+            FwmarkUseRecord::new(
+                FwmarkEvidenceSource::Xtables,
+                FwmarkPlane::Packet,
+                FwmarkUseOperation::PredicateRead,
+                0xff,
+            )
+            .unwrap(),
+            FwmarkUseRecord::new(
+                FwmarkEvidenceSource::Xtables,
+                FwmarkPlane::Packet,
+                FwmarkUseOperation::MaskedWrite,
+                0x03000000,
+            )
+            .unwrap(),
+        ]
+    );
+    assert_eq!(
+        filtered.legacy_mark_uses(),
+        [FwmarkUseRecord::new(
+            FwmarkEvidenceSource::Xtables,
+            FwmarkPlane::Packet,
+            FwmarkUseOperation::PredicateRead,
+            0xff,
+        )
+        .unwrap()]
+    );
+
+    let substituted = ipv4.replace(TARGET_WRITE, "0x02000000/0x03000000");
+    assert!(
+        observe_android_xtables_fwmarks_with_retained(
+            substituted.as_bytes(),
+            ipv6.as_bytes(),
+            AndroidNetdSourceProfile::AospNetd20250324,
+            candidate(),
+            &retained,
+        )
+        .is_err(),
+        "same-count target substitution must not be hidden by retained filtering"
     );
 }
 

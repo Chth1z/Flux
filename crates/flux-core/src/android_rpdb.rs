@@ -6,7 +6,9 @@ use crate::android_netd::AndroidNetdSourceProfile;
 use crate::canary_facility_policy::{
     ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
 };
-use crate::network_inventory::{InterfaceName, NetworkInventory};
+use crate::network_inventory::{
+    InterfaceName, NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId,
+};
 use crate::network_route::NetworkAddressFamily;
 use crate::network_rule::{
     NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RuleIpProtocol, RulePortRange,
@@ -15,6 +17,7 @@ use crate::network_rule::{
 use crate::rpdb_placement::{
     RpdbClassifierRevision, RpdbFamilyPlacement, RpdbPlacementLease, RpdbPlacementPlanError,
     RpdbPlacementRequest, RpdbRuleAudit, RpdbRuleClassification, plan_rpdb_placement,
+    plan_rpdb_placement_with_retained_owner,
 };
 
 const ROUTE_TABLE_UNSPECIFIED: u32 = 0;
@@ -46,6 +49,285 @@ const REQUIRED_INITIALIZATION_ROLES: [AndroidRpdbRuleRole; 7] = [
     AndroidRpdbRuleRole::LocalNetwork,
     AndroidRpdbRuleRole::FinalUnreachable,
 ];
+
+/// Maximum exact route/rule occurrences retained for one active native owner.
+///
+/// The native xtables owner currently has one policy-routing identity per address family.  Keeping
+/// this bound here prevents an owner-aware consumer from quietly becoming a generic inventory
+/// filtering framework.
+const MAX_ANDROID_RPDB_RETAINED_OWNER_OCCURRENCES: usize = 2;
+
+/// One exact route/rule occurrence belonging to a retained native owner.
+///
+/// The indices are intentionally opaque outside this crate.  They are only minted by
+/// [`AndroidRpdbRetainedOwner::from_verified_inventory_unchecked`] after the platform adapter has
+/// proved exact route/rule identity and multiplicity.  The occurrence is bound to the inventory
+/// snapshot and epoch from which that proof was made.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct AndroidRpdbRetainedOwnerOccurrence {
+    snapshot_id: NetworkInventorySnapshotId,
+    epoch: NetworkEpoch,
+    route_index: usize,
+    rule_index: usize,
+}
+
+impl AndroidRpdbRetainedOwnerOccurrence {
+    const fn route_index(self) -> usize {
+        self.route_index
+    }
+
+    const fn rule_index(self) -> usize {
+        self.rule_index
+    }
+}
+
+/// Exact retained-owner occurrences for one immutable Android RPDB inventory.
+///
+/// This is a narrow, purpose-specific input for owner-aware RPDB classification, topology, census,
+/// and placement.  It does not expose a general-purpose route/rule exclusion list and it carries
+/// the inventory snapshot/epoch that authenticated the occurrence indices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AndroidRpdbRetainedOwner {
+    snapshot_id: NetworkInventorySnapshotId,
+    epoch: NetworkEpoch,
+    occurrences: Box<[AndroidRpdbRetainedOwnerOccurrence]>,
+}
+
+impl AndroidRpdbRetainedOwner {
+    /// Mints occurrences from indices that the platform adapter has already matched exactly.
+    ///
+    /// The constructor checks bounds, family pairing, uniqueness, and the per-owner bound.  It
+    /// deliberately does not infer ownership from arbitrary records; the platform's exact
+    /// identity audit remains the authority for deciding which indices may be supplied.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have independently proved, against this exact immutable `inventory`, that
+    /// every supplied pair is the retained owner's exact route/rule identity and that each exact
+    /// identity occurs exactly once.  In particular, the proof must include every modeled route
+    /// and rule field and reject foreign, field-mismatched, duplicate, or same-coordinate
+    /// conflicting records.  The constructor validates only index bounds, family pairing,
+    /// uniqueness, and the bounded occurrence count; it cannot establish ownership from raw
+    /// indices by itself.
+    pub unsafe fn from_verified_inventory_unchecked(
+        inventory: &NetworkInventory,
+        indices: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Result<Self, AndroidRpdbRetainedOwnerError> {
+        let mut occurrences = Vec::new();
+        let mut families = Vec::new();
+        for (route_index, rule_index) in indices {
+            if occurrences.len() == MAX_ANDROID_RPDB_RETAINED_OWNER_OCCURRENCES {
+                return Err(AndroidRpdbRetainedOwnerError::TooManyOccurrences {
+                    maximum: MAX_ANDROID_RPDB_RETAINED_OWNER_OCCURRENCES,
+                });
+            }
+            if route_index >= inventory.routes().len() {
+                return Err(AndroidRpdbRetainedOwnerError::RouteIndexOutOfBounds {
+                    index: route_index,
+                    route_count: inventory.routes().len(),
+                });
+            }
+            if rule_index >= inventory.rules().len() {
+                return Err(AndroidRpdbRetainedOwnerError::RuleIndexOutOfBounds {
+                    index: rule_index,
+                    rule_count: inventory.rules().len(),
+                });
+            }
+            if occurrences
+                .iter()
+                .any(|occurrence: &AndroidRpdbRetainedOwnerOccurrence| {
+                    occurrence.route_index == route_index
+                })
+            {
+                return Err(AndroidRpdbRetainedOwnerError::DuplicateRouteIndex {
+                    index: route_index,
+                });
+            }
+            if occurrences
+                .iter()
+                .any(|occurrence: &AndroidRpdbRetainedOwnerOccurrence| {
+                    occurrence.rule_index == rule_index
+                })
+            {
+                return Err(AndroidRpdbRetainedOwnerError::DuplicateRuleIndex {
+                    index: rule_index,
+                });
+            }
+            let route_family = inventory.routes()[route_index].destination().family();
+            let rule_family = inventory.rules()[rule_index].destination().family();
+            if route_family != rule_family {
+                return Err(AndroidRpdbRetainedOwnerError::FamilyMismatch {
+                    route_index,
+                    rule_index,
+                });
+            }
+            if families.contains(&route_family) {
+                return Err(AndroidRpdbRetainedOwnerError::DuplicateFamily {
+                    family: route_family,
+                });
+            }
+            families.push(route_family);
+            occurrences.push(AndroidRpdbRetainedOwnerOccurrence {
+                snapshot_id: inventory.snapshot_id(),
+                epoch: inventory.epoch(),
+                route_index,
+                rule_index,
+            });
+        }
+        if occurrences.is_empty() {
+            return Err(AndroidRpdbRetainedOwnerError::Empty);
+        }
+        Ok(Self {
+            snapshot_id: inventory.snapshot_id(),
+            epoch: inventory.epoch(),
+            occurrences: occurrences.into_boxed_slice(),
+        })
+    }
+
+    fn occurrences(&self) -> &[AndroidRpdbRetainedOwnerOccurrence] {
+        &self.occurrences
+    }
+
+    pub(crate) fn contains_rule_index(&self, index: usize) -> bool {
+        self.occurrences
+            .iter()
+            .any(|occurrence| occurrence.rule_index() == index)
+    }
+
+    pub(crate) fn contains_route_index(&self, index: usize) -> bool {
+        self.occurrences
+            .iter()
+            .any(|occurrence| occurrence.route_index() == index)
+    }
+
+    pub(crate) fn ensure_current(
+        &self,
+        inventory: &NetworkInventory,
+    ) -> Result<(), AndroidRpdbRetainedOwnerError> {
+        if inventory.snapshot_id() != self.snapshot_id {
+            return Err(AndroidRpdbRetainedOwnerError::SnapshotMismatch {
+                owner: self.snapshot_id,
+                inventory: inventory.snapshot_id(),
+            });
+        }
+        if inventory.epoch() != self.epoch {
+            return Err(AndroidRpdbRetainedOwnerError::EpochMismatch {
+                owner: self.epoch,
+                inventory: inventory.epoch(),
+            });
+        }
+        for occurrence in &self.occurrences {
+            if occurrence.route_index() >= inventory.routes().len() {
+                return Err(AndroidRpdbRetainedOwnerError::RouteIndexOutOfBounds {
+                    index: occurrence.route_index(),
+                    route_count: inventory.routes().len(),
+                });
+            }
+            if occurrence.rule_index() >= inventory.rules().len() {
+                return Err(AndroidRpdbRetainedOwnerError::RuleIndexOutOfBounds {
+                    index: occurrence.rule_index(),
+                    rule_count: inventory.rules().len(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why a retained owner occurrence set cannot be bound to an inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidRpdbRetainedOwnerError {
+    Empty,
+    TooManyOccurrences {
+        maximum: usize,
+    },
+    RouteIndexOutOfBounds {
+        index: usize,
+        route_count: usize,
+    },
+    RuleIndexOutOfBounds {
+        index: usize,
+        rule_count: usize,
+    },
+    FamilyMismatch {
+        route_index: usize,
+        rule_index: usize,
+    },
+    DuplicateRouteIndex {
+        index: usize,
+    },
+    DuplicateRuleIndex {
+        index: usize,
+    },
+    DuplicateFamily {
+        family: NetworkAddressFamily,
+    },
+    SnapshotMismatch {
+        owner: NetworkInventorySnapshotId,
+        inventory: NetworkInventorySnapshotId,
+    },
+    EpochMismatch {
+        owner: NetworkEpoch,
+        inventory: NetworkEpoch,
+    },
+}
+
+impl fmt::Display for AndroidRpdbRetainedOwnerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("retained Android RPDB owner has no occurrences"),
+            Self::TooManyOccurrences { maximum } => write!(
+                formatter,
+                "retained Android RPDB owner exceeds the {maximum}-occurrence bound"
+            ),
+            Self::RouteIndexOutOfBounds { index, route_count } => write!(
+                formatter,
+                "retained Android RPDB route index {index} is outside {route_count} routes"
+            ),
+            Self::RuleIndexOutOfBounds { index, rule_count } => write!(
+                formatter,
+                "retained Android RPDB rule index {index} is outside {rule_count} rules"
+            ),
+            Self::FamilyMismatch {
+                route_index,
+                rule_index,
+            } => write!(
+                formatter,
+                "retained Android RPDB route {route_index} and rule {rule_index} belong to different families"
+            ),
+            Self::DuplicateRouteIndex { index } => {
+                write!(
+                    formatter,
+                    "retained Android RPDB route index {index} occurs more than once"
+                )
+            }
+            Self::DuplicateRuleIndex { index } => {
+                write!(
+                    formatter,
+                    "retained Android RPDB rule index {index} occurs more than once"
+                )
+            }
+            Self::DuplicateFamily { family } => write!(
+                formatter,
+                "retained Android RPDB owner has more than one {family:?} occurrence"
+            ),
+            Self::SnapshotMismatch { owner, inventory } => write!(
+                formatter,
+                "retained Android RPDB owner snapshot {} does not match inventory snapshot {}",
+                owner.get(),
+                inventory.get()
+            ),
+            Self::EpochMismatch { owner, inventory } => write!(
+                formatter,
+                "retained Android RPDB owner epoch {} does not match inventory epoch {}",
+                owner.get(),
+                inventory.get()
+            ),
+        }
+    }
+}
+
+impl Error for AndroidRpdbRetainedOwnerError {}
 
 /// Maximum ordered unknown-rule diagnostics retained by one classifier report.
 pub const MAX_ANDROID_RPDB_UNKNOWN_RULES: usize = 64;
@@ -296,6 +578,7 @@ pub struct AndroidRpdbClassificationReport {
     audit: RpdbRuleAudit,
     roles: Box<[Option<AndroidRpdbRuleRole>]>,
     reviewed_canary_rule_indices: Box<[usize]>,
+    retained_owner: Option<AndroidRpdbRetainedOwner>,
     unknown_rule_count: u32,
     unknown_rules: Box<[AndroidRpdbUnknownRule]>,
     omitted_unknown_rules: u32,
@@ -331,6 +614,10 @@ impl AndroidRpdbClassificationReport {
         &self.reviewed_canary_rule_indices
     }
 
+    pub(crate) fn retained_owner(&self) -> Option<&AndroidRpdbRetainedOwner> {
+        self.retained_owner.as_ref()
+    }
+
     #[must_use]
     pub const fn unknown_rule_count(&self) -> u32 {
         self.unknown_rule_count
@@ -356,6 +643,7 @@ impl AndroidRpdbClassificationReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AndroidRpdbPlacementPlanError {
     Rpdb(RpdbPlacementPlanError),
+    RetainedOwner(AndroidRpdbRetainedOwnerError),
     StaticPriorityWindowViolation {
         family: NetworkAddressFamily,
         last_reserved_must_precede: RulePriority,
@@ -369,6 +657,7 @@ impl fmt::Display for AndroidRpdbPlacementPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rpdb(error) => error.fmt(formatter),
+            Self::RetainedOwner(error) => error.fmt(formatter),
             Self::StaticPriorityWindowViolation {
                 family,
                 last_reserved_must_precede,
@@ -404,6 +693,7 @@ impl Error for AndroidRpdbPlacementPlanError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Rpdb(error) => Some(error),
+            Self::RetainedOwner(error) => Some(error),
             Self::StaticPriorityWindowViolation { .. } => None,
         }
     }
@@ -422,7 +712,27 @@ pub fn classify_android_rpdb(
         &[],
         profile.classifier_revision(),
         None,
+        None,
     )
+}
+
+/// Classifies one inventory while excluding only the exact, snapshot-bound retained owner rule
+/// occurrences minted by the platform owner audit.
+pub fn classify_android_rpdb_with_retained_owner(
+    inventory: &NetworkInventory,
+    profile: AndroidNetdSourceProfile,
+    retained_owner: &AndroidRpdbRetainedOwner,
+) -> Result<AndroidRpdbClassificationReport, AndroidRpdbRetainedOwnerError> {
+    retained_owner.ensure_current(inventory)?;
+    Ok(classify_android_rpdb_internal(
+        inventory,
+        profile,
+        &[],
+        &[],
+        profile.classifier_revision(),
+        None,
+        Some(retained_owner),
+    ))
 }
 
 /// Classifies Android-owned rules plus one complete exact cohort created under reviewed canary
@@ -433,6 +743,38 @@ pub fn classify_android_rpdb_with_reviewed_canary_facility(
     profile: AndroidNetdSourceProfile,
     policy: &ReviewedCanaryFacilityPolicy,
     selection: ReviewedCanaryFacilitySelection,
+) -> Result<AndroidRpdbClassificationReport, ReviewedCanaryRpdbClassificationError> {
+    classify_android_rpdb_with_reviewed_canary_facility_internal(
+        inventory, profile, policy, selection, None,
+    )
+}
+
+/// Classifies the reviewed canary cohort while also excluding one exact retained native owner.
+pub fn classify_android_rpdb_with_reviewed_canary_facility_and_retained_owner(
+    inventory: &NetworkInventory,
+    profile: AndroidNetdSourceProfile,
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+    retained_owner: &AndroidRpdbRetainedOwner,
+) -> Result<AndroidRpdbClassificationReport, ReviewedCanaryRpdbClassificationError> {
+    retained_owner
+        .ensure_current(inventory)
+        .map_err(ReviewedCanaryRpdbClassificationError::RetainedOwner)?;
+    classify_android_rpdb_with_reviewed_canary_facility_internal(
+        inventory,
+        profile,
+        policy,
+        selection,
+        Some(retained_owner),
+    )
+}
+
+fn classify_android_rpdb_with_reviewed_canary_facility_internal(
+    inventory: &NetworkInventory,
+    profile: AndroidNetdSourceProfile,
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+    retained_owner: Option<&AndroidRpdbRetainedOwner>,
 ) -> Result<AndroidRpdbClassificationReport, ReviewedCanaryRpdbClassificationError> {
     if policy.netd_source_profile() != profile {
         return Err(ReviewedCanaryRpdbClassificationError::ProfileMismatch);
@@ -457,6 +799,14 @@ pub fn classify_android_rpdb_with_reviewed_canary_facility(
     {
         return Err(ReviewedCanaryRpdbClassificationError::OwnedCohortMismatch);
     }
+    if retained_owner.is_some_and(|owner| {
+        owner
+            .occurrences()
+            .iter()
+            .any(|occurrence| expected_rule_index(inventory, &expected, occurrence.rule_index()))
+    }) {
+        return Err(ReviewedCanaryRpdbClassificationError::RetainedOwnerOverlap);
+    }
     let early_uid_lookup_rule_indices = reviewed_early_uid_lookup_rule_indices(inventory, policy)?;
     let revision = reviewed_canary_classifier_revision(policy);
     let reviewed_last_must_precede = RulePriority::from_raw(
@@ -472,7 +822,19 @@ pub fn classify_android_rpdb_with_reviewed_canary_facility(
         &early_uid_lookup_rule_indices,
         revision,
         Some(reviewed_last_must_precede),
+        retained_owner,
     ))
+}
+
+fn expected_rule_index(
+    inventory: &NetworkInventory,
+    expected: &[NetworkRuleRecord],
+    rule_index: usize,
+) -> bool {
+    inventory
+        .rules()
+        .get(rule_index)
+        .is_some_and(|rule| expected.iter().any(|candidate| candidate == rule))
 }
 
 fn classify_android_rpdb_internal(
@@ -482,6 +844,7 @@ fn classify_android_rpdb_internal(
     reviewed_early_uid_lookup_rule_indices: &[usize],
     classifier_revision: RpdbClassifierRevision,
     reviewed_last_must_precede: Option<RulePriority>,
+    retained_owner: Option<&AndroidRpdbRetainedOwner>,
 ) -> AndroidRpdbClassificationReport {
     let mut roles = Vec::with_capacity(inventory.rules().len());
     let mut classifications = Vec::with_capacity(inventory.rules().len());
@@ -489,7 +852,14 @@ fn classify_android_rpdb_internal(
     let mut unknown_reasons = Vec::with_capacity(inventory.rules().len());
 
     for (dump_index, rule) in inventory.rules().iter().enumerate() {
-        let decision = if reviewed_canary_rules.contains(rule) {
+        let decision = if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index))
+        {
+            RuleDecision {
+                role: None,
+                classification: RpdbRuleClassification::DoesNotConstrainFlux,
+                unknown_reason: None,
+            }
+        } else if reviewed_canary_rules.contains(rule) {
             reviewed_canary_rule_indices.push(dump_index);
             RuleDecision {
                 role: None,
@@ -508,6 +878,9 @@ fn classify_android_rpdb_internal(
 
     let profile_issues = find_profile_issues(inventory, &roles);
     for (dump_index, rule) in inventory.rules().iter().enumerate() {
+        if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
+            continue;
+        }
         let family = rule.destination().family();
         if profile_issues.iter().any(|issue| issue.family() == family)
             && classifications[dump_index] != RpdbRuleClassification::Unknown
@@ -566,6 +939,7 @@ fn classify_android_rpdb_internal(
         audit,
         roles: roles.into_boxed_slice(),
         reviewed_canary_rule_indices: reviewed_canary_rule_indices.into_boxed_slice(),
+        retained_owner: retained_owner.cloned(),
         unknown_rule_count,
         unknown_rules: unknown_rules.into_boxed_slice(),
         omitted_unknown_rules,
@@ -579,24 +953,28 @@ pub enum ReviewedCanaryRpdbClassificationError {
     InvalidExpectedRule,
     OwnedCohortMismatch,
     EarlyUidLookupCohortMismatch,
+    RetainedOwner(AndroidRpdbRetainedOwnerError),
+    RetainedOwnerOverlap,
 }
 
 impl fmt::Display for ReviewedCanaryRpdbClassificationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::ProfileMismatch => {
-                "reviewed canary facility uses a different Android netd source profile"
+        match self {
+            Self::ProfileMismatch => formatter
+                .write_str("reviewed canary facility uses a different Android netd source profile"),
+            Self::InvalidExpectedRule => formatter
+                .write_str("reviewed canary facility cannot form a canonical peer-selection rule"),
+            Self::OwnedCohortMismatch => formatter.write_str(
+                "live canary peer-selection rules differ from the complete reviewed cohort",
+            ),
+            Self::EarlyUidLookupCohortMismatch => formatter.write_str(
+                "live early UID lookup rules differ from the reviewed device-policy cohort",
+            ),
+            Self::RetainedOwner(error) => error.fmt(formatter),
+            Self::RetainedOwnerOverlap => {
+                formatter.write_str("retained owner overlaps the reviewed canary peer-rule cohort")
             }
-            Self::InvalidExpectedRule => {
-                "reviewed canary facility cannot form a canonical peer-selection rule"
-            }
-            Self::OwnedCohortMismatch => {
-                "live canary peer-selection rules differ from the complete reviewed cohort"
-            }
-            Self::EarlyUidLookupCohortMismatch => {
-                "live early UID lookup rules differ from the reviewed device-policy cohort"
-            }
-        })
+        }
     }
 }
 
@@ -759,8 +1137,31 @@ pub fn plan_android_rpdb_placement(
     report: &AndroidRpdbClassificationReport,
     request: RpdbPlacementRequest,
 ) -> Result<RpdbPlacementLease, AndroidRpdbPlacementPlanError> {
+    plan_android_rpdb_placement_inner(inventory, report, request)
+}
+
+fn plan_android_rpdb_placement_inner(
+    inventory: &NetworkInventory,
+    report: &AndroidRpdbClassificationReport,
+    request: RpdbPlacementRequest,
+) -> Result<RpdbPlacementLease, AndroidRpdbPlacementPlanError> {
+    let retained_owner = report.retained_owner();
+    if let Some(retained_owner) = retained_owner {
+        retained_owner
+            .ensure_current(inventory)
+            .map_err(AndroidRpdbPlacementPlanError::RetainedOwner)?;
+    }
     let contract = report.profile().priority_contract();
-    let lease = match plan_rpdb_placement(inventory, report.audit(), request) {
+    let placement_result = match retained_owner {
+        Some(retained_owner) => plan_rpdb_placement_with_retained_owner(
+            inventory,
+            report.audit(),
+            request,
+            retained_owner,
+        ),
+        None => plan_rpdb_placement(inventory, report.audit(), request),
+    };
+    let lease = match placement_result {
         Ok(lease) => lease,
         Err(RpdbPlacementPlanError::PriorityWindowViolation {
             family,
@@ -820,12 +1221,35 @@ pub fn plan_android_rpdb_placement_with_reviewed_canary_facility(
     policy: &ReviewedCanaryFacilityPolicy,
     selection: ReviewedCanaryFacilitySelection,
 ) -> Result<RpdbPlacementLease, ReviewedCanaryRpdbPlacementError> {
-    let expected_report = classify_android_rpdb_with_reviewed_canary_facility(
-        inventory,
-        report.profile(),
-        policy,
-        selection,
+    plan_android_rpdb_placement_with_reviewed_canary_facility_inner(
+        inventory, report, request, policy, selection,
     )
+}
+
+fn plan_android_rpdb_placement_with_reviewed_canary_facility_inner(
+    inventory: &NetworkInventory,
+    report: &AndroidRpdbClassificationReport,
+    request: RpdbPlacementRequest,
+    policy: &ReviewedCanaryFacilityPolicy,
+    selection: ReviewedCanaryFacilitySelection,
+) -> Result<RpdbPlacementLease, ReviewedCanaryRpdbPlacementError> {
+    let expected_report = match report.retained_owner() {
+        Some(retained_owner) => {
+            classify_android_rpdb_with_reviewed_canary_facility_and_retained_owner(
+                inventory,
+                report.profile(),
+                policy,
+                selection,
+                retained_owner,
+            )
+        }
+        None => classify_android_rpdb_with_reviewed_canary_facility(
+            inventory,
+            report.profile(),
+            policy,
+            selection,
+        ),
+    }
     .map_err(ReviewedCanaryRpdbPlacementError::Classification)?;
     if report != &expected_report {
         return Err(ReviewedCanaryRpdbPlacementError::ClassificationReportMismatch);
@@ -842,8 +1266,16 @@ pub fn plan_android_rpdb_placement_with_reviewed_canary_facility(
         return Err(ReviewedCanaryRpdbPlacementError::PlacementRequestMismatch);
     }
 
-    plan_rpdb_placement(inventory, report.audit(), request)
-        .map_err(ReviewedCanaryRpdbPlacementError::Placement)
+    match report.retained_owner() {
+        Some(retained_owner) => plan_rpdb_placement_with_retained_owner(
+            inventory,
+            report.audit(),
+            request,
+            retained_owner,
+        ),
+        None => plan_rpdb_placement(inventory, report.audit(), request),
+    }
+    .map_err(ReviewedCanaryRpdbPlacementError::Placement)
 }
 
 #[derive(Clone, Copy)]

@@ -3,6 +3,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::address_bypass::{AddressBypassRoutingSpec, AddressBypassRoutingSpecError};
+use crate::android_rpdb::AndroidRpdbRetainedOwner;
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 use crate::network_route::NetworkAddressFamily;
 use crate::network_rule::{NetworkRuleRecord, RuleAction, RulePriority, RuleProtocol, RuleTableId};
@@ -724,6 +725,28 @@ pub fn plan_rpdb_placement(
     audit: &RpdbRuleAudit,
     request: RpdbPlacementRequest,
 ) -> Result<RpdbPlacementLease, RpdbPlacementPlanError> {
+    plan_rpdb_placement_inner(inventory, audit, request, None)
+}
+
+/// Audits placement while ignoring only the exact route/rule occurrences of one retained owner.
+///
+/// This crate-private seam is intentionally typed to the Android retained-owner token. Generic
+/// callers continue to use [`plan_rpdb_placement`] and cannot provide arbitrary index exclusions.
+pub(crate) fn plan_rpdb_placement_with_retained_owner(
+    inventory: &NetworkInventory,
+    audit: &RpdbRuleAudit,
+    request: RpdbPlacementRequest,
+    retained_owner: &AndroidRpdbRetainedOwner,
+) -> Result<RpdbPlacementLease, RpdbPlacementPlanError> {
+    plan_rpdb_placement_inner(inventory, audit, request, Some(retained_owner))
+}
+
+fn plan_rpdb_placement_inner(
+    inventory: &NetworkInventory,
+    audit: &RpdbRuleAudit,
+    request: RpdbPlacementRequest,
+    retained_owner: Option<&AndroidRpdbRetainedOwner>,
+) -> Result<RpdbPlacementLease, RpdbPlacementPlanError> {
     if inventory.epoch() != audit.epoch {
         return Err(RpdbPlacementPlanError::AuditEpochMismatch {
             inventory: inventory.epoch(),
@@ -739,11 +762,27 @@ pub fn plan_rpdb_placement(
 
     let ipv4_window = request
         .ipv4
-        .map(|placement| plan_family(inventory, audit, NetworkAddressFamily::Ipv4, placement))
+        .map(|placement| {
+            plan_family(
+                inventory,
+                audit,
+                NetworkAddressFamily::Ipv4,
+                placement,
+                retained_owner,
+            )
+        })
         .transpose()?;
     let ipv6_window = request
         .ipv6
-        .map(|placement| plan_family(inventory, audit, NetworkAddressFamily::Ipv6, placement))
+        .map(|placement| {
+            plan_family(
+                inventory,
+                audit,
+                NetworkAddressFamily::Ipv6,
+                placement,
+                retained_owner,
+            )
+        })
         .transpose()?;
 
     Ok(RpdbPlacementLease {
@@ -761,6 +800,7 @@ fn plan_family(
     audit: &RpdbRuleAudit,
     family: NetworkAddressFamily,
     placement: RpdbFamilyPlacement,
+    retained_owner: Option<&AndroidRpdbRetainedOwner>,
 ) -> Result<RpdbPriorityWindow, RpdbPlacementPlanError> {
     let static_window = audit.static_priority_window(family);
     let mut last_must_precede = static_window.map(RpdbPriorityWindow::last_must_precede);
@@ -773,6 +813,9 @@ fn plan_family(
         .enumerate()
     {
         if rule.destination().family() != family {
+            continue;
+        }
+        if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
             continue;
         }
         if !rule.has_complete_attribute_coverage() {
@@ -807,6 +850,9 @@ fn plan_family(
         if rule.destination().family() != family {
             continue;
         }
+        if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
+            continue;
+        }
         let role = if rule.priority() == placement.proxy_priority {
             Some(RpdbPriorityRole::Proxy)
         } else if placement
@@ -828,6 +874,9 @@ fn plan_family(
 
     for (dump_index, rule) in inventory.rules().iter().enumerate() {
         if rule.destination().family() != family {
+            continue;
+        }
+        if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
             continue;
         }
         if let Some(target) = rule.goto_target()
@@ -856,6 +905,9 @@ fn plan_family(
     }
 
     for (dump_index, route) in inventory.routes().iter().enumerate() {
+        if retained_owner.is_some_and(|owner| owner.contains_route_index(dump_index)) {
+            continue;
+        }
         if route.destination().family() == family
             && route.properties().table().get() == placement.private_table.get()
         {
@@ -868,6 +920,9 @@ fn plan_family(
     }
 
     for (dump_index, rule) in inventory.rules().iter().enumerate() {
+        if retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index)) {
+            continue;
+        }
         if rule.destination().family() == family
             && rule_may_reference_table(rule, placement.private_table)
         {

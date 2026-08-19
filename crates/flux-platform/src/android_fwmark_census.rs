@@ -11,6 +11,11 @@ use flux_core::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::xtables::{
+    NativeCaptureOwnershipObservation, XtablesExpectedState, XtablesRestoreFamily,
+    XtablesRetainedMatcher, project_xtables_save,
+};
+
 mod assembly;
 mod existing_flux;
 mod nftables;
@@ -33,6 +38,7 @@ pub use assembly::{
     AndroidFwmarkCensusProjectionDigest, AndroidFwmarkCensusReportPhase,
     MAX_ANDROID_FWMARK_CENSUS_STAGE_BOUND, assemble_android_fwmark_census_projection,
     coordinate_android_fwmark_census, coordinate_android_fwmark_census_for_inventory,
+    coordinate_android_fwmark_census_for_inventory_with_active_owner,
     parse_android_fwmark_census_probe_reports, validate_android_fwmark_census_probe_reports,
     validate_android_fwmark_census_projection_report,
     write_android_fwmark_census_projection_report,
@@ -46,7 +52,9 @@ pub use existing_flux::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use existing_flux::{
     collect_android_existing_flux_ownership,
+    collect_android_existing_flux_ownership_for_active_owner,
     collect_android_existing_flux_ownership_for_current_daemon,
+    collect_android_existing_flux_ownership_for_current_daemon_and_active_owner,
 };
 
 pub use nftables::{
@@ -191,6 +199,7 @@ pub enum AndroidXtablesFwmarkObservationErrorKind {
     InvalidMarkValue,
     InvalidAndroidIncomingWriter,
     InvalidOrderedWrite,
+    RetainedProjectionMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,6 +279,103 @@ pub fn observe_android_xtables_fwmarks(
 ) -> Result<AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError> {
     let ipv4 = parse_ruleset(ipv4, NetworkAddressFamily::Ipv4)?;
     let ipv6 = parse_ruleset(ipv6, NetworkAddressFamily::Ipv6)?;
+    observe_parsed_android_xtables_fwmarks(ipv4, ipv6, profile, candidate, None, None)
+}
+
+/// Observes a complete dual-stack xtables snapshot around one exact active native owner.
+///
+/// The ownership observation is the only retained-owner input visible to callers. Its private
+/// xtables expectations are checked against both complete snapshots before semantic mark evidence
+/// omits the owner. Raw digest, table count, chain count, and rule count still cover every input
+/// table and rule. A mismatch—including a foreign or duplicate Flux-like record—fails closed.
+pub fn observe_android_xtables_fwmarks_for_active_owner(
+    ipv4: &[u8],
+    ipv6: &[u8],
+    profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
+    active_owner: &NativeCaptureOwnershipObservation,
+) -> Result<AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError> {
+    let retained_owner = active_owner.retained_owner();
+    let retained = RetainedXtablesExpectedStates::new(
+        retained_owner.xtables_expected_state(NetworkAddressFamily::Ipv4),
+        retained_owner.xtables_expected_state(NetworkAddressFamily::Ipv6),
+    );
+    observe_android_xtables_fwmarks_with_retained(ipv4, ipv6, profile, candidate, &retained)
+}
+
+/// Observes complete xtables snapshots while excluding only one exact, already-proven active
+/// owner's semantic rules.  The raw parser digest and all table/chain/rule counts still cover the
+/// unfiltered snapshots; only mark evidence is projected after the exact native projection match.
+pub(crate) fn observe_android_xtables_fwmarks_with_retained(
+    ipv4: &[u8],
+    ipv6: &[u8],
+    profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
+    retained: &RetainedXtablesExpectedStates<'_>,
+) -> Result<AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError> {
+    let ipv4_ruleset = parse_ruleset(ipv4, NetworkAddressFamily::Ipv4)?;
+    let ipv6_ruleset = parse_ruleset(ipv6, NetworkAddressFamily::Ipv6)?;
+    let ipv4_projection = project_xtables_save(ipv4, XtablesRestoreFamily::Ipv4).map_err(|_| {
+        AndroidXtablesFwmarkObservationError::global(
+            NetworkAddressFamily::Ipv4,
+            AndroidXtablesFwmarkObservationErrorKind::RetainedProjectionMismatch,
+        )
+    })?;
+    let ipv6_projection = project_xtables_save(ipv6, XtablesRestoreFamily::Ipv6).map_err(|_| {
+        AndroidXtablesFwmarkObservationError::global(
+            NetworkAddressFamily::Ipv6,
+            AndroidXtablesFwmarkObservationErrorKind::RetainedProjectionMismatch,
+        )
+    })?;
+    let ipv4_matcher = XtablesRetainedMatcher::from_expected(retained.ipv4, &ipv4_projection)
+        .map_err(|_| {
+            AndroidXtablesFwmarkObservationError::global(
+                NetworkAddressFamily::Ipv4,
+                AndroidXtablesFwmarkObservationErrorKind::RetainedProjectionMismatch,
+            )
+        })?;
+    let ipv6_matcher = XtablesRetainedMatcher::from_expected(retained.ipv6, &ipv6_projection)
+        .map_err(|_| {
+            AndroidXtablesFwmarkObservationError::global(
+                NetworkAddressFamily::Ipv6,
+                AndroidXtablesFwmarkObservationErrorKind::RetainedProjectionMismatch,
+            )
+        })?;
+    observe_parsed_android_xtables_fwmarks(
+        ipv4_ruleset,
+        ipv6_ruleset,
+        profile,
+        candidate,
+        Some(&ipv4_matcher),
+        Some(&ipv6_matcher),
+    )
+}
+
+/// Expected exact active owner projections for the two xtables families.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedXtablesExpectedStates<'a> {
+    ipv4: Option<&'a XtablesExpectedState>,
+    ipv6: Option<&'a XtablesExpectedState>,
+}
+
+impl<'a> RetainedXtablesExpectedStates<'a> {
+    #[must_use]
+    pub(crate) const fn new(
+        ipv4: Option<&'a XtablesExpectedState>,
+        ipv6: Option<&'a XtablesExpectedState>,
+    ) -> Self {
+        Self { ipv4, ipv6 }
+    }
+}
+
+fn observe_parsed_android_xtables_fwmarks(
+    ipv4: ParsedRuleset,
+    ipv6: ParsedRuleset,
+    profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
+    ipv4_matcher: Option<&XtablesRetainedMatcher>,
+    ipv6_matcher: Option<&XtablesRetainedMatcher>,
+) -> Result<AndroidXtablesFwmarkObservation, AndroidXtablesFwmarkObservationError> {
     let mut legacy_mark_uses = BTreeSet::new();
     let mut transfer_mark_uses = BTreeSet::new();
     let mut ordered_late_writes = Vec::new();
@@ -277,8 +383,8 @@ pub fn observe_android_xtables_fwmarks(
     let mut exact_mark_sentinels = Vec::new();
     let mut unqualified_exact_mark_sentinel_uses = BTreeSet::new();
 
-    for ruleset in [&ipv4, &ipv6] {
-        let evidence = ruleset.observe_marks(profile, candidate)?;
+    for (ruleset, matcher) in [(&ipv4, ipv4_matcher), (&ipv6, ipv6_matcher)] {
+        let evidence = ruleset.observe_marks(profile, candidate, matcher)?;
         legacy_mark_uses.extend(evidence.legacy_mark_uses);
         transfer_mark_uses.extend(evidence.transfer_mark_uses);
         ordered_late_writes.extend(evidence.ordered_late_writes);
@@ -322,7 +428,8 @@ pub fn observe_android_xtables_fwmarks(
     let table_count = ipv4.tables.len() + ipv6.tables.len();
     let chain_count = ipv4.chain_count() + ipv6.chain_count();
     let rule_count = ipv4.rule_count() + ipv6.rule_count();
-    let flux_owned_chain_count = ipv4.flux_owned_chain_count() + ipv6.flux_owned_chain_count();
+    let flux_owned_chain_count =
+        ipv4.flux_owned_chain_count(ipv4_matcher) + ipv6.flux_owned_chain_count(ipv6_matcher);
 
     Ok(AndroidXtablesFwmarkObservation {
         digest: AndroidXtablesSnapshotDigest(digest.finalize().into()),
@@ -777,6 +884,7 @@ impl ParsedRuleset {
         &self,
         profile: AndroidNetdSourceProfile,
         candidate: FwmarkCandidate,
+        retained: Option<&XtablesRetainedMatcher>,
     ) -> Result<FamilyMarkEvidence, AndroidXtablesFwmarkObservationError> {
         let mut evidence = FamilyMarkEvidence::default();
         let mut writes = Vec::new();
@@ -786,6 +894,11 @@ impl ParsedRuleset {
         for (table_name, table) in &self.tables {
             for (chain, rules) in &table.rules {
                 for rule in rules {
+                    if retained.is_some_and(|matcher| {
+                        matcher.excludes_rule(table_name, chain, rule.ordinal)
+                    }) {
+                        continue;
+                    }
                     let parsed = self.rule_mark_semantics(rule)?;
                     if let Some(mask) = parsed.packet_predicate_mask {
                         let use_record = mark_use(
@@ -860,6 +973,7 @@ impl ParsedRuleset {
                         FwmarkOrderedLateWritePlacement::InputAfterRouting,
                         transfer_overlap,
                         candidate,
+                        retained,
                     )?
                 } else {
                     self.qualify_ordered_write(
@@ -868,6 +982,7 @@ impl ParsedRuleset {
                         FwmarkOrderedLateWritePlacement::PostroutingAfterFinalFluxUse,
                         transfer_overlap,
                         candidate,
+                        retained,
                     )?
                 };
         }
@@ -876,7 +991,8 @@ impl ParsedRuleset {
             if occurrence.mark_use.mask() & candidate.mask() == 0 {
                 continue;
             }
-            occurrence.qualification = self.qualify_exact_mark_sentinel(occurrence, candidate)?;
+            occurrence.qualification =
+                self.qualify_exact_mark_sentinel(occurrence, candidate, retained)?;
         }
 
         let mut by_mark_use: BTreeMap<FwmarkUseRecord, Vec<&WriteOccurrence<'_>>> = BTreeMap::new();
@@ -1220,6 +1336,7 @@ impl ParsedRuleset {
         placement: FwmarkOrderedLateWritePlacement,
         transfer_overlap: bool,
         candidate: FwmarkCandidate,
+        retained: Option<&XtablesRetainedMatcher>,
     ) -> Result<Option<FwmarkOrderedLateWriteQualification>, AndroidXtablesFwmarkObservationError>
     {
         if occurrence.table != "mangle" || transfer_overlap {
@@ -1230,7 +1347,7 @@ impl ParsedRuleset {
             FwmarkNetfilterBuiltinHook::Input => "INPUT",
             FwmarkNetfilterBuiltinHook::Postrouting => "POSTROUTING",
         };
-        let references = self.references_to(occurrence.table, occurrence.chain);
+        let references = self.references_to(occurrence.table, occurrence.chain, retained);
         if references.len() != 1 {
             return Ok(None);
         }
@@ -1249,12 +1366,14 @@ impl ParsedRuleset {
             reference.ordinal,
             candidate.mask(),
             occurrence.rule,
+            retained,
         )? || self.has_earlier_overlapping_write(
             occurrence.table,
             occurrence.chain,
             occurrence.rule.ordinal,
             candidate.mask(),
             occurrence.rule,
+            retained,
         )? {
             return Ok(None);
         }
@@ -1302,6 +1421,7 @@ impl ParsedRuleset {
         &self,
         occurrence: &PredicateOccurrence<'_>,
         candidate: FwmarkCandidate,
+        retained: Option<&XtablesRetainedMatcher>,
     ) -> Result<Option<FwmarkExactMarkSentinelQualification>, AndroidXtablesFwmarkObservationError>
     {
         let projected = occurrence.sentinel & candidate.mask();
@@ -1314,7 +1434,7 @@ impl ParsedRuleset {
         {
             return Ok(None);
         }
-        let references = self.references_to(occurrence.table, occurrence.chain);
+        let references = self.references_to(occurrence.table, occurrence.chain, retained);
         if references.len() != 1 {
             return Ok(None);
         }
@@ -1363,13 +1483,23 @@ impl ParsedRuleset {
         Ok(Some(record))
     }
 
-    fn references_to(&self, table: &str, target: &str) -> Vec<(&str, &str, &ParsedRule)> {
+    fn references_to(
+        &self,
+        table: &str,
+        target: &str,
+        retained: Option<&XtablesRetainedMatcher>,
+    ) -> Vec<(&str, &str, &ParsedRule)> {
         let mut references = Vec::new();
         let Some((table_name, table)) = self.tables.get_key_value(table) else {
             return references;
         };
         for (chain, rules) in &table.rules {
             for rule in rules {
+                if retained
+                    .is_some_and(|matcher| matcher.excludes_rule(table_name, chain, rule.ordinal))
+                {
+                    continue;
+                }
                 if rule_targets(rule, target) {
                     references.push((table_name.as_ref(), chain.as_ref(), rule));
                 }
@@ -1385,6 +1515,7 @@ impl ParsedRuleset {
         ordinal: u32,
         candidate_mask: u32,
         current_rule: &ParsedRule,
+        retained: Option<&XtablesRetainedMatcher>,
     ) -> Result<bool, AndroidXtablesFwmarkObservationError> {
         let rules = self
             .tables
@@ -1393,6 +1524,9 @@ impl ParsedRuleset {
             .map(Vec::as_slice)
             .unwrap_or_default();
         for rule in rules.iter().take_while(|rule| rule.ordinal < ordinal) {
+            if retained.is_some_and(|matcher| matcher.excludes_rule(table, chain, rule.ordinal)) {
+                continue;
+            }
             if self
                 .rule_mark_semantics(rule)?
                 .packet_write_mask
@@ -1445,11 +1579,19 @@ impl ParsedRuleset {
             .sum()
     }
 
-    fn flux_owned_chain_count(&self) -> usize {
+    fn flux_owned_chain_count(&self, retained: Option<&XtablesRetainedMatcher>) -> usize {
         self.tables
-            .values()
-            .flat_map(|table| table.chains.keys())
-            .filter(|chain| crate::xtables::is_flux_owned_chain(chain))
+            .iter()
+            .flat_map(|(table_name, table)| {
+                table
+                    .chains
+                    .keys()
+                    .map(move |chain| (table_name.as_ref(), chain.as_ref()))
+            })
+            .filter(|(_, chain)| crate::xtables::is_flux_owned_chain(chain))
+            .filter(|(table, chain)| {
+                !retained.is_some_and(|matcher| matcher.excludes_chain(table, chain))
+            })
             .count()
     }
 

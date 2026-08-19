@@ -1,20 +1,21 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{
     AndroidMarkPlanningAuthority, AndroidMarkPlanningAuthorizationError, AndroidNetdSourceProfile,
-    AndroidTproxyTopologyScopeError, AndroidTproxyTopologyScopeRequest, CapabilityProfile,
-    CapabilityProfileDigest, CapabilityProfileRevision, CapturePathBehavioralEvidence,
-    CompleteFwmarkCensus, CompleteFwmarkCensusError, FwmarkCandidate,
-    FwmarkCensusCollectorEvidenceDigest, FwmarkCensusCollectorRevision, NetworkInventory,
-    NetworkNamespaceIdentity, ObservationKind, ReviewedAndroidPlatformProfileCatalogError,
-    ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
-    ReviewedCanaryRpdbClassificationError, ReviewedPolicyCatalogEntryId,
-    RpdbFwmarkCensusFragmentError, assess_android_tproxy_topology_scope,
-    authorize_android_mark_planning, classify_android_rpdb,
-    classify_android_rpdb_with_reviewed_canary_facility,
+    AndroidRpdbClassificationReport, AndroidRpdbRetainedOwner, AndroidTproxyTopologyScopeError,
+    AndroidTproxyTopologyScopeRequest, CapabilityProfile, CapabilityProfileDigest,
+    CapabilityProfileRevision, CapturePathBehavioralEvidence, CompleteFwmarkCensus,
+    CompleteFwmarkCensusError, FwmarkCandidate, FwmarkCensusCollectorEvidenceDigest,
+    FwmarkCensusCollectorRevision, NetworkInventory, NetworkNamespaceIdentity, ObservationKind,
+    ReviewedAndroidPlatformProfileCatalogError, ReviewedCanaryFacilityPolicy,
+    ReviewedCanaryFacilitySelection, ReviewedCanaryRpdbClassificationError,
+    ReviewedPolicyCatalogEntryId, RpdbFwmarkCensusFragmentError,
+    assess_android_tproxy_topology_scope, authorize_android_mark_planning, classify_android_rpdb,
+    classify_android_rpdb_with_retained_owner, classify_android_rpdb_with_reviewed_canary_facility,
+    classify_android_rpdb_with_reviewed_canary_facility_and_retained_owner,
     project_android_net_id_fwmark_census_fragment,
     project_rpdb_fwmark_census_fragment_with_classification,
     select_reviewed_android_platform_profile,
@@ -25,12 +26,15 @@ use super::{
     AndroidFwmarkCensusAssemblyError, AndroidFwmarkCensusProjection,
     assemble_android_fwmark_census_projection,
 };
+use crate::ProcessIdentity;
 use crate::android_fwmark_census::{
     AndroidExistingFluxOwnershipObservation, AndroidNftablesFwmarkObservation,
     AndroidTrafficControlBpfFwmarkObservation, AndroidXfrmFwmarkObservation,
     AndroidXtablesFwmarkObservation,
 };
 use crate::android_kernel_capabilities::{AndroidKernelConfigDigest, AndroidKernelConfigSnapshot};
+use crate::netlink::policy_routing::{exact_managed_route_index, exact_managed_rule_index};
+use crate::xtables::NativeCaptureOwnershipObservation;
 
 pub const ANDROID_FWMARK_CENSUS_COLLECTOR_REVISION: FwmarkCensusCollectorRevision =
     FwmarkCensusCollectorRevision::new(2).expect("collector revision two is nonzero");
@@ -173,6 +177,7 @@ pub struct AndroidFwmarkCensusCoordinatorRequest {
         ReviewedCanaryFacilitySelection,
     )>,
     stage_bound: Duration,
+    deadline: Option<Instant>,
 }
 
 impl AndroidFwmarkCensusCoordinatorRequest {
@@ -196,6 +201,7 @@ impl AndroidFwmarkCensusCoordinatorRequest {
             topology_scope,
             reviewed_canary_facility: None,
             stage_bound,
+            deadline: None,
         })
     }
 
@@ -206,6 +212,17 @@ impl AndroidFwmarkCensusCoordinatorRequest {
         selection: ReviewedCanaryFacilitySelection,
     ) -> Self {
         self.reviewed_canary_facility = Some((policy, selection));
+        self
+    }
+
+    /// Sets one optional absolute deadline for the complete census transaction.
+    ///
+    /// Ordinary callers leave this unset and retain the independent per-stage bound. An active
+    /// Capture Path audit supplies its immutable completion deadline so each bounded collector
+    /// receives only the remaining global budget.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -227,6 +244,11 @@ impl AndroidFwmarkCensusCoordinatorRequest {
     #[must_use]
     pub const fn stage_bound(&self) -> Duration {
         self.stage_bound
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 }
 
@@ -270,6 +292,29 @@ pub trait AndroidFwmarkCensusCoordinatorSource {
         bound: Duration,
     ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error>;
 
+    /// Collects an external snapshot while retaining exactly one already-authenticated native
+    /// owner.  The default is conservative for sources that have not implemented the narrow
+    /// owner-aware path; production Android overrides it so an active audit can consume the
+    /// owner's xtables evidence without treating it as foreign state.
+    fn collect_external_snapshot_for_active_owner(
+        &mut self,
+        phase: AndroidFwmarkCensusExternalPhase,
+        netd_source_profile: AndroidNetdSourceProfile,
+        candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
+        active_owner: &NativeCaptureOwnershipObservation,
+        bound: Duration,
+    ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
+        let _ = active_owner;
+        self.collect_external_snapshot(
+            phase,
+            netd_source_profile,
+            candidate,
+            reviewed_policy,
+            bound,
+        )
+    }
+
     fn collect_network_inventory(
         &mut self,
         bound: Duration,
@@ -282,6 +327,27 @@ pub trait AndroidFwmarkCensusCoordinatorSource {
         network_namespace: NetworkNamespaceIdentity,
         xtables: &AndroidXtablesFwmarkObservation,
     ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error>;
+
+    /// Collects existing-Flux ownership while retaining one exact, already-authenticated native
+    /// owner. Implementations that cannot prove the narrow owner-aware exception fall back to the
+    /// ordinary absence proof, which remains fail-closed for active-owner callers.
+    fn collect_existing_flux_ownership_for_active_owner(
+        &mut self,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        active_owner: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error> {
+        let _ = (active_owner, expected_engine);
+        self.collect_existing_flux_ownership(
+            inventory,
+            capability_profile,
+            network_namespace,
+            xtables,
+        )
+    }
 }
 
 struct BoundInventoryCoordinatorSource<'a, S> {
@@ -319,6 +385,25 @@ where
         )
     }
 
+    fn collect_external_snapshot_for_active_owner(
+        &mut self,
+        phase: AndroidFwmarkCensusExternalPhase,
+        netd_source_profile: AndroidNetdSourceProfile,
+        candidate: FwmarkCandidate,
+        reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
+        active_owner: &NativeCaptureOwnershipObservation,
+        bound: Duration,
+    ) -> Result<AndroidFwmarkCensusExternalSnapshot, Self::Error> {
+        self.source.collect_external_snapshot_for_active_owner(
+            phase,
+            netd_source_profile,
+            candidate,
+            reviewed_policy,
+            active_owner,
+            bound,
+        )
+    }
+
     fn collect_network_inventory(
         &mut self,
         _bound: Duration,
@@ -340,12 +425,33 @@ where
             xtables,
         )
     }
+
+    fn collect_existing_flux_ownership_for_active_owner(
+        &mut self,
+        inventory: &NetworkInventory,
+        capability_profile: &CapabilityProfile,
+        network_namespace: NetworkNamespaceIdentity,
+        xtables: &AndroidXtablesFwmarkObservation,
+        active_owner: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<AndroidExistingFluxOwnershipObservation, Self::Error> {
+        self.source
+            .collect_existing_flux_ownership_for_active_owner(
+                inventory,
+                capability_profile,
+                network_namespace,
+                xtables,
+                active_owner,
+                expected_engine,
+            )
+    }
 }
 
 /// Single-use planning evidence from one coherent, freshness-bracketed census.
 #[derive(Debug, Eq, PartialEq)]
 pub struct AndroidFwmarkCensusPlanningEvidence {
     mark_authority: AndroidMarkPlanningAuthority,
+    classification: AndroidRpdbClassificationReport,
     kernel_config: Arc<AndroidKernelConfigSnapshot>,
     capture_path_evidence: CapturePathBehavioralEvidence,
 }
@@ -353,11 +459,13 @@ pub struct AndroidFwmarkCensusPlanningEvidence {
 impl AndroidFwmarkCensusPlanningEvidence {
     fn new(
         mark_authority: AndroidMarkPlanningAuthority,
+        classification: AndroidRpdbClassificationReport,
         kernel_config: Arc<AndroidKernelConfigSnapshot>,
         capture_path_evidence: CapturePathBehavioralEvidence,
     ) -> Self {
         Self {
             mark_authority,
+            classification,
             kernel_config,
             capture_path_evidence,
         }
@@ -366,6 +474,11 @@ impl AndroidFwmarkCensusPlanningEvidence {
     #[must_use]
     pub const fn mark_authority(&self) -> &AndroidMarkPlanningAuthority {
         &self.mark_authority
+    }
+
+    #[must_use]
+    pub const fn classification(&self) -> &AndroidRpdbClassificationReport {
+        &self.classification
     }
 
     #[must_use]
@@ -428,6 +541,9 @@ pub enum AndroidFwmarkCensusCoordinatorError<E> {
         stage: AndroidFwmarkCensusCollectionStage,
         source: E,
     },
+    DeadlineExceeded {
+        stage: AndroidFwmarkCensusCollectionStage,
+    },
     CapabilityDeviceIdentityUnavailable {
         observation: ObservationKind,
     },
@@ -454,6 +570,7 @@ pub enum AndroidFwmarkCensusCoordinatorError<E> {
         requested: AndroidNetdSourceProfile,
     },
     ReviewedCanaryFacilityPolicyMismatch,
+    RetainedOwnerRoutingMismatch,
     ReviewedCanaryRpdb(Box<ReviewedCanaryRpdbClassificationError>),
     Topology(Box<AndroidTproxyTopologyScopeError>),
     Rpdb(RpdbFwmarkCensusFragmentError),
@@ -467,6 +584,7 @@ impl<E> AndroidFwmarkCensusCoordinatorError<E> {
     pub const fn collection_stage(&self) -> Option<AndroidFwmarkCensusCollectionStage> {
         match self {
             Self::Collection { stage, .. } => Some(*stage),
+            Self::DeadlineExceeded { stage } => Some(*stage),
             Self::CapabilityDeviceIdentityUnavailable { .. }
             | Self::CapabilityDrift { .. }
             | Self::ExternalSnapshotContextMismatch { .. }
@@ -474,6 +592,7 @@ impl<E> AndroidFwmarkCensusCoordinatorError<E> {
             | Self::PlatformProfile(_)
             | Self::SelectedNetdSourceProfileMismatch { .. }
             | Self::ReviewedCanaryFacilityPolicyMismatch
+            | Self::RetainedOwnerRoutingMismatch
             | Self::ReviewedCanaryRpdb(_)
             | Self::Topology(_)
             | Self::Rpdb(_)
@@ -490,6 +609,11 @@ impl<E: fmt::Display> fmt::Display for AndroidFwmarkCensusCoordinatorError<E> {
             Self::Collection { stage, source } => write!(
                 formatter,
                 "Android fwmark census {} collection failed: {source}",
+                stage.as_str()
+            ),
+            Self::DeadlineExceeded { stage } => write!(
+                formatter,
+                "Android fwmark census {} collection exceeded its absolute deadline",
                 stage.as_str()
             ),
             Self::CapabilityDeviceIdentityUnavailable { observation } => write!(
@@ -538,6 +662,9 @@ impl<E: fmt::Display> fmt::Display for AndroidFwmarkCensusCoordinatorError<E> {
             Self::ReviewedCanaryFacilityPolicyMismatch => formatter.write_str(
                 "Android fwmark census can exempt canary peer rules only under the exact selected facility policy",
             ),
+            Self::RetainedOwnerRoutingMismatch => formatter.write_str(
+                "Android fwmark census could not prove one exact retained native route/rule owner",
+            ),
             Self::ReviewedCanaryRpdb(error) => {
                 write!(formatter, "reviewed canary RPDB classification failed: {error}")
             }
@@ -566,12 +693,29 @@ impl<E: Error + 'static> Error for AndroidFwmarkCensusCoordinatorError<E> {
             Self::CompleteCensus(error) => Some(error),
             Self::Authorization(error) => Some(error.as_ref()),
             Self::CapabilityDeviceIdentityUnavailable { .. }
+            | Self::DeadlineExceeded { .. }
             | Self::CapabilityDrift { .. }
             | Self::ExternalSnapshotContextMismatch { .. }
             | Self::ExternalSnapshotDrift { .. }
             | Self::SelectedNetdSourceProfileMismatch { .. }
             | Self::ReviewedCanaryFacilityPolicyMismatch => None,
+            Self::RetainedOwnerRoutingMismatch => None,
         }
+    }
+}
+
+fn stage_bound_for<E>(
+    request: &AndroidFwmarkCensusCoordinatorRequest,
+    stage: AndroidFwmarkCensusCollectionStage,
+) -> Result<Duration, AndroidFwmarkCensusCoordinatorError<E>> {
+    let Some(deadline) = request.deadline else {
+        return Ok(request.stage_bound);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(AndroidFwmarkCensusCoordinatorError::DeadlineExceeded { stage })
+    } else {
+        Ok(request.stage_bound.min(remaining))
     }
 }
 
@@ -585,12 +729,25 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
     request: &AndroidFwmarkCensusCoordinatorRequest,
     purpose: AndroidFwmarkCensusCoordinatorPurpose,
 ) -> Result<AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorError<S::Error>> {
-    let capability_before = source
-        .collect_capability_profile(AndroidFwmarkCensusCollectionStage::CapabilityBefore)
-        .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
-            stage: AndroidFwmarkCensusCollectionStage::CapabilityBefore,
+    coordinate_android_fwmark_census_inner(source, request, purpose, None)
+}
+
+fn coordinate_android_fwmark_census_inner<S: AndroidFwmarkCensusCoordinatorSource>(
+    source: &mut S,
+    request: &AndroidFwmarkCensusCoordinatorRequest,
+    purpose: AndroidFwmarkCensusCoordinatorPurpose,
+    active_owner: Option<(&NativeCaptureOwnershipObservation, ProcessIdentity)>,
+) -> Result<AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorError<S::Error>> {
+    let capability_before_stage = AndroidFwmarkCensusCollectionStage::CapabilityBefore;
+    let capability_before = {
+        let _ = stage_bound_for::<S::Error>(request, capability_before_stage)?;
+        let result = source.collect_capability_profile(capability_before_stage);
+        let _ = stage_bound_for::<S::Error>(request, capability_before_stage)?;
+        result.map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
+            stage: capability_before_stage,
             source,
-        })?;
+        })?
+    };
     let network_namespace = capability_before
         .device_identity()
         .verified()
@@ -619,59 +776,94 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         return Err(AndroidFwmarkCensusCoordinatorError::ReviewedCanaryFacilityPolicyMismatch);
     }
 
-    let external_before = source
-        .collect_external_snapshot(
+    let external_before_stage = AndroidFwmarkCensusExternalPhase::Before.collection_stage();
+    let external_before = {
+        let bound = stage_bound_for::<S::Error>(request, external_before_stage)?;
+        let result = collect_external_snapshot(
+            source,
+            active_owner.map(|(owner, _)| owner),
             AndroidFwmarkCensusExternalPhase::Before,
             request.netd_source_profile,
             request.candidate,
             platform_profile_selection.mark_policy_catalog_entry(),
-            request.stage_bound,
-        )
-        .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
-            stage: AndroidFwmarkCensusExternalPhase::Before.collection_stage(),
+            bound,
+        );
+        let _ = stage_bound_for::<S::Error>(request, external_before_stage)?;
+        result.map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
+            stage: external_before_stage,
             source,
-        })?;
+        })?
+    };
     validate_external_context(
         &external_before,
         request,
         AndroidFwmarkCensusExternalPhase::Before,
     )?;
 
-    let inventory = source
-        .collect_network_inventory(request.stage_bound)
-        .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
-            stage: AndroidFwmarkCensusCollectionStage::NetworkInventory,
+    let inventory_stage = AndroidFwmarkCensusCollectionStage::NetworkInventory;
+    let inventory = {
+        let bound = stage_bound_for::<S::Error>(request, inventory_stage)?;
+        let result = source.collect_network_inventory(bound);
+        let _ = stage_bound_for::<S::Error>(request, inventory_stage)?;
+        result.map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
+            stage: inventory_stage,
             source,
-        })?;
-    let existing_flux = source
-        .collect_existing_flux_ownership(
-            &inventory,
-            &capability_before,
-            network_namespace,
-            &external_before.xtables,
-        )
-        .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
-            stage: AndroidFwmarkCensusCollectionStage::ExistingFluxOwnership,
+        })?
+    };
+    let existing_flux_stage = AndroidFwmarkCensusCollectionStage::ExistingFluxOwnership;
+    let existing_flux = {
+        let _ = stage_bound_for::<S::Error>(request, existing_flux_stage)?;
+        let result = match active_owner {
+            Some((active_owner, expected_engine)) => source
+                .collect_existing_flux_ownership_for_active_owner(
+                    &inventory,
+                    &capability_before,
+                    network_namespace,
+                    &external_before.xtables,
+                    active_owner,
+                    expected_engine,
+                ),
+            None => source.collect_existing_flux_ownership(
+                &inventory,
+                &capability_before,
+                network_namespace,
+                &external_before.xtables,
+            ),
+        };
+        let _ = stage_bound_for::<S::Error>(request, existing_flux_stage)?;
+        result.map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
+            stage: existing_flux_stage,
             source,
-        })?;
-    let external_after = source
-        .collect_external_snapshot(
+        })?
+    };
+    let external_after_stage = AndroidFwmarkCensusExternalPhase::After.collection_stage();
+    let external_after = {
+        let bound = stage_bound_for::<S::Error>(request, external_after_stage)?;
+        let result = collect_external_snapshot(
+            source,
+            active_owner.map(|(owner, _)| owner),
             AndroidFwmarkCensusExternalPhase::After,
             request.netd_source_profile,
             request.candidate,
             platform_profile_selection.mark_policy_catalog_entry(),
-            request.stage_bound,
-        )
-        .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
-            stage: AndroidFwmarkCensusExternalPhase::After.collection_stage(),
+            bound,
+        );
+        let _ = stage_bound_for::<S::Error>(request, external_after_stage)?;
+        result.map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
+            stage: external_after_stage,
             source,
-        })?;
-    let capability_after = source
-        .collect_capability_profile(AndroidFwmarkCensusCollectionStage::CapabilityAfter)
-        .map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
-            stage: AndroidFwmarkCensusCollectionStage::CapabilityAfter,
+        })?
+    };
+    let capability_after_stage = AndroidFwmarkCensusCollectionStage::CapabilityAfter;
+    let capability_after = {
+        let _ = stage_bound_for::<S::Error>(request, capability_after_stage)?;
+        let result = source.collect_capability_profile(capability_after_stage);
+        let _ = stage_bound_for::<S::Error>(request, capability_after_stage)?;
+        result.map_err(|source| AndroidFwmarkCensusCoordinatorError::Collection {
+            stage: capability_after_stage,
             source,
-        })?;
+        })?
+    };
 
     if capability_before != capability_after {
         return Err(AndroidFwmarkCensusCoordinatorError::CapabilityDrift {
@@ -693,8 +885,52 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         });
     }
 
-    let classification = match request.reviewed_canary_facility.as_ref() {
-        Some((policy, selection)) => classify_android_rpdb_with_reviewed_canary_facility(
+    let retained_owner = active_owner
+        .map(|(active_owner, _)| {
+            active_owner
+                .retained_owner()
+                .routing()
+                .iter()
+                .copied()
+                .map(|identity| {
+                    let route_index = exact_managed_route_index(&inventory, identity)
+                        .ok_or(AndroidFwmarkCensusCoordinatorError::RetainedOwnerRoutingMismatch)?;
+                    let rule_index = exact_managed_rule_index(&inventory, identity)
+                        .ok_or(AndroidFwmarkCensusCoordinatorError::RetainedOwnerRoutingMismatch)?;
+                    Ok((route_index, rule_index))
+                })
+                .collect::<Result<Vec<_>, AndroidFwmarkCensusCoordinatorError<S::Error>>>()
+                .and_then(|indices| {
+                    // SAFETY: each pair was obtained immediately above from the platform-private
+                    // exact identity audit against this immutable inventory.  That audit checks
+                    // every modeled route/rule field and requires one exact route and rule with
+                    // no duplicate or same-coordinate conflict before returning an index.
+                    unsafe {
+                        AndroidRpdbRetainedOwner::from_verified_inventory_unchecked(
+                            &inventory, indices,
+                        )
+                    }
+                    .map_err(|_| AndroidFwmarkCensusCoordinatorError::RetainedOwnerRoutingMismatch)
+                })
+        })
+        .transpose()?;
+    let classification = match (
+        request.reviewed_canary_facility.as_ref(),
+        retained_owner.as_ref(),
+    ) {
+        (Some((policy, selection)), Some(retained_owner)) => {
+            classify_android_rpdb_with_reviewed_canary_facility_and_retained_owner(
+                &inventory,
+                request.netd_source_profile,
+                policy,
+                *selection,
+                retained_owner,
+            )
+            .map_err(|error| {
+                AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(Box::new(error))
+            })?
+        }
+        (Some((policy, selection)), None) => classify_android_rpdb_with_reviewed_canary_facility(
             &inventory,
             request.netd_source_profile,
             policy,
@@ -703,7 +939,13 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
         .map_err(|error| {
             AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(Box::new(error))
         })?,
-        None => classify_android_rpdb(&inventory, request.netd_source_profile),
+        (None, Some(retained_owner)) => classify_android_rpdb_with_retained_owner(
+            &inventory,
+            request.netd_source_profile,
+            retained_owner,
+        )
+        .map_err(|_| AndroidFwmarkCensusCoordinatorError::RetainedOwnerRoutingMismatch)?,
+        (None, None) => classify_android_rpdb(&inventory, request.netd_source_profile),
     };
     let topology_scope =
         assess_android_tproxy_topology_scope(&inventory, &classification, &request.topology_scope)
@@ -766,6 +1008,7 @@ pub fn coordinate_android_fwmark_census<S: AndroidFwmarkCensusCoordinatorSource>
     Ok(AndroidFwmarkCensusCoordinatorOutcome::PlanningAuthority(
         Box::new(AndroidFwmarkCensusPlanningEvidence::new(
             authority,
+            classification,
             Arc::clone(&external_before.kernel_config),
             capture_path_evidence,
         )),
@@ -788,6 +1031,55 @@ pub fn coordinate_android_fwmark_census_for_inventory<S: AndroidFwmarkCensusCoor
         request,
         purpose,
     )
+}
+
+/// Runs the coherent census around one immutable inventory while retaining one exact active
+/// native owner.  The owner is passed through the narrow source seam for both external brackets;
+/// the inventory itself is never cloned, filtered, or replaced.
+pub fn coordinate_android_fwmark_census_for_inventory_with_active_owner<
+    S: AndroidFwmarkCensusCoordinatorSource,
+>(
+    source: &mut S,
+    request: &AndroidFwmarkCensusCoordinatorRequest,
+    purpose: AndroidFwmarkCensusCoordinatorPurpose,
+    inventory: Arc<NetworkInventory>,
+    active_owner: &NativeCaptureOwnershipObservation,
+    expected_engine: ProcessIdentity,
+) -> Result<AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorError<S::Error>> {
+    coordinate_android_fwmark_census_inner(
+        &mut BoundInventoryCoordinatorSource { source, inventory },
+        request,
+        purpose,
+        Some((active_owner, expected_engine)),
+    )
+}
+
+fn collect_external_snapshot<S: AndroidFwmarkCensusCoordinatorSource>(
+    source: &mut S,
+    active_owner: Option<&NativeCaptureOwnershipObservation>,
+    phase: AndroidFwmarkCensusExternalPhase,
+    netd_source_profile: AndroidNetdSourceProfile,
+    candidate: FwmarkCandidate,
+    reviewed_policy: Option<&ReviewedPolicyCatalogEntryId>,
+    bound: Duration,
+) -> Result<AndroidFwmarkCensusExternalSnapshot, S::Error> {
+    match active_owner {
+        Some(active_owner) => source.collect_external_snapshot_for_active_owner(
+            phase,
+            netd_source_profile,
+            candidate,
+            reviewed_policy,
+            active_owner,
+            bound,
+        ),
+        None => source.collect_external_snapshot(
+            phase,
+            netd_source_profile,
+            candidate,
+            reviewed_policy,
+            bound,
+        ),
+    }
 }
 
 fn validate_external_context<E>(

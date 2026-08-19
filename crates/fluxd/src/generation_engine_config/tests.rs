@@ -11,10 +11,10 @@ use flux_core::{
     CaptureInterfaceDirection, CapturePathId, CapturePathQualificationState,
     CapturePathQualifications, CapturePathRequest, CapturePredicate, CaptureTrafficDomain,
     CaptureUserId, EngineCredentials, FluxConfig, FwmarkCandidate, InterfaceAddressRecord,
-    InterfaceLinkRecord, KernelSupport, NetworkAddressFamily, NetworkInventory,
-    NetworkInventoryTracker, NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol,
-    RouteTableId, RulePriority, RuleProtocol, SelinuxMode,
-    select_reviewed_android_platform_profile,
+    InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
+    KernelSupport, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
+    NetworkNamespaceIdentity, Observation, ObservationKind, RouteProtocol, RouteTableId,
+    RulePriority, RuleProtocol, SelinuxMode, select_reviewed_android_platform_profile,
 };
 use flux_platform::internal::SingBoxProcessError;
 use flux_platform::{
@@ -40,12 +40,13 @@ use super::{
     PreparedGenerationRecord, PreparedGenerationRecordError, PreparedGenerationRecordStore,
     SelectedEngineSource, SelectedEngineSourceIdentity, TPROXY_GENERATION_CANDIDATE_SCHEMA_VERSION,
     TproxyCanaryEngineRoute, TproxyEngineConfigRequest, TproxyGenerationCandidateErrorKind,
-    bind_engine_config_to_spec, bind_engine_spec_to_desired_state,
-    collect_tproxy_engine_capability_profile, compile_desired_state, compile_desired_state_capture,
-    compile_tproxy_engine_config, compile_tproxy_generation_candidate,
-    declare_supervised_delivery_report_profile_fixture, parse_sing_box_version_output,
-    qualified_xtables_capture_path_evidence, qualified_xtables_kernel_config,
-    rebind_engine_capability_profile_fixture, reconstruct_canonical_tproxy_engine_config,
+    active_capture_plan_digest_for_audit, bind_engine_config_to_spec,
+    bind_engine_spec_to_desired_state, collect_tproxy_engine_capability_profile,
+    compile_desired_state, compile_desired_state_capture, compile_tproxy_engine_config,
+    compile_tproxy_generation_candidate, declare_supervised_delivery_report_profile_fixture,
+    parse_sing_box_version_output, qualified_xtables_capture_path_evidence,
+    qualified_xtables_kernel_config, rebind_engine_capability_profile_fixture,
+    reconstruct_canonical_tproxy_engine_config,
 };
 use crate::engine_supervisor::EngineCapabilityProbeError;
 use crate::functional_canary::FunctionalCanaryGateMode;
@@ -1924,6 +1925,238 @@ fn assembler_requires_local_output_routing_evidence() {
         GenerationAssemblyError::Planning(ref source)
             if source.kind() == GenerationPlanningErrorKind::MissingLocalOutputRouting
     ));
+}
+
+#[test]
+fn active_capture_plan_digest_rejects_unqualified_or_incomplete_fresh_planning() {
+    let fixture = HostAssemblyFixture::new();
+    let admitted = fixture
+        .assemble(None, None)
+        .expect("qualified baseline Generation");
+    let selection = admitted.capture_path_selection();
+    let unqualified = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        CapturePathQualificationEvidence::host_inspection_with_maximum_lifetime(
+            CapturePathQualifications::default(),
+            Instant::now(),
+        )
+        .expect("bounded unqualified evidence"),
+        &fixture.inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(test_routing()),
+    );
+
+    let error = active_capture_plan_digest_for_audit(
+        fixture.desired_state.desired_state(),
+        fixture.desired_state.capture(),
+        &GenerationPlanningAuthority::host_inspection(unqualified),
+        selection,
+    )
+    .expect_err("an unqualified fresh path cannot request a successor");
+    assert_eq!(
+        error.kind(),
+        GenerationPlanningErrorKind::CapturePathNotQualified {
+            path: CapturePathId::XtablesTproxy,
+            state: CapturePathQualificationState::Unqualified,
+        }
+    );
+
+    let missing_routing = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        qualified_xtables_capture_path_evidence(),
+        &fixture.inventory,
+        test_network_namespace(),
+        test_mark(),
+        None,
+    );
+    let error = active_capture_plan_digest_for_audit(
+        fixture.desired_state.desired_state(),
+        fixture.desired_state.capture(),
+        &GenerationPlanningAuthority::host_inspection(missing_routing),
+        selection,
+    )
+    .expect_err("missing local-OUTPUT routing must remain a planning error");
+    assert_eq!(
+        error.kind(),
+        GenerationPlanningErrorKind::MissingLocalOutputRouting
+    );
+}
+
+#[test]
+fn active_capture_plan_digest_binds_stable_plan_facts() {
+    let fixture = HostAssemblyFixture::new();
+    let baseline = fixture
+        .assemble(None, None)
+        .expect("baseline active Capture Path plan");
+    let selection = baseline.capture_path_selection();
+
+    let changed_mark = FwmarkCandidate::new(0x00ff_0000, 0x0070_0000, 0x0030_0000)
+        .expect("alternate mark remains inside the mask");
+    let mark_planning = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        qualified_xtables_capture_path_evidence(),
+        &fixture.inventory,
+        test_network_namespace(),
+        changed_mark,
+        Some(test_routing()),
+    );
+    let mark_digest = active_capture_plan_digest_for_audit(
+        fixture.desired_state.desired_state(),
+        fixture.desired_state.capture(),
+        &GenerationPlanningAuthority::host_inspection(mark_planning),
+        selection,
+    )
+    .expect("alternate mark is a complete safe plan");
+    assert_ne!(baseline.active_capture_plan_digest(), mark_digest);
+
+    let routing_target = XtablesLocalOutputRoutingTarget::new(
+        RulePriority::from_raw(30_998),
+        RouteTableId::from_raw(20_253),
+        NonZeroU32::new(1_024).expect("test route metric"),
+        RouteProtocol::from_raw(4),
+        RuleProtocol::from_raw(99),
+    )
+    .expect("alternate routing target");
+    let routing = XtablesLocalOutputRoutingSpec::new(Some(routing_target), None)
+        .expect("alternate IPv4 routing");
+    let routing_planning = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        qualified_xtables_capture_path_evidence(),
+        &fixture.inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(routing),
+    );
+    let routing_digest = active_capture_plan_digest_for_audit(
+        fixture.desired_state.desired_state(),
+        fixture.desired_state.capture(),
+        &GenerationPlanningAuthority::host_inspection(routing_planning),
+        selection,
+    )
+    .expect("alternate routing is a complete safe plan");
+    assert_ne!(baseline.active_capture_plan_digest(), routing_digest);
+
+    let exact_source =
+        fixture
+            .base_desired_state
+            .replacen("path = \"auto\"", "path = \"xtables_tproxy\"", 1);
+    let exact = fixture
+        .assemble(None, Some(fixture.compile_desired_state(&exact_source)))
+        .expect("exact xtables plan");
+    assert_ne!(
+        baseline.active_capture_plan_digest(),
+        exact.active_capture_plan_digest(),
+        "the caller's path request is a stable plan fact"
+    );
+
+    let tcp_only_source = fixture
+        .base_desired_state
+        .replacen("udp = true", "udp = false", 1);
+    let tcp_only = fixture
+        .assemble(None, Some(fixture.compile_desired_state(&tcp_only_source)))
+        .expect("TCP-only plan");
+    assert_ne!(
+        baseline.active_capture_plan_digest(),
+        tcp_only.active_capture_plan_digest(),
+        "compiled traffic program and protocol scope are stable plan facts"
+    );
+}
+
+#[test]
+fn active_capture_plan_digest_excludes_volatile_evidence_and_generation_lineage() {
+    let fixture = HostAssemblyFixture::new();
+    let baseline = fixture
+        .assemble(None, None)
+        .expect("baseline active Capture Path plan");
+    let successor = fixture
+        .assemble(Some(baseline.identity()), None)
+        .expect("unchanged successor Generation");
+    assert_eq!(
+        baseline.active_capture_plan_digest(),
+        successor.active_capture_plan_digest(),
+        "Generation identity and lineage are not active-plan facts"
+    );
+
+    let mut tracker = NetworkInventoryTracker::new();
+    let first_inventory = empty_inventory(&mut tracker).clone();
+    let changed_link = InterfaceLinkRecord::new(
+        InterfaceIndex::new(7).expect("positive interface index"),
+        InterfaceName::new(b"wlan0").expect("bounded interface name"),
+        InterfaceHardwareType::from_raw(1),
+        InterfaceLinkFlags::UP,
+    );
+    let second_inventory = tracker
+        .publish_complete([changed_link], Vec::<InterfaceAddressRecord>::new())
+        .expect("publish materially changed inventory")
+        .clone();
+    assert_ne!(
+        first_inventory.snapshot_id(),
+        second_inventory.snapshot_id()
+    );
+    assert_ne!(first_inventory.epoch(), second_inventory.epoch());
+
+    let observed_at = Instant::now();
+    let later_observed_at = observed_at
+        .checked_add(Duration::from_secs(1))
+        .expect("later observation time");
+    let qualifications = qualified_xtables_capture_path_evidence().qualifications();
+    let first_evidence = CapturePathQualificationEvidence::host_inspection(
+        qualifications,
+        observed_at,
+        observed_at
+            .checked_add(Duration::from_secs(30))
+            .expect("first bounded deadline"),
+    )
+    .expect("first bounded evidence");
+    let second_evidence = CapturePathQualificationEvidence::host_inspection(
+        qualifications,
+        later_observed_at,
+        later_observed_at
+            .checked_add(Duration::from_secs(45))
+            .expect("second bounded deadline"),
+    )
+    .expect("second bounded evidence");
+    let first_planning = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        first_evidence,
+        &first_inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(test_routing()),
+    );
+    let second_planning = HostInspectionPlanningAuthority::new(
+        &fixture.capability_profile,
+        qualified_xtables_kernel_config(),
+        second_evidence,
+        &second_inventory,
+        test_network_namespace(),
+        test_mark(),
+        Some(test_routing()),
+    );
+    let first_digest = active_capture_plan_digest_for_audit(
+        fixture.desired_state.desired_state(),
+        fixture.desired_state.capture(),
+        &GenerationPlanningAuthority::host_inspection(first_planning),
+        baseline.capture_path_selection(),
+    )
+    .expect("first complete plan");
+    let second_digest = active_capture_plan_digest_for_audit(
+        fixture.desired_state.desired_state(),
+        fixture.desired_state.capture(),
+        &GenerationPlanningAuthority::host_inspection(second_planning),
+        baseline.capture_path_selection(),
+    )
+    .expect("second complete plan");
+    assert_eq!(
+        first_digest, second_digest,
+        "snapshot, epoch, observation time, and deadline are freshness facts outside the plan"
+    );
 }
 
 #[test]

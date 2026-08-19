@@ -13,8 +13,7 @@ use flux_core::{
     FwmarkUseOperation, FwmarkUseRecord, GenerationId, NetworkAddressFamily, NetworkInventory,
     Reason, ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
     ReviewedCanaryRoleCredentials, RpdbFamilyPlacement, RpdbPlacementRequest, RulePriority,
-    RuleTableId, StaleRpdbPlacementLease, classify_android_rpdb,
-    classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
+    RuleTableId, StaleRpdbPlacementLease, plan_android_rpdb_placement,
     plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
@@ -25,9 +24,9 @@ use flux_platform::{
     AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusExternalPhase,
     NativeCaptureOwnershipObservation, NativeXtablesCaptureAdmission,
     NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
-    SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
-    SystemAndroidFwmarkCensusSourceError, SystemAndroidFwmarkCensusSourceErrorKind,
-    coordinate_android_fwmark_census_for_inventory,
+    ProcessIdentity, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,
+    SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
+    SystemAndroidFwmarkCensusSourceErrorKind, coordinate_android_fwmark_census_for_inventory,
     coordinate_android_fwmark_census_for_inventory_with_active_owner,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
@@ -88,20 +87,15 @@ pub(crate) trait NativeGenerationPlanningSource: Send + 'static {
     ) -> Result<GenerationPlanningAuthority, Self::Error>;
 
     /// Collect planning evidence for an active-path audit while retaining the exact ownership
-    /// observation as an input to the platform-private census transaction. Implementations that
-    /// do not have a retained-owner-aware collector may conservatively require a successor.
+    /// observation as an input to the platform-private census transaction.
     fn plan_active_capture_audit(
         &mut self,
         desired_state: &FluxConfig,
         inventory: &NetworkInventory,
-        _ownership: &NativeCaptureOwnershipObservation,
-    ) -> Result<Option<GenerationPlanningAuthority>, Self::Error> {
-        // An ordinary fresh plan cannot account for the exact retained native owner.  Treat
-        // owner-aware collection as an explicit capability so a source that has not implemented
-        // the narrow audit transaction fails closed into successor preparation.
-        let _ = (desired_state, inventory);
-        Ok(None)
-    }
+        complete_before: Instant,
+        ownership: &NativeCaptureOwnershipObservation,
+        expected_engine: ProcessIdentity,
+    ) -> Result<GenerationPlanningAuthority, Self::Error>;
 }
 
 trait EngineCapabilityProfileSource: Send + 'static {
@@ -196,6 +190,17 @@ impl NativeGenerationPlanningSource for LinuxNativeCompositionPlanningSource {
             ),
         ))
     }
+
+    fn plan_active_capture_audit(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: &NetworkInventory,
+        _complete_before: Instant,
+        _ownership: &NativeCaptureOwnershipObservation,
+        _expected_engine: ProcessIdentity,
+    ) -> Result<GenerationPlanningAuthority, Self::Error> {
+        self.plan(desired_state, inventory)
+    }
 }
 
 const SYSTEM_ANDROID_CANDIDATE_MASK: u32 = 0x0300_0000;
@@ -276,14 +281,15 @@ impl SystemAndroidGenerationPlanningSource {
         desired_state: &FluxConfig,
         inventory: Arc<NetworkInventory>,
     ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
-        self.plan_fresh_with_owner(desired_state, inventory, None)
+        self.plan_fresh_with_owner(desired_state, inventory, None, None)
     }
 
     fn plan_fresh_with_owner(
         &mut self,
         desired_state: &FluxConfig,
         inventory: Arc<NetworkInventory>,
-        active_owner: Option<&NativeCaptureOwnershipObservation>,
+        active_owner: Option<(&NativeCaptureOwnershipObservation, ProcessIdentity)>,
+        active_deadline: Option<Instant>,
     ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
         // The census and placement pipeline can perform bounded external observations. Age the
         // resulting Capture Path evidence from the beginning of that transaction so time spent
@@ -339,17 +345,23 @@ impl SystemAndroidGenerationPlanningSource {
             SYSTEM_ANDROID_CENSUS_BOUND,
         )
         .expect("compiled Android census request is structurally valid");
+        if let Some(deadline) = active_deadline {
+            request = request.with_deadline(deadline);
+        }
         if let Some((policy, selection, _)) = self.reviewed_canary_facility.as_ref() {
             request = request.with_reviewed_canary_facility(policy.clone(), *selection);
         }
         let outcome = match active_owner {
-            Some(active_owner) => coordinate_android_fwmark_census_for_inventory_with_active_owner(
-                &mut self.census,
-                &request,
-                AndroidFwmarkCensusCoordinatorPurpose::PlanningAuthority,
-                Arc::clone(&inventory),
-                active_owner,
-            ),
+            Some((active_owner, expected_engine)) => {
+                coordinate_android_fwmark_census_for_inventory_with_active_owner(
+                    &mut self.census,
+                    &request,
+                    AndroidFwmarkCensusCoordinatorPurpose::PlanningAuthority,
+                    Arc::clone(&inventory),
+                    active_owner,
+                    expected_engine,
+                )
+            }
             None => coordinate_android_fwmark_census_for_inventory(
                 &mut self.census,
                 &request,
@@ -388,23 +400,7 @@ impl SystemAndroidGenerationPlanningSource {
             });
         let placement_request = RpdbPlacementRequest::new(Some(family), ipv6_placement)
             .expect("compiled Android placement always enables IPv4");
-        let classification = match self.reviewed_canary_facility.as_ref() {
-            Some((policy, selection, _)) => classify_android_rpdb_with_reviewed_canary_facility(
-                &inventory,
-                netd_source_profile,
-                policy,
-                *selection,
-            )
-            .map_err(|source| {
-                SystemAndroidGenerationPlanningError::Placement(
-                    SystemAndroidGenerationPlanningPlacementError::new(
-                        SystemAndroidGenerationPlanningPlacementFailureClass::ReviewedClassification,
-                        source,
-                    ),
-                )
-            })?,
-            None => classify_android_rpdb(&inventory, netd_source_profile),
-        };
+        let classification = evidence.classification().clone();
         let placement = match self.reviewed_canary_facility.as_ref() {
             Some((policy, selection, _)) => {
                 plan_android_rpdb_placement_with_reviewed_canary_facility(
@@ -414,6 +410,7 @@ impl SystemAndroidGenerationPlanningSource {
                     policy,
                     *selection,
                 )
+                .map_err(|source| source.to_string())
                 .map_err(|source| {
                     SystemAndroidGenerationPlanningError::Placement(
                         SystemAndroidGenerationPlanningPlacementError::new(
@@ -424,6 +421,7 @@ impl SystemAndroidGenerationPlanningSource {
                 })?
             }
             None => plan_android_rpdb_placement(&inventory, &classification, placement_request)
+                .map_err(|source| source.to_string())
                 .map_err(|source| {
                     SystemAndroidGenerationPlanningError::Placement(
                         SystemAndroidGenerationPlanningPlacementError::new(
@@ -459,12 +457,15 @@ impl NativeGenerationPlanningSource for SystemAndroidGenerationPlanningSource {
         &mut self,
         desired_state: &FluxConfig,
         inventory: &NetworkInventory,
+        complete_before: Instant,
         ownership: &NativeCaptureOwnershipObservation,
-    ) -> Result<Option<GenerationPlanningAuthority>, Self::Error> {
+        expected_engine: ProcessIdentity,
+    ) -> Result<GenerationPlanningAuthority, Self::Error> {
         let planning = self.plan_fresh_with_owner(
             desired_state,
             Arc::new(inventory.clone()),
-            Some(ownership),
+            Some((ownership, expected_engine)),
+            Some(complete_before),
         )?;
         let Some((mark, placement)) = planning.android_runtime_binding() else {
             return Err(SystemAndroidGenerationPlanningError::Placement(
@@ -487,7 +488,7 @@ impl NativeGenerationPlanningSource for SystemAndroidGenerationPlanningSource {
                     ),
                 )
             })?;
-        Ok(Some(planning))
+        Ok(planning)
     }
 }
 
@@ -553,6 +554,10 @@ impl SystemAndroidGenerationPlanningCensusFailureClass {
             AndroidFwmarkCensusCoordinatorError::Collection { stage, source } => Self::Collection {
                 stage: *stage,
                 source: source.kind(),
+            },
+            AndroidFwmarkCensusCoordinatorError::DeadlineExceeded { stage } => Self::Collection {
+                stage: *stage,
+                source: SystemAndroidFwmarkCensusSourceErrorKind::DeadlineExceeded,
             },
             AndroidFwmarkCensusCoordinatorError::CapabilityDeviceIdentityUnavailable { .. } => {
                 Self::CapabilityDeviceIdentityUnavailable
@@ -934,7 +939,6 @@ impl SystemAndroidGenerationPlanningAuthorizationFailureClass {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemAndroidGenerationPlanningPlacementFailureClass {
-    ReviewedClassification,
     ReviewedPlanning,
     GenericPlanning,
     StaleLease,
@@ -944,7 +948,6 @@ impl SystemAndroidGenerationPlanningPlacementFailureClass {
     #[cfg(any(test, flux_android_qualification))]
     fn fmt_token(self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ReviewedClassification => "placement/reviewed-classification",
             Self::ReviewedPlanning => "placement/reviewed-planning",
             Self::GenericPlanning => "placement/generic-planning",
             Self::StaleLease => "placement/stale-lease",
@@ -1449,6 +1452,7 @@ where
     allow_test_root_canary_credentials: bool,
     accepted_subscription: Option<ValidatedSubscriptionEngineConfig>,
     latest_capture_path_decision: Option<CapturePathDecision>,
+    successor_planning: Option<GenerationPlanningAuthority>,
     pending: Option<PendingGeneration>,
     committed: Option<CommittedGeneration<I>>,
     retired_config_path: Option<PathBuf>,
@@ -1519,6 +1523,7 @@ where
             allow_test_root_canary_credentials: false,
             accepted_subscription,
             latest_capture_path_decision: None,
+            successor_planning: None,
             pending: None,
             committed: None,
             retired_config_path: None,
@@ -1550,9 +1555,10 @@ where
         &mut self,
         prior: Option<I>,
     ) -> Result<PreparedNativeGeneration<A::Target>, NativeGenerationSourceError> {
+        self.successor_planning = None;
         let inputs = self.current_inputs()?;
         let (engine_source, subscription) = self.select_current_engine_source(&inputs)?;
-        self.prepare_candidate(&inputs, engine_source, subscription, prior)
+        self.prepare_candidate(&inputs, engine_source, subscription, prior, None)
     }
 
     fn current_inputs(
@@ -1704,6 +1710,7 @@ where
         engine_source: SelectedEngineSource,
         subscription: Option<ValidatedSubscriptionEngineConfig>,
         prior: Option<I>,
+        planning_override: Option<GenerationPlanningAuthority>,
     ) -> Result<PreparedNativeGeneration<A::Target>, NativeGenerationSourceError> {
         self.require_prior(prior)?;
         if self.pending.is_some() {
@@ -1732,7 +1739,7 @@ where
             subscription.clone(),
             prior_owned,
             next,
-            config_path.clone(),
+            planning_override,
         );
         if result.is_err() {
             let _ = record_io::remove(&config_path);
@@ -1747,8 +1754,9 @@ where
         subscription: Option<ValidatedSubscriptionEngineConfig>,
         prior_owned: Option<AdmittedGenerationIdentity>,
         expected_generation: GenerationId,
-        config_path: PathBuf,
+        planning_override: Option<GenerationPlanningAuthority>,
     ) -> Result<PreparedNativeGeneration<A::Target>, NativeGenerationSourceError> {
+        let config_path = self.paths.generation_config(expected_generation);
         let desired_state = inputs.desired_state().clone();
         let spec = build_engine_spec(&desired_state, &config_path, &self.paths)?;
         let binding = bind_engine_config_to_spec(engine_source.artifact().clone(), &spec)
@@ -1757,10 +1765,13 @@ where
             .engine_profiles
             .collect(&binding, &spec)
             .map_err(NativeGenerationSourceError::EngineProfile)?;
-        let planning = self
-            .planning
-            .plan(&desired_state, inputs.inventory())
-            .map_err(|source| NativeGenerationSourceError::Planning(Box::new(source)))?;
+        let planning = match planning_override {
+            Some(planning) => planning,
+            None => self
+                .planning
+                .plan(&desired_state, inputs.inventory())
+                .map_err(|source| NativeGenerationSourceError::Planning(Box::new(source)))?,
+        };
         let capability_profile = planning.capability_profile().clone();
         let artifacts = inputs
             .capture()
@@ -1953,13 +1964,16 @@ where
         target: I,
         ownership: &NativeCaptureOwnershipObservation,
     ) -> Result<crate::runtime_coordinator::ActiveCaptureAudit, NativeGenerationSourceError> {
+        self.successor_planning = None;
         let inputs = request.fresh_inputs();
-        let generation = request.active().id();
-        let plan_digest = request.active().active_capture_plan_digest().ok_or(
-            NativeGenerationSourceError::Invariant(
-                "active Capture Path audit has no canonical plan digest",
-            ),
-        )?;
+        let active = request.active();
+        let generation = active.generation();
+        let plan_digest =
+            request
+                .active_capture_plan_digest()
+                .ok_or(NativeGenerationSourceError::Invariant(
+                    "active Capture Path audit has no canonical plan digest",
+                ))?;
         let requested_at = request.started_at();
         let complete_before = request.complete_before();
         if requested_at >= complete_before {
@@ -2013,10 +2027,6 @@ where
                 "active Capture Path audit has a substituted active plan digest",
             ));
         }
-        if inputs.desired_state() != &committed_desired_state {
-            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
-        }
-
         // The address reconciler and production source share one NetworkInventorySource. Require
         // the exact fresh transaction immediately before the bounded owner-aware planning pass.
         let source_inventory = self
@@ -2031,23 +2041,35 @@ where
                 "active Capture Path audit received a substituted inventory transaction",
             ));
         }
-        let Some(planning) = self
+        let planning = self
             .planning
-            .plan_active_capture_audit(&committed_desired_state, inputs.inventory(), ownership)
-            .map_err(|source| NativeGenerationSourceError::Planning(Box::new(source)))?
-        else {
-            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
-        };
+            .plan_active_capture_audit(
+                inputs.desired_state(),
+                inputs.inventory(),
+                complete_before,
+                ownership,
+                request.engine_process(),
+            )
+            .map_err(|source| NativeGenerationSourceError::Planning(Box::new(source)))?;
+        if Instant::now() >= complete_before {
+            return Err(NativeGenerationSourceError::Invariant(
+                "fresh Capture Path audit planning reached its completion deadline",
+            ));
+        }
         let fresh_digest = crate::generation_engine_config::active_capture_plan_digest_for_audit(
-            &committed_desired_state,
+            inputs.desired_state(),
             inputs.capture().capture(),
             &planning,
             committed_runtime_binding.capture_path_selection(),
-        );
-        if fresh_digest != committed_digest {
-            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
+        )
+        .map_err(|error| {
+            NativeGenerationSourceError::Assembly(GenerationAssemblyError::Planning(error))
+        })?;
+        if Instant::now() >= complete_before {
+            return Err(NativeGenerationSourceError::Invariant(
+                "fresh Capture Path audit digest reached its completion deadline",
+            ));
         }
-        let completed_at = Instant::now();
         let observed_at = planning
             .capture_path_evidence()
             .valid_until()
@@ -2056,15 +2078,21 @@ where
                 "fresh Capture Path evidence has no representable observation time",
             ))?;
         let valid_until = planning.capture_path_evidence().valid_until();
-        if observed_at < requested_at
-            || completed_at >= complete_before
-            || valid_until <= complete_before
-            || valid_until <= completed_at
-        {
+        if observed_at < requested_at || valid_until <= observed_at {
             return Err(NativeGenerationSourceError::Invariant(
-                "fresh Capture Path evidence did not safely extend the committed deadline",
+                "fresh Capture Path evidence has invalid chronology",
             ));
         }
+        if Instant::now() >= complete_before {
+            return Err(NativeGenerationSourceError::Invariant(
+                "fresh Capture Path audit completed after its completion deadline",
+            ));
+        }
+        if inputs.desired_state() != &committed_desired_state || fresh_digest != committed_digest {
+            self.successor_planning = Some(planning);
+            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
+        }
+        self.successor_planning = None;
         Ok(crate::runtime_coordinator::ActiveCaptureAudit::Extended {
             generation: committed_runtime_binding,
             observed_at,
@@ -2117,6 +2145,7 @@ where
         inputs: &AddressReconciledGenerationInputs,
         prior: I,
     ) -> Result<Option<PreparedNativeGeneration<A::Target>>, Self::Error> {
+        self.successor_planning = None;
         self.require_prior(Some(prior))?;
         let committed = self
             .committed
@@ -2132,8 +2161,30 @@ where
         }
         let engine_source = committed.engine_source.clone();
         let subscription = self.accepted_subscription.clone();
-        self.prepare_candidate(inputs, engine_source, subscription, Some(prior))
+        self.prepare_candidate(inputs, engine_source, subscription, Some(prior), None)
             .map(Some)
+    }
+
+    fn prepare_audit_successor(
+        &mut self,
+        inputs: &AddressReconciledGenerationInputs,
+        prior: I,
+    ) -> Result<Option<PreparedNativeGeneration<A::Target>>, Self::Error> {
+        let planning = self.successor_planning.take().ok_or(
+            NativeGenerationSourceError::Invariant(
+                "active Capture Path audit successor has no cached owner-aware planning authority",
+            ),
+        )?;
+        self.require_prior(Some(prior))?;
+        let (engine_source, subscription) = self.select_current_engine_source(inputs)?;
+        self.prepare_candidate(
+            inputs,
+            engine_source,
+            subscription,
+            Some(prior),
+            Some(planning),
+        )
+        .map(Some)
     }
 
     fn prepare_subscription(
@@ -2141,6 +2192,7 @@ where
         config: &ValidatedSubscriptionEngineConfig,
         prior: Option<I>,
     ) -> Result<Option<PreparedNativeGeneration<A::Target>>, Self::Error> {
+        self.successor_planning = None;
         let inputs = self.current_inputs()?;
         if config.desired_state() != inputs.desired_state() {
             return Err(NativeGenerationSourceError::SelectedSourceDrift);
@@ -2166,11 +2218,12 @@ where
             config.snapshot_digest(),
             config.subscription_source(),
         );
-        self.prepare_candidate(&inputs, selected, Some(config.clone()), prior)
+        self.prepare_candidate(&inputs, selected, Some(config.clone()), prior, None)
             .map(Some)
     }
 
     fn accept_deferred_subscription(&mut self, config: ValidatedSubscriptionEngineConfig) -> bool {
+        self.successor_planning = None;
         if self.committed.is_some() || self.pending.is_some() {
             return false;
         }
@@ -2184,6 +2237,7 @@ where
 
     fn invalidate_latest_capture_path_decision(&mut self) {
         self.latest_capture_path_decision = None;
+        self.successor_planning = None;
     }
 
     fn audit_active_capture(
@@ -2200,6 +2254,7 @@ where
         generation: GenerationId,
         prior: Option<I>,
     ) -> Result<(), Self::Error> {
+        self.successor_planning = None;
         self.reject_pending(generation, prior)
     }
 
@@ -2208,6 +2263,7 @@ where
         phase: PublishedRuntimeState,
         target: Option<I>,
     ) -> Result<(), Self::Error> {
+        self.successor_planning = None;
         match phase {
             PublishedRuntimeState::Running { generation } => {
                 self.settle_running(generation, target)
@@ -2546,6 +2602,27 @@ esac
         capture_path_qualifications: CapturePathQualifications,
         capture_path_observed_at: Instant,
         capture_path_valid_until: Instant,
+        ordinary_plan_calls: Arc<Mutex<usize>>,
+        audit_plan_calls: Arc<Mutex<usize>>,
+    }
+
+    impl HostPlanning {
+        fn authority(&self, inventory: &NetworkInventory) -> GenerationPlanningAuthority {
+            GenerationPlanningAuthority::host_inspection(HostInspectionPlanningAuthority::new(
+                &self.capability_profile,
+                qualified_xtables_kernel_config(),
+                CapturePathQualificationEvidence::host_inspection(
+                    self.capture_path_qualifications,
+                    self.capture_path_observed_at,
+                    self.capture_path_valid_until,
+                )
+                .expect("host Capture Path evidence has a bounded lifetime"),
+                inventory,
+                NetworkNamespaceIdentity::new(10, 20).expect("network namespace identity"),
+                FwmarkCandidate::new(0x00ff_0000, 0x0080_0000, 0x0040_0000).expect("test mark"),
+                Some(test_routing()),
+            ))
+        }
     }
 
     impl NativeGenerationPlanningSource for HostPlanning {
@@ -2556,22 +2633,27 @@ esac
             _desired_state: &FluxConfig,
             inventory: &NetworkInventory,
         ) -> Result<GenerationPlanningAuthority, Self::Error> {
-            Ok(GenerationPlanningAuthority::host_inspection(
-                HostInspectionPlanningAuthority::new(
-                    &self.capability_profile,
-                    qualified_xtables_kernel_config(),
-                    CapturePathQualificationEvidence::host_inspection(
-                        self.capture_path_qualifications,
-                        self.capture_path_observed_at,
-                        self.capture_path_valid_until,
-                    )
-                    .expect("host Capture Path evidence has a bounded lifetime"),
-                    inventory,
-                    NetworkNamespaceIdentity::new(10, 20).expect("network namespace identity"),
-                    FwmarkCandidate::new(0x00ff_0000, 0x0080_0000, 0x0040_0000).expect("test mark"),
-                    Some(test_routing()),
-                ),
-            ))
+            *self
+                .ordinary_plan_calls
+                .lock()
+                .expect("ordinary planning call counter lock") += 1;
+            Ok(self.authority(inventory))
+        }
+
+        fn plan_active_capture_audit(
+            &mut self,
+            desired_state: &FluxConfig,
+            inventory: &NetworkInventory,
+            _complete_before: Instant,
+            _ownership: &NativeCaptureOwnershipObservation,
+            _expected_engine: ProcessIdentity,
+        ) -> Result<GenerationPlanningAuthority, Self::Error> {
+            let _ = desired_state;
+            *self
+                .audit_plan_calls
+                .lock()
+                .expect("audit planning call counter lock") += 1;
+            Ok(self.authority(inventory))
         }
     }
 
@@ -2671,6 +2753,8 @@ esac
                     capture_path_qualifications: capture_path_evidence.qualifications(),
                     capture_path_observed_at,
                     capture_path_valid_until: capture_path_evidence_deadline,
+                    ordinary_plan_calls: Arc::new(Mutex::new(0)),
+                    audit_plan_calls: Arc::new(Mutex::new(0)),
                 },
                 RecordingAdmission::default(),
                 accepted_subscription,
@@ -2711,6 +2795,11 @@ esac
             prepared
         }
 
+        fn cache_successor_planning(&mut self, inputs: &AddressReconciledGenerationInputs) {
+            let planning = self.source.planning.authority(inputs.inventory());
+            self.source.successor_planning = Some(planning);
+        }
+
         fn changed_inventory(&self) -> Arc<NetworkInventory> {
             let mut tracker = NetworkInventoryTracker::new();
             tracker
@@ -2747,6 +2836,8 @@ esac
             capture_path_valid_until: capture_path_observed_at
                 .checked_add(Duration::from_secs(5 * 60))
                 .expect("test Capture Path deadline is representable"),
+            ordinary_plan_calls: Arc::new(Mutex::new(0)),
+            audit_plan_calls: Arc::new(Mutex::new(0)),
         };
         let initial = host_planning
             .plan(&fixture.desired_state, &inventory)
@@ -3008,6 +3099,193 @@ esac
         assert_eq!(fixture.source.committed_engine_source(), expected_source);
         assert_eq!(fs::read(first_path).unwrap(), first_bytes);
         assert!(!fixture.generation_path(2).exists());
+    }
+
+    #[test]
+    fn audit_successor_forces_generation_when_address_inspection_is_unchanged() {
+        let mut fixture = SourceFixture::new(false);
+        let initial = fixture.commit_initial();
+        let inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current address inputs");
+        let ordinary_plan_calls_before = *fixture
+            .source
+            .planning
+            .ordinary_plan_calls
+            .lock()
+            .expect("ordinary planning call counter lock");
+        fixture.cache_successor_planning(&inputs);
+
+        let successor = fixture
+            .source
+            .prepare_audit_successor(&inputs, *initial.target())
+            .expect("prepare forced audit successor")
+            .expect("forced audit successor must not collapse unchanged inspection");
+
+        assert_eq!(successor.runtime().id().get(), 2);
+        assert_eq!(
+            *fixture
+                .source
+                .planning
+                .ordinary_plan_calls
+                .lock()
+                .expect("ordinary planning call counter lock"),
+            ordinary_plan_calls_before,
+            "forced audit successor consumes cached planning without ordinary planning"
+        );
+        assert!(fixture.generation_path(1).exists());
+        assert!(fixture.generation_path(2).exists());
+    }
+
+    #[test]
+    fn audit_successor_without_cached_planning_fails_closed_and_does_not_replan() {
+        let mut fixture = SourceFixture::new(false);
+        let initial = fixture.commit_initial();
+        let inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current address inputs");
+
+        let error = match fixture
+            .source
+            .prepare_audit_successor(&inputs, *initial.target())
+        {
+            Ok(_) => panic!("forced successor requires the completed audit authority"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, NativeGenerationSourceError::Invariant(_)));
+        assert!(!fixture.generation_path(2).exists());
+        assert!(fixture.source.successor_planning.is_none());
+    }
+
+    #[test]
+    fn audit_successor_consumes_cached_planning_once() {
+        let mut fixture = SourceFixture::new(false);
+        let initial = fixture.commit_initial();
+        let inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current address inputs");
+        fixture.cache_successor_planning(&inputs);
+
+        fixture
+            .source
+            .prepare_audit_successor(&inputs, *initial.target())
+            .expect("prepare forced audit successor")
+            .expect("forced audit successor exists");
+
+        let error = match fixture
+            .source
+            .prepare_audit_successor(&inputs, *initial.target())
+        {
+            Ok(_) => panic!("the owner-aware authority cannot be replayed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, NativeGenerationSourceError::Invariant(_)));
+    }
+
+    #[test]
+    fn stale_cached_planning_fails_closed_against_a_new_inventory_snapshot() {
+        let mut fixture = SourceFixture::new(false);
+        let initial = fixture.commit_initial();
+        let old_inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current address inputs");
+        fixture.cache_successor_planning(&old_inputs);
+
+        let changed = fixture.changed_inventory();
+        fixture.inventory.publish(Some(Arc::clone(&changed)));
+        let new_inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current inputs after inventory change");
+        let error = match fixture
+            .source
+            .prepare_audit_successor(&new_inputs, *initial.target())
+        {
+            Ok(_) => panic!("stale owner-aware planning must not assemble"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, NativeGenerationSourceError::Assembly(_)));
+        assert!(!fixture.generation_path(2).exists());
+        assert!(fixture.source.successor_planning.is_none());
+    }
+
+    #[test]
+    fn audit_successor_uses_the_current_desired_state_after_drift() {
+        let mut fixture = SourceFixture::new(false);
+        let initial = fixture.commit_initial();
+        let changed_source = fs::read_to_string(&fixture.desired_state_path)
+            .expect("read fixture Desired State")
+            .replacen(
+                "event_queue_capacity = 256",
+                "event_queue_capacity = 257",
+                1,
+            );
+        let changed_desired_state =
+            FluxConfig::parse(&changed_source).expect("parse changed Desired State");
+        fs::write(&fixture.desired_state_path, changed_source)
+            .expect("persist changed Desired State");
+        let inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current address inputs after Desired State drift");
+        fixture.cache_successor_planning(&inputs);
+
+        let successor = fixture
+            .source
+            .prepare_audit_successor(&inputs, *initial.target())
+            .expect("prepare forced audit successor after Desired State drift")
+            .expect("Desired State drift must still produce an ordinary successor");
+
+        assert_eq!(successor.runtime().id().get(), 2);
+        fixture
+            .source
+            .settle(
+                PublishedRuntimeState::Running {
+                    generation: successor.runtime().id(),
+                },
+                Some(*successor.target()),
+            )
+            .expect("commit Desired State successor");
+        assert_eq!(
+            fixture.source.committed_desired_state(),
+            Some(&changed_desired_state)
+        );
+    }
+
+    #[test]
+    fn audit_successor_settlement_prunes_the_predecessor_file() {
+        let mut fixture = SourceFixture::new(false);
+        let initial = fixture.commit_initial();
+        let inputs = fixture
+            .source
+            .current_inputs()
+            .expect("current address inputs");
+        fixture.cache_successor_planning(&inputs);
+        let successor = fixture
+            .source
+            .prepare_audit_successor(&inputs, *initial.target())
+            .expect("prepare forced audit successor")
+            .expect("forced audit successor must exist");
+
+        fixture
+            .source
+            .settle(
+                PublishedRuntimeState::Running {
+                    generation: successor.runtime().id(),
+                },
+                Some(*successor.target()),
+            )
+            .expect("settle forced audit successor");
+
+        assert!(!fixture.generation_path(1).exists());
+        assert!(fixture.generation_path(2).exists());
+        assert!(fixture.source.retired_config_path.is_none());
     }
 
     #[test]

@@ -137,6 +137,9 @@ fn coordinator_error_label(
             stage.as_str(),
             source_error_label(source)
         ),
+        AndroidFwmarkCensusCoordinatorError::DeadlineExceeded { stage } => {
+            format!("collection-{}-deadline-exceeded", stage.as_str())
+        }
         AndroidFwmarkCensusCoordinatorError::CapabilityDeviceIdentityUnavailable { .. } => {
             "capability-device-identity-unavailable".to_owned()
         }
@@ -157,6 +160,9 @@ fn coordinator_error_label(
         }
         AndroidFwmarkCensusCoordinatorError::ReviewedCanaryFacilityPolicyMismatch => {
             "reviewed-canary-facility-policy-mismatch".to_owned()
+        }
+        AndroidFwmarkCensusCoordinatorError::RetainedOwnerRoutingMismatch => {
+            "retained-owner-routing-mismatch".to_owned()
         }
         AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(_) => {
             "reviewed-canary-rpdb".to_owned()

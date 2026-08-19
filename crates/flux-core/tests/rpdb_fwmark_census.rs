@@ -1,10 +1,13 @@
 use flux_core::{
-    FwmarkCensusCoverageRecord, FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane,
-    FwmarkUseOperation, FwmarkUseRecord, MAX_COMPLETE_FWMARK_CENSUS_MARK_USES,
-    NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker, NetworkRuleRecord,
-    OpaqueRuleAttribute, RpdbFwmarkCensusFragmentError, RuleAction, RuleAttributeOpacity,
-    RuleFlags, RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority,
-    RuleProperties, RuleProtocol, RuleTableId, project_rpdb_fwmark_census_fragment,
+    AndroidRpdbRetainedOwner, FwmarkCensusCoverageRecord, FwmarkCensusCoverageState,
+    FwmarkEvidenceSource, FwmarkPlane, FwmarkUseOperation, FwmarkUseRecord,
+    MAX_COMPLETE_FWMARK_CENSUS_MARK_USES, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, OpaqueRuleAttribute,
+    RouteFlags, RoutePath, RoutePrefix, RouteProperties, RouteProtocol, RouteScope, RouteTableId,
+    RouteType, RpdbFwmarkCensusFragmentError, RuleAction, RuleAttributeOpacity, RuleFlags,
+    RuleFwMark, RuleOpaqueAttributeFingerprint, RulePrefix, RulePriority, RuleProperties,
+    RuleProtocol, RuleTableId, classify_android_rpdb_with_retained_owner,
+    project_rpdb_fwmark_census_fragment, project_rpdb_fwmark_census_fragment_with_classification,
 };
 
 #[test]
@@ -230,6 +233,42 @@ fn raw_record_budget_accepts_512_and_rejects_513_without_truncation() {
 }
 
 #[test]
+fn retained_owner_projection_excludes_only_the_authenticated_rule_index() {
+    let rule = marked_rule(
+        NetworkAddressFamily::Ipv4,
+        100,
+        0x0100_0000,
+        0x0300_0000,
+        RuleAction::TO_TABLE,
+        RuleFlags::default(),
+    );
+    let inventory = inventory_with_routes([route(NetworkAddressFamily::Ipv4, 100)], [rule]);
+    // SAFETY: this test supplies the one pair in the fixture as the exact retained identity; the
+    // production caller obtains indices only after the platform-private exact identity audit.
+    let retained_owner = unsafe {
+        AndroidRpdbRetainedOwner::from_verified_inventory_unchecked(&inventory, [(0, 0)])
+    }
+    .expect("one exact retained owner occurrence");
+    let classification = classify_android_rpdb_with_retained_owner(
+        &inventory,
+        flux_core::AndroidNetdSourceProfile::AospNetd20250324,
+        &retained_owner,
+    )
+    .expect("owner-aware classification");
+
+    let fragment =
+        project_rpdb_fwmark_census_fragment_with_classification(&inventory, &classification)
+            .expect("one exact retained owner rule can be projected away");
+    assert!(fragment.raw_mark_uses().is_empty());
+    let invalid_owner = {
+        // SAFETY: this deliberately exercises the constructor's bounds check; it is not a
+        // production ownership proof and cannot be used to authorize a retained owner.
+        unsafe { AndroidRpdbRetainedOwner::from_verified_inventory_unchecked(&inventory, [(1, 0)]) }
+    };
+    assert!(invalid_owner.is_err());
+}
+
+#[test]
 fn freshness_requires_the_exact_snapshot_and_epoch() {
     let mut tracker = NetworkInventoryTracker::new();
     let initial = tracker
@@ -332,4 +371,32 @@ fn inventory(rules: impl IntoIterator<Item = NetworkRuleRecord>) -> NetworkInven
         .publish_complete_with_routing([], [], [], rules)
         .expect("complete inventory")
         .clone()
+}
+
+fn inventory_with_routes(
+    routes: impl IntoIterator<Item = NetworkRouteRecord>,
+    rules: impl IntoIterator<Item = NetworkRuleRecord>,
+) -> NetworkInventory {
+    NetworkInventoryTracker::new()
+        .publish_complete_with_routing([], [], routes, rules)
+        .expect("complete inventory")
+        .clone()
+}
+
+fn route(family: NetworkAddressFamily, table: u32) -> NetworkRouteRecord {
+    NetworkRouteRecord::new(
+        RoutePrefix::unspecified(family),
+        RoutePrefix::unspecified(family),
+        RouteProperties::new(
+            0,
+            RouteTableId::from_raw(table),
+            RouteProtocol::from_raw(2),
+            RouteScope::from_raw(0),
+            RouteType::from_raw(1),
+            RouteFlags::default(),
+        ),
+        0,
+        RoutePath::None,
+    )
+    .expect("valid route")
 }

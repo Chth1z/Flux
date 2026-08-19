@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
@@ -217,6 +217,86 @@ pub(crate) struct XtablesExpectedState {
     projection: XtablesSaveProjection,
 }
 
+/// Exact coordinate matcher for one retained active owner.
+///
+/// The matcher is deliberately derived only after a complete live projection has been compared
+/// with the active expectation.  It is therefore safe for the census parser to omit the owner's
+/// rules from semantic mark evidence while retaining every raw rule, chain, and table in its
+/// snapshot digest.  No name-prefix or count-based filtering is performed here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XtablesRetainedMatcher {
+    owned_chains: BTreeSet<Box<str>>,
+    owned_chain_rules: BTreeSet<(Box<str>, u32)>,
+    native_references: BTreeSet<(Box<str>, u32)>,
+}
+
+impl XtablesRetainedMatcher {
+    pub(crate) fn from_expected(
+        expected: Option<&XtablesExpectedState>,
+        observed: &XtablesSaveProjection,
+    ) -> Result<Self, XtablesSaveProjectionError> {
+        if let Some(expected) = expected {
+            if expected.phase() != XtablesExpectedStatePhase::Active
+                || expected.projection().family() != observed.family()
+                || !expected.is_satisfied_by(observed)
+            {
+                return Err(XtablesSaveProjectionError::global(
+                    XtablesSaveProjectionErrorKind::RetainedProjectionMismatch,
+                ));
+            }
+            let projection = expected.projection();
+            let owned_chains = projection.chains.keys().cloned().collect::<BTreeSet<_>>();
+            let owned_chain_rules = projection
+                .chains
+                .iter()
+                .flat_map(|(chain, state)| {
+                    state.rules.iter().enumerate().map(|(index, _)| {
+                        (
+                            chain.clone(),
+                            u32::try_from(index + 1)
+                                .expect("bounded retained rule ordinal fits in u32"),
+                        )
+                    })
+                })
+                .collect();
+            let native_references = projection
+                .native_references
+                .iter()
+                .map(|reference| (reference.source_chain.clone(), reference.ordinal.get()))
+                .collect();
+            Ok(Self {
+                owned_chains,
+                owned_chain_rules,
+                native_references,
+            })
+        } else if !observed.is_empty() {
+            Err(XtablesSaveProjectionError::global(
+                XtablesSaveProjectionErrorKind::RetainedProjectionMismatch,
+            ))
+        } else {
+            Ok(Self {
+                owned_chains: BTreeSet::new(),
+                owned_chain_rules: BTreeSet::new(),
+                native_references: BTreeSet::new(),
+            })
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn excludes_chain(&self, table: &str, chain: &str) -> bool {
+        table == "mangle" && self.owned_chains.contains(chain)
+    }
+
+    #[must_use]
+    pub(crate) fn excludes_rule(&self, table: &str, chain: &str, ordinal: u32) -> bool {
+        if table != "mangle" {
+            return false;
+        }
+        self.owned_chain_rules.contains(&(chain.into(), ordinal))
+            || self.native_references.contains(&(chain.into(), ordinal))
+    }
+}
+
 impl XtablesExpectedState {
     pub(crate) fn from_apply_artifacts<'a>(
         family: XtablesRestoreFamily,
@@ -317,6 +397,7 @@ pub(crate) enum XtablesSaveProjectionErrorKind {
     ExpectedExternalAppend,
     ExpectedReplacementMismatch,
     OwnedStateOutsideMangle,
+    RetainedProjectionMismatch,
 }
 
 #[derive(Debug)]

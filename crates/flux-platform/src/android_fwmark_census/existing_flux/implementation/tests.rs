@@ -1,13 +1,15 @@
 use std::fs;
 use std::net::Ipv4Addr;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 
 use flux_core::{
-    AndroidNetdSourceProfile, CapabilityProfile, CapabilityProfileRevision, FwmarkCandidate,
-    FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane, InterfaceAddressRecord,
-    InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags, InterfaceLinkRecord, InterfaceName,
-    KernelFacts, NetworkAddressFamily, NetworkInventory, NetworkInventoryTracker,
-    NetworkRouteRecord, NetworkRuleRecord, Observation, RouteFlags, RoutePath, RoutePrefix,
+    AndroidNetdSourceProfile, BootIdentity, CapabilityProfile, CapabilityProfileRevision,
+    FwmarkCandidate, FwmarkCensusCoverageState, FwmarkEvidenceSource, FwmarkPlane, GenerationId,
+    InterfaceAddressRecord, InterfaceHardwareType, InterfaceIndex, InterfaceLinkFlags,
+    InterfaceLinkRecord, InterfaceName, KernelFacts, NetworkAddressFamily, NetworkInventory,
+    NetworkInventoryTracker, NetworkRouteRecord, NetworkRuleRecord, Observation,
+    OwnershipJournalIdentity, OwnershipJournalRevision, RouteFlags, RoutePath, RoutePrefix,
     RouteProperties, RouteProtocol, RouteScope, RouteTableId, RouteType, RuleAction, RuleFlags,
     RuleFwMark, RulePrefix, RulePriority, RuleProperties, RuleProtocol, RuleTableId,
 };
@@ -15,8 +17,12 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use super::*;
+use crate::ProcessIdentity;
 use crate::android_fwmark_census::{
     AndroidXtablesFwmarkObservation, observe_android_xtables_fwmarks,
+};
+use crate::xtables::{
+    NativeCaptureOwnershipObservation, NativeCaptureRetainedOwner, NativeCaptureTargetIdentity,
 };
 
 struct Fixture {
@@ -207,6 +213,55 @@ fn malformed_archive_and_no_follow_paths_fail_closed() {
     assert_eq!(
         linked.collect().expect_err("linked root must fail").kind(),
         AndroidExistingFluxOwnershipErrorKind::DurableObservationFailed
+    );
+}
+
+#[test]
+fn active_owner_does_not_turn_missing_durable_state_into_absence() {
+    let fixture = Fixture::new();
+    let owner = test_active_owner(fixture.network_namespace);
+
+    let error = collect_from_roots_with_active_owner(
+        &fixture.durable_root,
+        &fixture.proc_root,
+        &fixture.inventory,
+        &fixture.capability_profile,
+        fixture.network_namespace,
+        &fixture.xtables,
+        None,
+        &owner,
+        test_engine_identity(),
+    )
+    .expect_err("an active owner without its exact durable pair must fail closed");
+
+    assert_eq!(
+        error.kind(),
+        AndroidExistingFluxOwnershipErrorKind::DurableOwnershipPresent
+    );
+}
+
+#[test]
+fn active_owner_process_census_binds_the_expected_engine_identity() {
+    let fixture = Fixture::new();
+    write_process(&fixture.proc_root, 50, "sing-box", 500);
+    let owner = test_active_owner(fixture.network_namespace);
+
+    observe_flux_processes_for_owner(
+        &fixture.proc_root,
+        None,
+        Some((&owner, test_engine_identity())),
+    )
+    .expect("the exact supervised engine identity is retained");
+
+    let wrong = ProcessIdentity::new(
+        NonZeroU32::new(51).expect("alternate engine PID"),
+        NonZeroU64::new(501).expect("alternate engine start time"),
+    );
+    let error = observe_flux_processes_for_owner(&fixture.proc_root, None, Some((&owner, wrong)))
+        .expect_err("a different process instance cannot satisfy the active-owner census");
+    assert_eq!(
+        error.kind(),
+        AndroidExistingFluxOwnershipErrorKind::ProcessOwnershipPresent
     );
 }
 
@@ -658,4 +713,30 @@ fn empty_target_archive() -> Vec<u8> {
     let checksum = Sha256::digest(&encoded);
     encoded.extend_from_slice(&checksum);
     encoded
+}
+
+fn test_active_owner(
+    network_namespace: flux_core::NetworkNamespaceIdentity,
+) -> NativeCaptureOwnershipObservation {
+    let target =
+        NativeCaptureTargetIdentity::new(GenerationId::INITIAL, [0x61; 32], [0x62; 32], [0x63; 32]);
+    NativeCaptureOwnershipObservation::new(
+        target,
+        BootIdentity::parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("test boot identity"),
+        network_namespace,
+        OwnershipJournalIdentity::new([0x64; 32]).expect("test journal identity"),
+        OwnershipJournalRevision::INITIAL,
+        NonZeroU16::new(1).expect("test journal schema"),
+        7,
+        NonZeroU64::new(8).expect("test journal inode"),
+        [0x65; 32],
+        NativeCaptureRetainedOwner::new(target, None, None, []),
+    )
+}
+
+fn test_engine_identity() -> ProcessIdentity {
+    ProcessIdentity::new(
+        NonZeroU32::new(50).expect("test engine PID"),
+        NonZeroU64::new(500).expect("test engine start time"),
+    )
 }

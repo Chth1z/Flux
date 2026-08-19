@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
-use crate::android_rpdb::AndroidRpdbClassificationReport;
+use crate::android_rpdb::{AndroidRpdbClassificationReport, AndroidRpdbRetainedOwner};
 use crate::canonical_evidence::CanonicalEvidenceDigest;
 use crate::network_inventory::{NetworkEpoch, NetworkInventory, NetworkInventorySnapshotId};
 use crate::network_route::NetworkAddressFamily;
@@ -492,7 +492,7 @@ pub fn audit_fwmark_candidate_partial(
     inventory: &NetworkInventory,
     candidate: FwmarkCandidate,
 ) -> FwmarkPartialAudit {
-    audit_fwmark_candidate_partial_with_exclusions(inventory, candidate, &[])
+    audit_fwmark_candidate_partial_with_exclusions(inventory, candidate, &[], None)
 }
 
 pub(crate) fn audit_fwmark_candidate_partial_with_classification(
@@ -509,6 +509,7 @@ pub(crate) fn audit_fwmark_candidate_partial_with_classification(
         inventory,
         candidate,
         classification.reviewed_canary_rule_indices(),
+        classification.retained_owner(),
     )
 }
 
@@ -516,6 +517,7 @@ fn audit_fwmark_candidate_partial_with_exclusions(
     inventory: &NetworkInventory,
     candidate: FwmarkCandidate,
     excluded_reviewed_canary_rule_indices: &[usize],
+    retained_owner: Option<&AndroidRpdbRetainedOwner>,
 ) -> FwmarkPartialAudit {
     let mut conflicts = Vec::new();
     let mut omitted_conflicts = 0_u32;
@@ -544,6 +546,7 @@ fn audit_fwmark_candidate_partial_with_exclusions(
         if excluded_reviewed_canary_rule_indices
             .binary_search(&dump_index)
             .is_ok()
+            || retained_owner.is_some_and(|owner| owner.contains_rule_index(dump_index))
         {
             continue;
         }
@@ -595,5 +598,135 @@ fn retain_conflict(
         conflicts.push(conflict);
     } else {
         *omitted_conflicts = omitted_conflicts.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::android_netd::AndroidNetdSourceProfile;
+    use crate::android_rpdb::{
+        AndroidRpdbRetainedOwner, classify_android_rpdb_with_retained_owner,
+    };
+    use crate::network_inventory::NetworkInventoryTracker;
+    use crate::network_route::{
+        NetworkRouteRecord, RouteFlags, RoutePath, RoutePrefix, RouteProperties, RouteProtocol,
+        RouteScope, RouteTableId, RouteType,
+    };
+    use crate::network_rule::{
+        NetworkRuleRecord, RuleAction, RuleFlags, RuleFwMark, RulePrefix, RulePriority,
+        RuleProperties, RuleProtocol, RuleTableId,
+    };
+
+    const CANDIDATE_MASK: u32 = 0x0300_0000;
+    const PROXY_VALUE: u32 = 0x0100_0000;
+    const BYPASS_VALUE: u32 = 0x0200_0000;
+
+    #[test]
+    fn retained_owner_rule_does_not_self_conflict() {
+        let inventory = inventory([marked_rule(100)]);
+        let retained_owner = retained_owner(&inventory, [(0, 0)]);
+        let classification = classify_android_rpdb_with_retained_owner(
+            &inventory,
+            AndroidNetdSourceProfile::AospNetd20250324,
+            &retained_owner,
+        )
+        .expect("owner-aware Android RPDB classification");
+        let candidate = candidate();
+        let generic = audit_fwmark_candidate_partial(&inventory, candidate);
+        assert_eq!(generic.outcome(), FwmarkPartialAuditOutcome::Conflicting);
+        assert_eq!(generic.conflicts().len(), 1);
+
+        let partial = audit_fwmark_candidate_partial_with_classification(
+            &inventory,
+            &classification,
+            candidate,
+        );
+
+        assert_eq!(partial.outcome(), FwmarkPartialAuditOutcome::Incomplete);
+        assert!(partial.conflicts().is_empty());
+    }
+
+    #[test]
+    fn foreign_overlapping_selector_remains_a_partial_conflict() {
+        let inventory = inventory([marked_rule(100), marked_rule(200)]);
+        let retained_owner = retained_owner(&inventory, [(0, 0)]);
+        let classification = classify_android_rpdb_with_retained_owner(
+            &inventory,
+            AndroidNetdSourceProfile::AospNetd20250324,
+            &retained_owner,
+        )
+        .expect("owner-aware Android RPDB classification");
+
+        let partial = audit_fwmark_candidate_partial_with_classification(
+            &inventory,
+            &classification,
+            candidate(),
+        );
+
+        assert_eq!(partial.outcome(), FwmarkPartialAuditOutcome::Conflicting);
+        assert_eq!(partial.conflicts().len(), 1);
+        assert!(matches!(
+            partial.conflicts()[0],
+            FwmarkPartialConflict::RpdbSelectorOverlap { dump_index: 1, .. }
+        ));
+    }
+
+    fn candidate() -> FwmarkCandidate {
+        FwmarkCandidate::new(CANDIDATE_MASK, PROXY_VALUE, BYPASS_VALUE)
+            .expect("test candidate has two role values")
+    }
+
+    fn marked_rule(priority: u32) -> NetworkRuleRecord {
+        NetworkRuleRecord::new(
+            RulePrefix::unspecified(NetworkAddressFamily::Ipv4),
+            RulePrefix::unspecified(NetworkAddressFamily::Ipv4),
+            RuleProperties::new(
+                0,
+                RuleTableId::from_raw(100),
+                RuleAction::TO_TABLE,
+                RuleProtocol::from_raw(0),
+                RuleFlags::default(),
+            ),
+            RulePriority::from_raw(priority),
+            None,
+        )
+        .expect("test rule")
+        .with_fwmark(RuleFwMark::new(PROXY_VALUE, CANDIDATE_MASK).expect("test selector"))
+    }
+
+    fn route() -> NetworkRouteRecord {
+        NetworkRouteRecord::new(
+            RoutePrefix::unspecified(NetworkAddressFamily::Ipv4),
+            RoutePrefix::unspecified(NetworkAddressFamily::Ipv4),
+            RouteProperties::new(
+                0,
+                RouteTableId::from_raw(100),
+                RouteProtocol::from_raw(2),
+                RouteScope::from_raw(0),
+                RouteType::from_raw(1),
+                RouteFlags::default(),
+            ),
+            0,
+            RoutePath::None,
+        )
+        .expect("test route")
+    }
+
+    fn inventory(rules: impl IntoIterator<Item = NetworkRuleRecord>) -> NetworkInventory {
+        NetworkInventoryTracker::new()
+            .publish_complete_with_routing([], [], [route()], rules)
+            .expect("complete test inventory")
+            .clone()
+    }
+
+    fn retained_owner(
+        inventory: &NetworkInventory,
+        indices: impl IntoIterator<Item = (usize, usize)>,
+    ) -> AndroidRpdbRetainedOwner {
+        // SAFETY: every test pair is built from the exact route/rule records in this immutable
+        // fixture; production callers perform the equivalent platform identity proof first.
+        unsafe { AndroidRpdbRetainedOwner::from_verified_inventory_unchecked(inventory, indices) }
+            .expect("exact retained-owner fixture")
     }
 }

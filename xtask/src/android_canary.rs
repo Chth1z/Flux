@@ -20,7 +20,7 @@ use super::android_artifact::AndroidArtifactIdentity;
 use super::android_remote::{
     FilesystemIdentity, OwnedRemoteDirectory, OwnedRemoteDirectorySpec, normalize_adb_shell_output,
     owned_root_functions, parse_directory_identity, path_absence_function,
-    process_absence_function, run_owned_remote_transaction, shell_single_quote,
+    process_absence_function, run_owned_remote_transaction, shell_single_quote, valid_boot_id,
 };
 use super::{
     ANDROID_ENGINE_CREDENTIAL_CANARY_TEST, ANDROID_RUSTFLAGS,
@@ -816,17 +816,6 @@ fn validate_profile_text(label: &str, value: &str, maximum_bytes: usize) -> Resu
         ));
     }
     Ok(())
-}
-
-fn valid_boot_id(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 pub(super) fn revalidate_device(
@@ -2250,15 +2239,6 @@ mod tests {
         }
         assert!(ANDROID_RUSTFLAGS.contains("max-page-size=16384"));
         assert!(ANDROID_RUSTFLAGS.contains("common-page-size=16384"));
-    }
-
-    #[test]
-    fn boot_id_requires_uuid_like_canonical_shape() {
-        assert!(valid_boot_id("01234567-89ab-cdef-0123-456789abcdef"));
-        assert!(valid_boot_id("01234567-89AB-CDEF-0123-456789ABCDEF"));
-        assert!(!valid_boot_id("0123456789abcdef0123456789abcdef"));
-        assert!(!valid_boot_id("01234567-89ab-cdef-0123-456789abcdeg"));
-        assert!(!valid_boot_id("01234567-89ab-cdef-0123-456789abcdef\n"));
     }
 
     #[test]

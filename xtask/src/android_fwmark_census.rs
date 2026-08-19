@@ -19,9 +19,9 @@ use super::android_canary::{
 };
 use super::android_remote::{
     FilesystemIdentity, OwnedRemoteDirectory as RemoteDirectory, OwnedRemoteDirectorySpec,
-    normalize_adb_shell_output, owned_root_functions, parse_directory_identity,
-    path_absence_function, process_absence_function, run_owned_remote_transaction,
-    shell_single_quote,
+    normalize_adb_shell_output, owned_root_functions, parse_canonical_u64,
+    parse_directory_identity, path_absence_function, process_absence_function,
+    run_owned_remote_transaction, shell_single_quote, valid_boot_id, validate_profile_text,
 };
 use super::{
     ANDROID_MIN_LOAD_ALIGNMENT, ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
@@ -512,27 +512,6 @@ fn parse_namespace_field(line: &str, key: &str) -> Result<NetworkNamespaceIdenti
         return Err(format!("root identity field {key} has a zero inode"));
     }
     Ok(NetworkNamespaceIdentity { device, inode })
-}
-
-fn validate_profile_text(label: &str, value: &str, maximum_bytes: usize) -> Result<(), String> {
-    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
-        Err(format!(
-            "Android {label} must be one non-empty control-free line of at most {maximum_bytes} bytes"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn valid_boot_id(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn revalidate_device(
@@ -1093,18 +1072,6 @@ fn device_identity_function(expected_device: &DeviceProfile) -> String {
            [ \"$(/system/bin/stat -Lc '%d:%i' /proc/self/ns/net)\" = \"$EXPECTED_NAMESPACE\" ]\n\
          }}\n"
     )
-}
-
-fn parse_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
-    if value.is_empty()
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(format!("{field} is not a canonical unsigned decimal"));
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| format!("{field} exceeds the u64 domain"))
 }
 
 fn parse_canonical_u32(value: &str, field: &str) -> Result<u32, String> {

@@ -104,6 +104,31 @@ fn safe_literal(bytes: &[u8], punctuation: &[u8]) -> bool {
     })
 }
 
+pub(super) fn valid_boot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+pub(super) fn validate_profile_text(
+    label: &str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), String> {
+    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
+        Err(format!(
+            "Android {label} must be one non-empty control-free line of at most {maximum_bytes} bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FilesystemIdentity {
     device: u64,
@@ -248,7 +273,7 @@ fn parse_filesystem_identity_field(line: &str, key: &str) -> Result<FilesystemId
     )
 }
 
-fn parse_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
+pub(super) fn parse_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
         || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -461,6 +486,29 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn boot_id_requires_uuid_like_canonical_shape() {
+        assert!(valid_boot_id("01234567-89ab-cdef-0123-456789abcdef"));
+        assert!(valid_boot_id("01234567-89AB-CDEF-0123-456789ABCDEF"));
+        assert!(!valid_boot_id("0123456789abcdef0123456789abcdef"));
+        assert!(!valid_boot_id("01234567-89ab-cdef-0123-456789abcdeg"));
+        assert!(!valid_boot_id("01234567-89ab-cdef-0123-456789abcdef\n"));
+    }
+
+    #[test]
+    fn profile_text_and_unsigned_decimal_are_canonical() {
+        assert!(validate_profile_text("field", "value", 5).is_ok());
+        assert!(validate_profile_text("field", "", 5).is_err());
+        assert!(validate_profile_text("field", "value\n", 6).is_err());
+        assert!(validate_profile_text("field", "value", 4).is_err());
+
+        assert_eq!(parse_canonical_u64("0", "field"), Ok(0));
+        assert_eq!(parse_canonical_u64("42", "field"), Ok(42));
+        assert!(parse_canonical_u64("042", "field").is_err());
+        assert!(parse_canonical_u64("-1", "field").is_err());
+        assert!(parse_canonical_u64("18446744073709551616", "field").is_err());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::android_canary::{
     Options, adb_root_shell_output, adb_success_with_timeout, adb_text, artifact_path_for_adb,
     bounded_diagnostic, command_output_bounded, forward_output,
 };
-use super::android_remote::shell_single_quote;
+use super::android_remote::{shell_single_quote, valid_boot_id, validate_profile_text};
 use super::{
     ANDROID_NDK_REVISION, ANDROID_RUSTFLAGS, ANDROID_TARGET, ANDROID_TARGET_RUSTFLAGS_ENV,
     LINUX_ANDROID_HOST_BUILD_TMPDIR, android_linker, verify_ndk_revision,
@@ -229,27 +229,6 @@ fn verify_device(options: &Options) -> Result<DeviceProfile, String> {
         build_fingerprint,
         boot_id,
     })
-}
-
-fn validate_profile_text(label: &str, value: &str, maximum_bytes: usize) -> Result<(), String> {
-    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
-        Err(format!(
-            "Android {label} must be one non-empty control-free line of at most {maximum_bytes} bytes"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn valid_boot_id(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn revalidate_device(

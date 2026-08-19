@@ -14,6 +14,7 @@ use flux_platform::internal::{
 
 use super::android_canary::{self, Options};
 use super::android_kernel::meets_supported_floor as kernel_meets_floor;
+use super::android_remote::valid_boot_id;
 
 const COMMAND: &str = "preflight-android-arm64-mark-ordering";
 const MINIMUM_ANDROID_SDK: u32 = 31;
@@ -218,17 +219,6 @@ fn validated_adb_text(
         ));
     }
     Ok(value)
-}
-
-fn valid_boot_id(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn preflight_property_names() -> impl Iterator<Item = &'static str> {

@@ -13,8 +13,9 @@ use flux_core::{
     FwmarkUseOperation, FwmarkUseRecord, GenerationId, NetworkAddressFamily, NetworkInventory,
     Reason, ReviewedCanaryFacilityPolicy, ReviewedCanaryFacilitySelection,
     ReviewedCanaryRoleCredentials, RpdbFamilyPlacement, RpdbPlacementRequest, RulePriority,
-    RuleTableId, classify_android_rpdb, classify_android_rpdb_with_reviewed_canary_facility,
-    plan_android_rpdb_placement, plan_android_rpdb_placement_with_reviewed_canary_facility,
+    RuleTableId, StaleRpdbPlacementLease, classify_android_rpdb,
+    classify_android_rpdb_with_reviewed_canary_facility, plan_android_rpdb_placement,
+    plan_android_rpdb_placement_with_reviewed_canary_facility,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_core::{CapabilityProfile, NetworkNamespaceIdentity};
@@ -22,10 +23,12 @@ use flux_platform::{
     AndroidFwmarkCensusCollectionStage, AndroidFwmarkCensusCoordinatorError,
     AndroidFwmarkCensusCoordinatorOutcome, AndroidFwmarkCensusCoordinatorPurpose,
     AndroidFwmarkCensusCoordinatorRequest, AndroidFwmarkCensusExternalPhase,
-    NativeXtablesCaptureAdmission, NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget,
-    NetworkInventorySource, SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness,
-    SystemAndroidFwmarkCensusSource, SystemAndroidFwmarkCensusSourceError,
-    SystemAndroidFwmarkCensusSourceErrorKind, coordinate_android_fwmark_census_for_inventory,
+    NativeCaptureOwnershipObservation, NativeXtablesCaptureAdmission,
+    NativeXtablesCaptureAdmissionError, NativeXtablesCaptureTarget, NetworkInventorySource,
+    SingBoxLaunchSpec, SingBoxPrivilege, SingBoxReadiness, SystemAndroidFwmarkCensusSource,
+    SystemAndroidFwmarkCensusSourceError, SystemAndroidFwmarkCensusSourceErrorKind,
+    coordinate_android_fwmark_census_for_inventory,
+    coordinate_android_fwmark_census_for_inventory_with_active_owner,
 };
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
 use flux_platform::{
@@ -35,8 +38,9 @@ use flux_platform::{
 
 use crate::functional_canary::{CanaryBindingError, CanaryFacilityIdentity};
 use crate::generation_engine_config::{
-    AddressReconciledGenerationInputs, AddressReconciliationError, AddressReconciliationInspection,
-    AdmittedGeneration, AdmittedGenerationIdentity, CapturePathDecision,
+    ActiveCapturePlanDigest, AddressReconciledGenerationInputs, AddressReconciliationError,
+    AddressReconciliationInspection, AdmittedGeneration, AdmittedGenerationIdentity,
+    CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE, CapturePathDecision,
     CapturePathQualificationEvidenceError, DesiredStateCompileError, EngineCapabilityProfile,
     EngineCapabilityProfileError, EngineConfigCompileError, EngineConfigLaunchBinding,
     GenerationAssembler, GenerationAssemblyError, GenerationAssemblyRequest,
@@ -57,9 +61,12 @@ use crate::generation_engine_config::{
 };
 use crate::intent_store::record_io;
 use crate::native_runtime_writer::{NativeGenerationSource, PreparedNativeGeneration};
-use crate::runtime_coordinator::{PreparedGeneration, PublishedRuntimeState};
+use crate::runtime_coordinator::{ActiveCaptureAudit, PreparedGeneration, PublishedRuntimeState};
 use crate::subscription::ValidatedSubscriptionEngineConfig;
-use crate::{EngineSpec, EngineSpecError, IntentStoreError, RestartPolicy, RestartPolicyError};
+use crate::{
+    EngineSpec, EngineSpecError, IntentStoreError, RestartPolicy, RestartPolicyError,
+    RuntimeGenerationBinding,
+};
 
 pub(crate) trait CompleteNativeInventorySource: Send + 'static {
     fn snapshot(&mut self) -> Option<Arc<NetworkInventory>>;
@@ -79,6 +86,22 @@ pub(crate) trait NativeGenerationPlanningSource: Send + 'static {
         desired_state: &FluxConfig,
         inventory: &NetworkInventory,
     ) -> Result<GenerationPlanningAuthority, Self::Error>;
+
+    /// Collect planning evidence for an active-path audit while retaining the exact ownership
+    /// observation as an input to the platform-private census transaction. Implementations that
+    /// do not have a retained-owner-aware collector may conservatively require a successor.
+    fn plan_active_capture_audit(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: &NetworkInventory,
+        _ownership: &NativeCaptureOwnershipObservation,
+    ) -> Result<Option<GenerationPlanningAuthority>, Self::Error> {
+        // An ordinary fresh plan cannot account for the exact retained native owner.  Treat
+        // owner-aware collection as an explicit capability so a source that has not implemented
+        // the narrow audit transaction fails closed into successor preparation.
+        let _ = (desired_state, inventory);
+        Ok(None)
+    }
 }
 
 trait EngineCapabilityProfileSource: Send + 'static {
@@ -253,6 +276,15 @@ impl SystemAndroidGenerationPlanningSource {
         desired_state: &FluxConfig,
         inventory: Arc<NetworkInventory>,
     ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
+        self.plan_fresh_with_owner(desired_state, inventory, None)
+    }
+
+    fn plan_fresh_with_owner(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: Arc<NetworkInventory>,
+        active_owner: Option<&NativeCaptureOwnershipObservation>,
+    ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
         // The census and placement pipeline can perform bounded external observations. Age the
         // resulting Capture Path evidence from the beginning of that transaction so time spent
         // collecting facts never extends the five-minute safety lease.
@@ -310,12 +342,21 @@ impl SystemAndroidGenerationPlanningSource {
         if let Some((policy, selection, _)) = self.reviewed_canary_facility.as_ref() {
             request = request.with_reviewed_canary_facility(policy.clone(), *selection);
         }
-        let outcome = coordinate_android_fwmark_census_for_inventory(
-            &mut self.census,
-            &request,
-            AndroidFwmarkCensusCoordinatorPurpose::PlanningAuthority,
-            Arc::clone(&inventory),
-        )
+        let outcome = match active_owner {
+            Some(active_owner) => coordinate_android_fwmark_census_for_inventory_with_active_owner(
+                &mut self.census,
+                &request,
+                AndroidFwmarkCensusCoordinatorPurpose::PlanningAuthority,
+                Arc::clone(&inventory),
+                active_owner,
+            ),
+            None => coordinate_android_fwmark_census_for_inventory(
+                &mut self.census,
+                &request,
+                AndroidFwmarkCensusCoordinatorPurpose::PlanningAuthority,
+                Arc::clone(&inventory),
+            ),
+        }
         .map_err(|source| {
             SystemAndroidGenerationPlanningError::Census(
                 SystemAndroidGenerationPlanningCensusError::new(source),
@@ -413,6 +454,41 @@ impl NativeGenerationPlanningSource for SystemAndroidGenerationPlanningSource {
         }
         self.plan_fresh(desired_state, Arc::new(inventory.clone()))
     }
+
+    fn plan_active_capture_audit(
+        &mut self,
+        desired_state: &FluxConfig,
+        inventory: &NetworkInventory,
+        ownership: &NativeCaptureOwnershipObservation,
+    ) -> Result<Option<GenerationPlanningAuthority>, Self::Error> {
+        let planning = self.plan_fresh_with_owner(
+            desired_state,
+            Arc::new(inventory.clone()),
+            Some(ownership),
+        )?;
+        let Some((mark, placement)) = planning.android_runtime_binding() else {
+            return Err(SystemAndroidGenerationPlanningError::Placement(
+                SystemAndroidGenerationPlanningPlacementError::new(
+                    SystemAndroidGenerationPlanningPlacementFailureClass::StaleLease,
+                    "owner-aware Android planning produced no RPDB placement lease",
+                ),
+            ));
+        };
+        placement
+            .ensure_current(
+                inventory,
+                mark.topology_scope().profile().classifier_revision(),
+            )
+            .map_err(|source: StaleRpdbPlacementLease| {
+                SystemAndroidGenerationPlanningError::Placement(
+                    SystemAndroidGenerationPlanningPlacementError::new(
+                        SystemAndroidGenerationPlanningPlacementFailureClass::StaleLease,
+                        source,
+                    ),
+                )
+            })?;
+        Ok(Some(planning))
+    }
 }
 
 #[cfg(any(test, flux_android_qualification))]
@@ -495,6 +571,7 @@ impl SystemAndroidGenerationPlanningCensusFailureClass {
             AndroidFwmarkCensusCoordinatorError::ReviewedCanaryFacilityPolicyMismatch => {
                 Self::ReviewedCanaryFacilityPolicyMismatch
             }
+            AndroidFwmarkCensusCoordinatorError::RetainedOwnerRoutingMismatch => Self::Rpdb,
             AndroidFwmarkCensusCoordinatorError::ReviewedCanaryRpdb(_) => Self::ReviewedCanaryRpdb,
             AndroidFwmarkCensusCoordinatorError::Topology(_) => Self::Topology,
             AndroidFwmarkCensusCoordinatorError::Rpdb(_) => Self::Rpdb,
@@ -860,6 +937,7 @@ pub(crate) enum SystemAndroidGenerationPlanningPlacementFailureClass {
     ReviewedClassification,
     ReviewedPlanning,
     GenericPlanning,
+    StaleLease,
 }
 
 impl SystemAndroidGenerationPlanningPlacementFailureClass {
@@ -869,6 +947,7 @@ impl SystemAndroidGenerationPlanningPlacementFailureClass {
             Self::ReviewedClassification => "placement/reviewed-classification",
             Self::ReviewedPlanning => "placement/reviewed-planning",
             Self::GenericPlanning => "placement/generic-planning",
+            Self::StaleLease => "placement/stale-lease",
         })
     }
 }
@@ -1328,6 +1407,8 @@ impl NativeGenerationSourcePaths {
 
 struct PendingGeneration {
     identity: AdmittedGenerationIdentity,
+    active_capture_plan_digest: ActiveCapturePlanDigest,
+    runtime_binding: RuntimeGenerationBinding,
     desired_state: FluxConfig,
     engine_source: SelectedEngineSource,
     address: AddressReconciliationInspection,
@@ -1337,6 +1418,8 @@ struct PendingGeneration {
 
 struct CommittedGeneration<I> {
     identity: AdmittedGenerationIdentity,
+    active_capture_plan_digest: ActiveCapturePlanDigest,
+    runtime_binding: RuntimeGenerationBinding,
     target: I,
     desired_state: FluxConfig,
     engine_source: SelectedEngineSource,
@@ -1718,11 +1801,14 @@ where
             ));
         }
         let identity = admitted.identity();
+        let active_capture_plan_digest = admitted.active_capture_plan_digest();
         let engine_profile_revision = admitted.engine_profile_revision();
         let functional_canary_mode = admitted.functional_canary_mode();
         let supervised_delivery_report = admitted.supervised_delivery_report();
         let capture_path_selection = admitted.capture_path_selection();
         let capture_path_evidence_deadline = admitted.capture_path_evidence_deadline();
+        let runtime_binding =
+            RuntimeGenerationBinding::new(expected_generation, admitted.capture_path_selection());
         let prepared_canary_generation = admitted
             .prepared_canary_generation_binding()
             .map_err(NativeGenerationSourceError::CanaryBinding)?;
@@ -1739,6 +1825,8 @@ where
             .map_err(|source| NativeGenerationSourceError::Admission(Box::new(source)))?;
         self.pending = Some(PendingGeneration {
             identity,
+            active_capture_plan_digest,
+            runtime_binding,
             desired_state,
             engine_source,
             address: inputs.inspection(),
@@ -1755,6 +1843,7 @@ where
             capture_path_evidence_deadline,
         )
         .with_prepared_canary_generation(prepared_canary_generation);
+        let runtime = runtime.with_active_capture_plan_digest(active_capture_plan_digest);
         let runtime = match retained_canary_facility {
             Some(facility) => runtime.with_retained_canary_facility(facility),
             None => runtime,
@@ -1797,6 +1886,8 @@ where
                 .expect("validated pending native Generation remains present");
             let previous = self.committed.replace(CommittedGeneration {
                 identity: pending.identity,
+                active_capture_plan_digest: pending.active_capture_plan_digest,
+                runtime_binding: pending.runtime_binding,
                 target,
                 desired_state: pending.desired_state,
                 engine_source: pending.engine_source,
@@ -1854,6 +1945,131 @@ where
         remove_generation_file(&pending.config_path)?;
         self.pending = None;
         Ok(())
+    }
+
+    fn audit_committed_capture(
+        &mut self,
+        request: &crate::runtime_coordinator::ActiveCaptureAuditRequest<'_>,
+        target: I,
+        ownership: &NativeCaptureOwnershipObservation,
+    ) -> Result<crate::runtime_coordinator::ActiveCaptureAudit, NativeGenerationSourceError> {
+        let inputs = request.fresh_inputs();
+        let generation = request.active().id();
+        let plan_digest = request.active().active_capture_plan_digest().ok_or(
+            NativeGenerationSourceError::Invariant(
+                "active Capture Path audit has no canonical plan digest",
+            ),
+        )?;
+        let requested_at = request.started_at();
+        let complete_before = request.complete_before();
+        if requested_at >= complete_before {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit has no valid completion window",
+            ));
+        }
+        if self.pending.is_some() || self.retired_config_path.is_some() {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit overlapped Generation settlement",
+            ));
+        }
+        let (
+            committed_identity,
+            committed_target,
+            committed_desired_state,
+            committed_digest,
+            committed_runtime_binding,
+        ) = {
+            let committed =
+                self.committed
+                    .as_ref()
+                    .ok_or(NativeGenerationSourceError::Invariant(
+                        "active Capture Path audit has no committed Generation",
+                    ))?;
+            (
+                committed.identity,
+                committed.target,
+                committed.desired_state.clone(),
+                committed.active_capture_plan_digest,
+                committed.runtime_binding,
+            )
+        };
+        if committed_identity.generation() != generation || committed_target != target {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit identifies a different committed runtime",
+            ));
+        }
+        if committed_runtime_binding.generation() != generation {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit has a substituted committed runtime binding",
+            ));
+        }
+        if ownership.target().generation() != generation {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit has substituted native ownership",
+            ));
+        }
+        if plan_digest != committed_digest {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit has a substituted active plan digest",
+            ));
+        }
+        if inputs.desired_state() != &committed_desired_state {
+            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
+        }
+
+        // The address reconciler and production source share one NetworkInventorySource. Require
+        // the exact fresh transaction immediately before the bounded owner-aware planning pass.
+        let source_inventory = self
+            .inventory
+            .snapshot()
+            .ok_or(NativeGenerationSourceError::InventoryUnavailable)?;
+        if source_inventory.snapshot_id() != inputs.inventory().snapshot_id()
+            || source_inventory.epoch() != inputs.inventory().epoch()
+            || source_inventory.materially_differs_from(inputs.inventory())
+        {
+            return Err(NativeGenerationSourceError::Invariant(
+                "active Capture Path audit received a substituted inventory transaction",
+            ));
+        }
+        let Some(planning) = self
+            .planning
+            .plan_active_capture_audit(&committed_desired_state, inputs.inventory(), ownership)
+            .map_err(|source| NativeGenerationSourceError::Planning(Box::new(source)))?
+        else {
+            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
+        };
+        let fresh_digest = crate::generation_engine_config::active_capture_plan_digest_for_audit(
+            &committed_desired_state,
+            inputs.capture().capture(),
+            &planning,
+            committed_runtime_binding.capture_path_selection(),
+        );
+        if fresh_digest != committed_digest {
+            return Ok(crate::runtime_coordinator::ActiveCaptureAudit::SuccessorRequired);
+        }
+        let completed_at = Instant::now();
+        let observed_at = planning
+            .capture_path_evidence()
+            .valid_until()
+            .checked_sub(CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE)
+            .ok_or(NativeGenerationSourceError::Invariant(
+                "fresh Capture Path evidence has no representable observation time",
+            ))?;
+        let valid_until = planning.capture_path_evidence().valid_until();
+        if observed_at < requested_at
+            || completed_at >= complete_before
+            || valid_until <= complete_before
+            || valid_until <= completed_at
+        {
+            return Err(NativeGenerationSourceError::Invariant(
+                "fresh Capture Path evidence did not safely extend the committed deadline",
+            ));
+        }
+        Ok(crate::runtime_coordinator::ActiveCaptureAudit::Extended {
+            generation: committed_runtime_binding,
+            observed_at,
+            valid_until,
+        })
     }
 
     #[cfg(test)]
@@ -1968,6 +2184,15 @@ where
 
     fn invalidate_latest_capture_path_decision(&mut self) {
         self.latest_capture_path_decision = None;
+    }
+
+    fn audit_active_capture(
+        &mut self,
+        request: &crate::runtime_coordinator::ActiveCaptureAuditRequest<'_>,
+        target: I,
+        ownership: &NativeCaptureOwnershipObservation,
+    ) -> Result<ActiveCaptureAudit, Self::Error> {
+        self.audit_committed_capture(request, target, ownership)
     }
 
     fn reject_prepared(

@@ -16,7 +16,7 @@ use flux_platform::socket_diagnostics::{
 use flux_platform::{
     NativeCaptureCanaryAttempt, NativeCaptureCanaryRouteOutcome, NativeCaptureCanaryRouteQuery,
     NativeCaptureCanarySelector, NativeCaptureConvergedState, NativeCaptureConvergence,
-    NativeCaptureDesired, NativeCaptureTargetIdentity,
+    NativeCaptureDesired, NativeCaptureOwnershipObservation, NativeCaptureTargetIdentity,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use flux_platform::{
@@ -38,9 +38,10 @@ use crate::functional_canary::{
 use crate::generation_engine_config::EngineCapabilityProfileRevision;
 use crate::generation_engine_config::{AddressReconciledGenerationInputs, CapturePathDecision};
 use crate::runtime_coordinator::{
-    AddressResyncStrategy, CanaryCounterReadback, CanaryCounterRetirementReadback,
-    CanaryRouteReadback, CanarySelectorSession, PreparedGeneration, PublishedRuntimeState,
-    RetiredCanarySelectorSession, RuntimeCoordinator, RuntimeFunctionalCanary, RuntimeWriter,
+    ActiveCaptureAudit, ActiveCaptureAuditRequest, AddressResyncStrategy, CanaryCounterReadback,
+    CanaryCounterRetirementReadback, CanaryRouteReadback, CanarySelectorSession,
+    PreparedGeneration, PublishedRuntimeState, RetiredCanarySelectorSession, RuntimeCoordinator,
+    RuntimeFunctionalCanary, RuntimeWriter,
 };
 use crate::subscription::ValidatedSubscriptionEngineConfig;
 
@@ -72,6 +73,7 @@ enum LiveCaptureReadbackFailure<E> {
     TargetMismatch,
 }
 
+#[cfg(test)]
 fn verify_live_capture_readback<I, E>(
     expected: I,
     observation: Result<Option<I>, E>,
@@ -82,6 +84,18 @@ where
     match observation {
         Err(source) => Err(LiveCaptureReadbackFailure::Observation(source)),
         Ok(Some(observed)) if observed == expected => Ok(()),
+        Ok(Some(_)) => Err(LiveCaptureReadbackFailure::TargetMismatch),
+        Ok(None) => Err(LiveCaptureReadbackFailure::Missing),
+    }
+}
+
+fn verify_live_capture_observation<E>(
+    expected: NativeCaptureTargetIdentity,
+    observation: Result<Option<NativeCaptureOwnershipObservation>, E>,
+) -> Result<NativeCaptureOwnershipObservation, LiveCaptureReadbackFailure<E>> {
+    match observation {
+        Err(source) => Err(LiveCaptureReadbackFailure::Observation(source)),
+        Ok(Some(observation)) if observation.target() == expected => Ok(observation),
         Ok(Some(_)) => Err(LiveCaptureReadbackFailure::TargetMismatch),
         Ok(None) => Err(LiveCaptureReadbackFailure::Missing),
     }
@@ -144,6 +158,21 @@ pub(crate) trait NativeGenerationSource<T, I>: Send + 'static {
     }
 
     fn invalidate_latest_capture_path_decision(&mut self) {}
+
+    /// Audit fresh inputs against one exact committed native runtime. The ownership observation
+    /// is borrowed into the source's private platform transaction; retained-owner material never
+    /// crosses this trait boundary.
+    ///
+    /// Implementations must not prepare or admit a successor, write Generation state, converge
+    /// capture, or alter committed lineage. A successor result leaves the old deadline untouched.
+    fn audit_active_capture(
+        &mut self,
+        _request: &ActiveCaptureAuditRequest<'_>,
+        _target: I,
+        _ownership: &NativeCaptureOwnershipObservation,
+    ) -> Result<ActiveCaptureAudit, Self::Error> {
+        Ok(ActiveCaptureAudit::SuccessorRequired)
+    }
 
     fn reject_prepared(
         &mut self,
@@ -722,6 +751,33 @@ where
             ))
     }
 
+    fn observe_exact_native_ownership(
+        &mut self,
+        expected: NativeCaptureTargetIdentity,
+        operation: &'static str,
+    ) -> Result<NativeCaptureOwnershipObservation, NativeCoordinatorWriterError> {
+        match verify_live_capture_observation(expected, self.convergence.observe_active_ownership())
+        {
+            Ok(observation) => Ok(observation),
+            Err(LiveCaptureReadbackFailure::Observation(source)) => {
+                self.recovery_required = true;
+                Err(NativeCoordinatorWriterError::convergence(operation, source))
+            }
+            Err(LiveCaptureReadbackFailure::TargetMismatch) => {
+                self.recovery_required = true;
+                Err(NativeCoordinatorWriterError::Invariant(
+                    "live native ownership differs from the published Generation",
+                ))
+            }
+            Err(LiveCaptureReadbackFailure::Missing) => {
+                self.recovery_required = true;
+                Err(NativeCoordinatorWriterError::Invariant(
+                    "live native ownership readback is absent for a published Generation",
+                ))
+            }
+        }
+    }
+
     fn active_canary_attempt(
         &self,
         generation: &PreparedGeneration,
@@ -1108,32 +1164,100 @@ where
             // a platform ownership readback. Production native identities always do.
             return Ok(());
         };
-        let observation = self
-            .convergence
-            .observe_active_ownership()
-            .map(|observation| observation.map(|observation| observation.target()));
-        match verify_live_capture_readback(expected_native, observation) {
-            Ok(()) => Ok(()),
-            Err(LiveCaptureReadbackFailure::Observation(source)) => {
-                self.recovery_required = true;
-                Err(NativeCoordinatorWriterError::convergence(
-                    "observe live native ownership during structural verification",
-                    source,
-                ))
-            }
-            Err(LiveCaptureReadbackFailure::TargetMismatch) => {
-                self.recovery_required = true;
-                Err(NativeCoordinatorWriterError::Invariant(
-                    "live native ownership differs from the published Generation",
-                ))
-            }
-            Err(LiveCaptureReadbackFailure::Missing) => {
-                self.recovery_required = true;
-                Err(NativeCoordinatorWriterError::Invariant(
-                    "live native ownership readback is absent for a published Generation",
-                ))
+        self.observe_exact_native_ownership(
+            expected_native,
+            "observe live native ownership during structural verification",
+        )
+        .map(|_| ())
+    }
+
+    fn audit_active_capture(
+        &mut self,
+        request: ActiveCaptureAuditRequest<'_>,
+    ) -> Result<ActiveCaptureAudit, Self::Error> {
+        if self.recovery_required {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit requires capture recovery",
+            ));
+        }
+        if self.active_canary_selector_session.is_some() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit overlapped an active canary selector session",
+            ));
+        }
+
+        let generation = request.active();
+        if self.committed_generation != Some(generation.id()) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit does not identify the committed Generation",
+            ));
+        }
+        let expected = C::target_identity(&self.retained(generation.id())?.target);
+        if expected.coordinator_generation() != Some(generation.id())
+            || self.converged_identity != Some(expected)
+        {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit has no exact active committed target",
+            ));
+        }
+
+        if request.started_at() >= request.complete_before() {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "active Capture Path audit began at or after its prior deadline",
+            ));
+        }
+
+        let Some(expected_native) = expected.native_capture_target_identity() else {
+            // A synthetic convergence identity has no descriptor-anchored ownership evidence and
+            // therefore cannot authorize a live evidence lease extension.
+            return Ok(ActiveCaptureAudit::SuccessorRequired);
+        };
+        let ownership_before = self.observe_exact_native_ownership(
+            expected_native,
+            "observe native ownership before active Capture Path audit",
+        )?;
+
+        let audit = self
+            .source
+            .audit_active_capture(&request, expected, &ownership_before);
+
+        // Always close the readback bracket, including after a planning error. A source failure
+        // cannot hide simultaneous native ownership drift.
+        let ownership_after = self.observe_exact_native_ownership(
+            expected_native,
+            "observe native ownership after active Capture Path audit",
+        )?;
+        if ownership_after != ownership_before {
+            self.recovery_required = true;
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "descriptor-anchored native ownership changed during active Capture Path audit",
+            ));
+        }
+
+        let audit = audit.map_err(|source| {
+            NativeCoordinatorWriterError::preparation(
+                "audit committed native Capture Path evidence",
+                source,
+            )
+        })?;
+        if let ActiveCaptureAudit::Extended {
+            generation: audited_generation,
+            observed_at,
+            valid_until,
+        } = audit
+        {
+            if audited_generation != generation.runtime_binding()
+                || observed_at < request.started_at()
+                || observed_at >= request.complete_before()
+                || valid_until <= request.complete_before()
+                || valid_until <= observed_at
+            {
+                return Err(NativeCoordinatorWriterError::Invariant(
+                    "native source returned mismatched active Capture Path audit",
+                ));
             }
         }
+        Ok(audit)
     }
 
     fn observe_active_canary_generation(

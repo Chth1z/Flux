@@ -7,6 +7,12 @@ pub(crate) fn xtables_capture_path_selection() -> CapturePathSelection {
         "reason": "automatic_highest_ranked_qualified",
         "candidates": [
             {
+                "path": "ebpf",
+                "state": "unimplemented",
+                "qualification_state": "unqualified",
+                "first_kernel_gap": null
+            },
+            {
                 "path": "nftables_tproxy",
                 "state": "unimplemented",
                 "qualification_state": "unqualified",
@@ -49,6 +55,12 @@ pub(crate) fn unqualified_capture_path_decision() -> CapturePathDecision {
                 "kind": "no_qualified_path"
             },
             "candidates": [
+                {
+                    "path": "ebpf",
+                    "state": "unimplemented",
+                    "qualification_state": "unqualified",
+                    "first_kernel_gap": null
+                },
                 {
                     "path": "nftables_tproxy",
                     "state": "unimplemented",

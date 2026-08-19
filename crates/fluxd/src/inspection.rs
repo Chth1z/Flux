@@ -942,11 +942,11 @@ mod tests {
             crate::CapturePathRejectionReason::NoQualifiedPath
         );
         assert_eq!(
-            rejection.candidates()[1].state(),
+            rejection.candidates()[2].state(),
             flux_platform::AndroidCapturePathState::Unqualified
         );
         assert_eq!(
-            rejection.candidates()[1].qualification_state(),
+            rejection.candidates()[2].qualification_state(),
             flux_core::CapturePathQualificationState::Unqualified
         );
     }

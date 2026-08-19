@@ -429,6 +429,7 @@ const SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_V1:
         artifact_digest: SAMSUNG_SM_S9180_FZDP_QKERNEL_20260722_QUALIFICATION_ARTIFACT_DIGEST,
         qualifications: CapturePathQualifications::new(
             CapturePathQualificationState::Unqualified,
+            CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Qualified,
             CapturePathQualificationState::Unqualified,
         ),

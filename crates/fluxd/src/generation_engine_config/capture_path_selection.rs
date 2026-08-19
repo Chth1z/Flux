@@ -22,10 +22,10 @@ pub(crate) const CAPTURE_PATH_QUALIFICATION_EVIDENCE_MAX_AGE: Duration =
     Duration::from_secs(5 * 60);
 
 const CAPTURE_PATH_SELECTION_EVIDENCE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Capture Path decision\0canonical-schema-v2\0sha256-v1\0";
+    b"Flux Capture Path decision\0canonical-schema-v3\0sha256-v1\0";
 
 pub(crate) const PRODUCTION_IMPLEMENTED_CAPTURE_ADAPTERS: ImplementedCaptureAdapters =
-    ImplementedCaptureAdapters::new(false, true, false);
+    ImplementedCaptureAdapters::new(false, false, true, false);
 pub(crate) const PRODUCTION_CAPTURE_PATH_SELECTOR: CapturePathSelector =
     CapturePathSelector::new(PRODUCTION_IMPLEMENTED_CAPTURE_ADAPTERS);
 
@@ -481,8 +481,13 @@ impl TryFrom<SerializedCapturePathSelection> for CapturePathSelection {
     type Error = CapturePathSelectionDecodeError;
 
     fn try_from(selection: SerializedCapturePathSelection) -> Result<Self, Self::Error> {
-        let [first, second, third] = selection.candidates;
-        let candidates = [first.try_into()?, second.try_into()?, third.try_into()?];
+        let [first, second, third, fourth] = selection.candidates;
+        let candidates = [
+            first.try_into()?,
+            second.try_into()?,
+            third.try_into()?,
+            fourth.try_into()?,
+        ];
         Self::try_from_status_parts(
             parse_capture_path_request(&selection.request)?,
             parse_capture_path(&selection.selected)?,
@@ -518,11 +523,16 @@ impl TryFrom<SerializedCapturePathRejection> for CapturePathRejection {
     type Error = CapturePathSelectionDecodeError;
 
     fn try_from(rejection: SerializedCapturePathRejection) -> Result<Self, Self::Error> {
-        let [first, second, third] = rejection.candidates;
+        let [first, second, third, fourth] = rejection.candidates;
         Self::try_from_status_parts(
             parse_capture_path_request(&rejection.request)?,
             rejection.reason.try_into()?,
-            [first.try_into()?, second.try_into()?, third.try_into()?],
+            [
+                first.try_into()?,
+                second.try_into()?,
+                third.try_into()?,
+                fourth.try_into()?,
+            ],
             CapturePathSelectionEvidenceDigest::from_bytes(decode_digest(
                 &rejection.evidence_digest,
             )?),
@@ -1189,6 +1199,7 @@ pub(crate) fn qualified_xtables_capture_path_evidence() -> CapturePathQualificat
     CapturePathQualificationEvidence::host_inspection_with_maximum_lifetime(
         CapturePathQualifications::new(
             CapturePathQualificationState::Unqualified,
+            CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Qualified,
             CapturePathQualificationState::Unqualified,
         ),
@@ -1204,6 +1215,12 @@ pub(crate) fn test_xtables_capture_path_selection() -> CapturePathSelection {
         CapturePathId::XtablesTproxy,
         CapturePathSelectionReason::AutomaticHighestRankedQualified,
         [
+            CapturePathCandidateStatus::from_status_parts(
+                CapturePathId::Ebpf,
+                AndroidCapturePathState::Unimplemented,
+                CapturePathQualificationState::Unqualified,
+                None,
+            ),
             CapturePathCandidateStatus::from_status_parts(
                 CapturePathId::NftablesTproxy,
                 AndroidCapturePathState::Unimplemented,
@@ -1242,6 +1259,12 @@ pub(crate) fn test_unqualified_capture_path_decision() -> CapturePathDecision {
             CapturePathRequest::Auto,
             CapturePathRejectionReason::NoQualifiedPath,
             [
+                CapturePathCandidateStatus::from_status_parts(
+                    CapturePathId::Ebpf,
+                    AndroidCapturePathState::Unimplemented,
+                    CapturePathQualificationState::Unqualified,
+                    None,
+                ),
                 CapturePathCandidateStatus::from_status_parts(
                     CapturePathId::NftablesTproxy,
                     AndroidCapturePathState::Unimplemented,
@@ -1394,6 +1417,7 @@ const fn capture_request_tag(request: CapturePathRequest) -> u8 {
 
 const fn capture_path_tag(path: CapturePathId) -> u8 {
     match path {
+        CapturePathId::Ebpf => 3,
         CapturePathId::NftablesTproxy => 0,
         CapturePathId::XtablesTproxy => 1,
         CapturePathId::ManagedTun => 2,
@@ -1457,6 +1481,7 @@ mod qualification_evidence_tests {
 
     fn qualifications() -> CapturePathQualifications {
         CapturePathQualifications::new(
+            CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Qualified,
             CapturePathQualificationState::Unqualified,

@@ -561,6 +561,9 @@ const TUN_REQUIRED_FEATURES: &[AndroidKernelFeature] = &[
 
 fn required_features(path: CapturePathId) -> &'static [AndroidKernelFeature] {
     match path {
+        // eBPF qualification is supplied by the active Sing-Box probe. Kernel configuration is
+        // intentionally not treated as positive evidence for this path.
+        CapturePathId::Ebpf => &[],
         CapturePathId::NftablesTproxy => NFTABLES_REQUIRED_FEATURES,
         CapturePathId::XtablesTproxy => XTABLES_REQUIRED_FEATURES,
         CapturePathId::ManagedTun => TUN_REQUIRED_FEATURES,
@@ -1036,7 +1039,7 @@ mod tests {
     use tempfile::tempdir;
 
     const ALL_CAPTURE_ADAPTERS: ImplementedCaptureAdapters =
-        ImplementedCaptureAdapters::new(true, true, true);
+        ImplementedCaptureAdapters::new(true, true, true, true);
 
     fn complete_feature_config(
         overrides: &[(AndroidKernelFeature, AndroidKernelConfigOptionState)],
@@ -1233,10 +1236,11 @@ mod tests {
                 CapturePathQualificationState::Qualified,
                 CapturePathQualificationState::Qualified,
                 CapturePathQualificationState::Qualified,
+                CapturePathQualificationState::Qualified,
             ),
             CapturePathRequest::Auto,
         );
-        assert_eq!(decision.selected(), Some(CapturePathId::NftablesTproxy));
+        assert_eq!(decision.selected(), Some(CapturePathId::Ebpf));
         assert_eq!(decision.next_to_qualify(), None);
     }
 
@@ -1249,18 +1253,23 @@ mod tests {
             CapturePathQualifications::new(
                 CapturePathQualificationState::Denied,
                 CapturePathQualificationState::Conflicting,
+                CapturePathQualificationState::Broken,
                 CapturePathQualificationState::Qualified,
             ),
             CapturePathRequest::Auto,
         );
         assert_eq!(decision.selected(), Some(CapturePathId::ManagedTun));
         assert_eq!(
-            decision.candidate(CapturePathId::NftablesTproxy).state(),
+            decision.candidate(CapturePathId::Ebpf).state(),
             AndroidCapturePathState::Denied
         );
         assert_eq!(
-            decision.candidate(CapturePathId::XtablesTproxy).state(),
+            decision.candidate(CapturePathId::NftablesTproxy).state(),
             AndroidCapturePathState::Conflicting
+        );
+        assert_eq!(
+            decision.candidate(CapturePathId::XtablesTproxy).state(),
+            AndroidCapturePathState::Broken
         );
     }
 
@@ -1275,48 +1284,50 @@ mod tests {
             CapturePathQualificationState::Broken,
             CapturePathQualificationState::Unqualified,
         ];
-        for nftables in states {
-            for xtables in states {
-                for tun in states {
-                    let qualifications = [nftables, xtables, tun];
-                    let decision = select_android_capture_path(
-                        &config,
-                        ALL_CAPTURE_ADAPTERS,
-                        CapturePathQualifications::new(nftables, xtables, tun),
-                        CapturePathRequest::Auto,
-                    );
-                    let expected_selected = qualifications
-                        .iter()
-                        .position(|state| *state == CapturePathQualificationState::Qualified)
-                        .map(|index| CapturePathId::ALL[index]);
-                    let expected_next = expected_selected
-                        .is_none()
-                        .then(|| {
-                            qualifications
-                                .iter()
-                                .position(|state| {
-                                    *state == CapturePathQualificationState::Unqualified
-                                })
-                                .map(|index| CapturePathId::ALL[index])
-                        })
-                        .flatten();
-                    assert_eq!(
-                        decision.selected(),
-                        expected_selected,
-                        "qualifications={qualifications:?}"
-                    );
-                    assert_eq!(
-                        decision.next_to_qualify(),
-                        expected_next,
-                        "qualifications={qualifications:?}"
-                    );
+        for ebpf in states {
+            for nftables in states {
+                for xtables in states {
+                    for tun in states {
+                        let qualifications = [ebpf, nftables, xtables, tun];
+                        let decision = select_android_capture_path(
+                            &config,
+                            ALL_CAPTURE_ADAPTERS,
+                            CapturePathQualifications::new(ebpf, nftables, xtables, tun),
+                            CapturePathRequest::Auto,
+                        );
+                        let expected_selected = qualifications
+                            .iter()
+                            .position(|state| *state == CapturePathQualificationState::Qualified)
+                            .map(|index| CapturePathId::ALL[index]);
+                        let expected_next = expected_selected
+                            .is_none()
+                            .then(|| {
+                                qualifications
+                                    .iter()
+                                    .position(|state| {
+                                        *state == CapturePathQualificationState::Unqualified
+                                    })
+                                    .map(|index| CapturePathId::ALL[index])
+                            })
+                            .flatten();
+                        assert_eq!(
+                            decision.selected(),
+                            expected_selected,
+                            "qualifications={qualifications:?}"
+                        );
+                        assert_eq!(
+                            decision.next_to_qualify(),
+                            expected_next,
+                            "qualifications={qualifications:?}"
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn current_device_shape_selects_xtables_as_the_next_qualification() {
+    fn current_device_shape_selects_ebpf_as_the_next_qualification() {
         let config = complete_feature_config(&[(
             AndroidKernelFeature::NfTables,
             AndroidKernelConfigOptionState::Disabled,
@@ -1328,10 +1339,7 @@ mod tests {
             CapturePathRequest::Auto,
         );
         assert_eq!(decision.selected(), None);
-        assert_eq!(
-            decision.next_to_qualify(),
-            Some(CapturePathId::XtablesTproxy)
-        );
+        assert_eq!(decision.next_to_qualify(), Some(CapturePathId::Ebpf));
         let nftables = decision.candidate(CapturePathId::NftablesTproxy);
         assert_eq!(nftables.state(), AndroidCapturePathState::Missing);
         assert_eq!(
@@ -1354,6 +1362,7 @@ mod tests {
             ALL_CAPTURE_ADAPTERS,
             CapturePathQualifications::new(
                 CapturePathQualificationState::Unqualified,
+                CapturePathQualificationState::Unqualified,
                 CapturePathQualificationState::Qualified,
                 CapturePathQualificationState::Qualified,
             ),
@@ -1366,8 +1375,9 @@ mod tests {
     #[test]
     fn unimplemented_adapters_never_qualify_or_become_qualification_work() {
         let config = complete_feature_config(&[]);
-        let xtables_only = ImplementedCaptureAdapters::new(false, true, false);
+        let xtables_only = ImplementedCaptureAdapters::new(false, false, true, false);
         let qualifications = CapturePathQualifications::new(
+            CapturePathQualificationState::Qualified,
             CapturePathQualificationState::Qualified,
             CapturePathQualificationState::Qualified,
             CapturePathQualificationState::Qualified,
@@ -1410,6 +1420,7 @@ mod tests {
             &config,
             ALL_CAPTURE_ADAPTERS,
             CapturePathQualifications::new(
+                CapturePathQualificationState::Unsupported,
                 CapturePathQualificationState::Qualified,
                 CapturePathQualificationState::Unqualified,
                 CapturePathQualificationState::Unqualified,

@@ -562,6 +562,7 @@ impl CaptureConfig {
         Ok(Self {
             path_request: match raw.path {
                 RawCapturePathRequest::Auto => CapturePathRequest::Auto,
+                RawCapturePathRequest::Ebpf => CapturePathRequest::Exact(CapturePathId::Ebpf),
                 RawCapturePathRequest::NftablesTproxy => {
                     CapturePathRequest::Exact(CapturePathId::NftablesTproxy)
                 }
@@ -1223,6 +1224,7 @@ struct RawCaptureConfig {
 #[serde(rename_all = "snake_case")]
 enum RawCapturePathRequest {
     Auto,
+    Ebpf,
     NftablesTproxy,
     XtablesTproxy,
     ManagedTun,

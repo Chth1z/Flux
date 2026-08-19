@@ -7,7 +7,7 @@ pub const CAPTURE_PATH_BEHAVIORAL_EVIDENCE_DIGEST_BYTES: usize = 32;
 pub const REVIEWED_CAPTURE_PATH_EVIDENCE_ARTIFACT_DIGEST_BYTES: usize = 32;
 
 const CAPTURE_PATH_BEHAVIORAL_EVIDENCE_DIGEST_DOMAIN: &[u8] =
-    b"Flux Capture Path behavioral evidence\0canonical-schema-v1\0sha256-v1\0";
+    b"Flux Capture Path behavioral evidence\0canonical-schema-v2\0sha256-v1\0";
 
 /// Stable product identity of the mechanism that realizes one Capture Program.
 ///
@@ -15,17 +15,28 @@ const CAPTURE_PATH_BEHAVIORAL_EVIDENCE_DIGEST_DOMAIN: &[u8] =
 /// eBPF counter source observing an xtables Generation still reports `XtablesTproxy`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CapturePathId {
+    Ebpf,
     NftablesTproxy,
     XtablesTproxy,
     ManagedTun,
 }
 
 impl CapturePathId {
-    pub const ALL: [Self; 3] = [Self::NftablesTproxy, Self::XtablesTproxy, Self::ManagedTun];
+    /// Automatic preference order for the closed Capture Path inventory.
+    ///
+    /// Nftables remains modeled but unimplemented. While it is deferred, the implemented order is
+    /// therefore eBPF, xtables TPROXY, then Managed TUN.
+    pub const ALL: [Self; 4] = [
+        Self::Ebpf,
+        Self::NftablesTproxy,
+        Self::XtablesTproxy,
+        Self::ManagedTun,
+    ];
 
     #[must_use]
     pub const fn as_token(self) -> &'static str {
         match self {
+            Self::Ebpf => "ebpf",
             Self::NftablesTproxy => "nftables_tproxy",
             Self::XtablesTproxy => "xtables_tproxy",
             Self::ManagedTun => "managed_tun",
@@ -64,6 +75,7 @@ pub enum CapturePathQualificationState {
 /// Complete behavioral qualification set for the closed Capture Path inventory.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CapturePathQualifications {
+    ebpf: CapturePathQualificationState,
     nftables_tproxy: CapturePathQualificationState,
     xtables_tproxy: CapturePathQualificationState,
     managed_tun: CapturePathQualificationState,
@@ -72,11 +84,13 @@ pub struct CapturePathQualifications {
 impl CapturePathQualifications {
     #[must_use]
     pub const fn new(
+        ebpf: CapturePathQualificationState,
         nftables_tproxy: CapturePathQualificationState,
         xtables_tproxy: CapturePathQualificationState,
         managed_tun: CapturePathQualificationState,
     ) -> Self {
         Self {
+            ebpf,
             nftables_tproxy,
             xtables_tproxy,
             managed_tun,
@@ -86,6 +100,7 @@ impl CapturePathQualifications {
     #[must_use]
     pub const fn state(self, path: CapturePathId) -> CapturePathQualificationState {
         match path {
+            CapturePathId::Ebpf => self.ebpf,
             CapturePathId::NftablesTproxy => self.nftables_tproxy,
             CapturePathId::XtablesTproxy => self.xtables_tproxy,
             CapturePathId::ManagedTun => self.managed_tun,
@@ -102,6 +117,7 @@ impl CapturePathQualifications {
 impl Default for CapturePathQualifications {
     fn default() -> Self {
         Self::new(
+            CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Unqualified,
             CapturePathQualificationState::Unqualified,
@@ -314,6 +330,7 @@ fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
 
 const fn capture_path_tag(path: CapturePathId) -> u8 {
     match path {
+        CapturePathId::Ebpf => 3,
         CapturePathId::NftablesTproxy => 0,
         CapturePathId::XtablesTproxy => 1,
         CapturePathId::ManagedTun => 2,
@@ -334,6 +351,7 @@ const fn qualification_state_tag(state: CapturePathQualificationState) -> u8 {
 /// Closed inventory of complete mutation Adapters available to the selector.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ImplementedCaptureAdapters {
+    ebpf: bool,
     nftables_tproxy: bool,
     xtables_tproxy: bool,
     managed_tun: bool,
@@ -341,8 +359,14 @@ pub struct ImplementedCaptureAdapters {
 
 impl ImplementedCaptureAdapters {
     #[must_use]
-    pub const fn new(nftables_tproxy: bool, xtables_tproxy: bool, managed_tun: bool) -> Self {
+    pub const fn new(
+        ebpf: bool,
+        nftables_tproxy: bool,
+        xtables_tproxy: bool,
+        managed_tun: bool,
+    ) -> Self {
         Self {
+            ebpf,
             nftables_tproxy,
             xtables_tproxy,
             managed_tun,
@@ -352,6 +376,7 @@ impl ImplementedCaptureAdapters {
     #[must_use]
     pub const fn contains(self, path: CapturePathId) -> bool {
         match path {
+            CapturePathId::Ebpf => self.ebpf,
             CapturePathId::NftablesTproxy => self.nftables_tproxy,
             CapturePathId::XtablesTproxy => self.xtables_tproxy,
             CapturePathId::ManagedTun => self.managed_tun,
@@ -360,7 +385,10 @@ impl ImplementedCaptureAdapters {
 
     #[must_use]
     pub fn count(self) -> u8 {
-        u8::from(self.nftables_tproxy) + u8::from(self.xtables_tproxy) + u8::from(self.managed_tun)
+        u8::from(self.ebpf)
+            + u8::from(self.nftables_tproxy)
+            + u8::from(self.xtables_tproxy)
+            + u8::from(self.managed_tun)
     }
 }
 
@@ -372,7 +400,10 @@ mod tests {
     fn capture_path_tokens_are_stable_and_unique() {
         let mut tokens = CapturePathId::ALL.map(CapturePathId::as_token);
         tokens.sort_unstable();
-        assert_eq!(tokens, ["managed_tun", "nftables_tproxy", "xtables_tproxy"]);
+        assert_eq!(
+            tokens,
+            ["ebpf", "managed_tun", "nftables_tproxy", "xtables_tproxy"]
+        );
     }
 
     #[test]
@@ -385,8 +416,9 @@ mod tests {
 
     #[test]
     fn implemented_adapter_inventory_is_closed_over_every_path() {
-        let adapters = ImplementedCaptureAdapters::new(false, true, false);
+        let adapters = ImplementedCaptureAdapters::new(false, false, true, false);
         assert_eq!(adapters.count(), 1);
+        assert!(!adapters.contains(CapturePathId::Ebpf));
         assert!(!adapters.contains(CapturePathId::NftablesTproxy));
         assert!(adapters.contains(CapturePathId::XtablesTproxy));
         assert!(!adapters.contains(CapturePathId::ManagedTun));

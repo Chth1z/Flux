@@ -1548,6 +1548,7 @@ fn automatic_capture_path_selection_chooses_the_only_implemented_qualified_adapt
         selection.candidates().map(|candidate| candidate.state()),
         [
             AndroidCapturePathState::Unimplemented,
+            AndroidCapturePathState::Unimplemented,
             AndroidCapturePathState::Qualified,
             AndroidCapturePathState::Unimplemented,
         ]
@@ -1568,6 +1569,7 @@ fn kernel_eligibility_without_behavioral_qualification_rejects_every_production_
         rejection.candidates().map(|candidate| candidate.state()),
         [
             AndroidCapturePathState::Unimplemented,
+            AndroidCapturePathState::Unimplemented,
             AndroidCapturePathState::Unqualified,
             AndroidCapturePathState::Unimplemented,
         ]
@@ -1576,9 +1578,9 @@ fn kernel_eligibility_without_behavioral_qualification_rejects_every_production_
         rejection
             .candidates()
             .map(|candidate| candidate.qualification_state()),
-        [CapturePathQualificationState::Unqualified; 3]
+        [CapturePathQualificationState::Unqualified; 4]
     );
-    assert_eq!(rejection.candidates()[1].first_kernel_gap(), None);
+    assert_eq!(rejection.candidates()[2].first_kernel_gap(), None);
 }
 
 #[test]
@@ -1657,6 +1659,34 @@ fn rejected_capture_path_decision_round_trips_complete_candidate_evidence() {
 }
 
 #[test]
+fn capture_path_decision_decode_rejects_legacy_three_candidate_wire_shapes() {
+    let fixture = HostAssemblyFixture::new();
+    let selection = fixture
+        .assemble(None, None)
+        .expect("qualified Capture Path Generation")
+        .capture_path_selection();
+    let mut selected = serde_json::to_value(CapturePathDecision::Selected { selection })
+        .expect("encode selected Capture Path decision");
+    selected["selection"]["candidates"]
+        .as_array_mut()
+        .expect("selected candidate array")
+        .remove(0);
+    serde_json::from_value::<CapturePathDecision>(selected)
+        .expect_err("legacy three-candidate selection must be rejected");
+
+    let mut rejected = serde_json::to_value(CapturePathDecision::Rejected {
+        rejection: unqualified_capture_path_rejection(&fixture),
+    })
+    .expect("encode rejected Capture Path decision");
+    rejected["rejection"]["candidates"]
+        .as_array_mut()
+        .expect("rejected candidate array")
+        .remove(0);
+    serde_json::from_value::<CapturePathDecision>(rejected)
+        .expect_err("legacy three-candidate rejection must be rejected");
+}
+
+#[test]
 fn selected_capture_path_decode_rejects_qualified_state_without_qualified_behavior() {
     let selection = HostAssemblyFixture::new()
         .assemble(None, None)
@@ -1664,7 +1694,7 @@ fn selected_capture_path_decode_rejects_qualified_state_without_qualified_behavi
         .capture_path_selection();
     let mut encoded = serde_json::to_value(CapturePathDecision::Selected { selection })
         .expect("encode selected Capture Path decision");
-    encoded["selection"]["candidates"][1]["qualification_state"] =
+    encoded["selection"]["candidates"][2]["qualification_state"] =
         serde_json::Value::String("unqualified".to_owned());
 
     serde_json::from_value::<CapturePathDecision>(encoded)
@@ -1679,7 +1709,7 @@ fn selected_capture_path_decode_rejects_qualified_state_with_a_disabled_kernel_g
         .capture_path_selection();
     let mut encoded = serde_json::to_value(CapturePathDecision::Selected { selection })
         .expect("encode selected Capture Path decision");
-    encoded["selection"]["candidates"][1]["first_kernel_gap"] = serde_json::json!({
+    encoded["selection"]["candidates"][2]["first_kernel_gap"] = serde_json::json!({
         "config_symbol": "CONFIG_NETFILTER",
         "state": "disabled"
     });
@@ -1717,7 +1747,7 @@ fn exact_unimplemented_capture_paths_fail_without_xtables_fallback() {
             }
         );
         assert_eq!(
-            error.candidates()[1].state(),
+            error.candidates()[2].state(),
             AndroidCapturePathState::Qualified,
             "qualified xtables must remain diagnostic evidence, not an exact-request fallback"
         );

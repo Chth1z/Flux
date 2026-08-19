@@ -203,6 +203,7 @@ fn requires_every_complete_desired_state_section() {
 fn admits_only_the_current_capture_path_request_grammar() {
     for (path, expected) in [
         ("auto", CapturePathRequest::Auto),
+        ("ebpf", CapturePathRequest::Exact(CapturePathId::Ebpf)),
         (
             "nftables_tproxy",
             CapturePathRequest::Exact(CapturePathId::NftablesTproxy),

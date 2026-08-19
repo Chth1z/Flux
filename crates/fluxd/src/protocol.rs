@@ -2584,6 +2584,7 @@ mod tests {
             selection.candidates().map(|candidate| candidate.state()),
             [
                 flux_platform::AndroidCapturePathState::Unimplemented,
+                flux_platform::AndroidCapturePathState::Unimplemented,
                 flux_platform::AndroidCapturePathState::Qualified,
                 flux_platform::AndroidCapturePathState::Unimplemented,
             ]

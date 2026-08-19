@@ -1253,6 +1253,7 @@ fn update_capture_path_request(digest: &mut Sha256, request: CapturePathRequest)
 
 fn update_capture_path_id(digest: &mut Sha256, path: CapturePathId) {
     digest.update([match path {
+        CapturePathId::Ebpf => 3,
         CapturePathId::NftablesTproxy => 0,
         CapturePathId::XtablesTproxy => 1,
         CapturePathId::ManagedTun => 2,
@@ -1276,6 +1277,7 @@ fn update_capture_path_qualifications(
     for path in CapturePathId::ALL {
         digest.update([
             match path {
+                CapturePathId::Ebpf => 3,
                 CapturePathId::NftablesTproxy => 0,
                 CapturePathId::XtablesTproxy => 1,
                 CapturePathId::ManagedTun => 2,
@@ -1721,6 +1723,7 @@ fn application_mode_tag(mode: CaptureApplicationMode) -> u8 {
 
 const fn capture_path_tag(path: CapturePathId) -> u8 {
     match path {
+        CapturePathId::Ebpf => 3,
         CapturePathId::NftablesTproxy => 0,
         CapturePathId::XtablesTproxy => 1,
         CapturePathId::ManagedTun => 2,

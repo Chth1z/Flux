@@ -45,6 +45,9 @@ const QUALIFICATION_RUSTFLAGS: &str = concat!(
 );
 const QUALIFICATION_HOST_RUSTFLAGS: &str = "--cfg flux_android_qualification";
 const QUALIFICATION_COHORT_HELPER: &str = "android-qualification-fwmark-cohort";
+const QUALIFICATION_PREFLIGHT_HELPER_FAILURE_LABEL: &str = "helper-failure";
+const QUALIFICATION_PREFLIGHT_HELPER_FAILURE: &str =
+    "qualification ordered-cohort preflight rejected at helper-failure";
 const QUALIFICATION_COHORT_TARGET_DIRECTORY: &str =
     "target/android-functional-qualification/cohort-host";
 const QUALIFICATION_COHORT_PASS: &[u8] = b"FLUX_ANDROID_Q11_COHORT_PREFLIGHT_PASS\n";
@@ -513,11 +516,14 @@ fn qualification_ordered_cohort_preflight(
     device: &DeviceProfile,
     workspace: &Path,
 ) -> Result<(), String> {
-    let helper = build_qualification_cohort_helper(workspace)?;
+    let helper = build_qualification_cohort_helper(workspace)
+        .map_err(|_| QUALIFICATION_PREFLIGHT_HELPER_FAILURE.to_owned())?;
     let before = collect_qualification_xtables_pair(target, device)?;
-    revalidate_device(target, device, "between ordered-cohort snapshots")?;
+    revalidate_device(target, device, "between ordered-cohort snapshots")
+        .map_err(|_| QUALIFICATION_PREFLIGHT_HELPER_FAILURE.to_owned())?;
     let after = collect_qualification_xtables_pair(target, device)?;
-    revalidate_device(target, device, "after ordered-cohort snapshots")?;
+    revalidate_device(target, device, "after ordered-cohort snapshots")
+        .map_err(|_| QUALIFICATION_PREFLIGHT_HELPER_FAILURE.to_owned())?;
     let frame = android_qualification_cohort_frame::encode([
         &before.ipv4,
         &before.ipv6,
@@ -555,7 +561,8 @@ fn collect_qualification_xtables_family(
         ADB_COHORT_SNAPSHOT_TIMEOUT,
         QUALIFICATION_COHORT_CAPTURE_LIMIT,
         "collect read-only qualification xtables cohort snapshot",
-    )?;
+    )
+    .map_err(|_| QUALIFICATION_PREFLIGHT_HELPER_FAILURE.to_owned())?;
     validate_qualification_xtables_stdout(&output.stdout)?;
     let output = normalize_adb_shell_output(output)
         .map_err(|_| "qualification xtables cohort snapshot transport failed".to_owned())?;
@@ -658,7 +665,7 @@ fn classify_qualification_cohort_helper_output(output: &Output) -> Result<(), St
         return Ok(());
     }
     if !output.stderr.is_empty() {
-        return Err("qualification ordered-cohort preflight rejected at helper-failure".to_owned());
+        return Err(QUALIFICATION_PREFLIGHT_HELPER_FAILURE.to_owned());
     }
     let boundary = output.status.code().and_then(|code| {
         let boundary =
@@ -685,7 +692,9 @@ fn classify_qualification_cohort_helper_output(output: &Output) -> Result<(), St
             None
         }
     });
-    let boundary = boundary.as_deref().unwrap_or("helper-failure");
+    let boundary = boundary
+        .as_deref()
+        .unwrap_or(QUALIFICATION_PREFLIGHT_HELPER_FAILURE_LABEL);
     Err(format!(
         "qualification ordered-cohort preflight rejected at {boundary}"
     ))

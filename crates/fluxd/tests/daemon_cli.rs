@@ -166,59 +166,75 @@ fn json_status_comes_from_the_live_daemon_snapshot() {
 
     assert_eq!(exit, 0);
     assert!(stderr.is_empty());
-    assert_eq!(
-        String::from_utf8(stdout).expect("UTF-8 output"),
-        concat!(
-            "{\"daemon\":\"running\",",
-            "\"native_admission\":{\"state\":\"admitted\"},",
-            "\"capability_profile\":{",
-            "\"schema_version\":3,\"revision\":1,",
-            "\"boot_identity\":{\"status\":\"verified\",",
-            "\"value\":\"01234567-89ab-cdef-0123-456789abcdef\"},",
-            "\"device_identity\":{\"status\":\"unavailable\"},",
-            "\"kernel\":{\"release\":{\"status\":\"verified\",",
-            "\"value\":\"5.10.198-android12-9-gki\"},",
-            "\"version\":{\"status\":\"verified\",\"value\":\"5.10.198\"},",
-            "\"minimum\":\"5.10.0\",\"gate\":{\"status\":\"allowed\"}},",
-            "\"selinux\":{\"status\":\"verified\",\"value\":\"enforcing\"}},",
-            "\"control\":{\"revision\":18,\"administrative_state\":\"stopped\",",
-            "\"configuration_dirty\":true,\"in_flight\":null,",
-            "\"last_completed\":null},",
-            "\"runtime\":{\"revision\":7,\"phase\":\"repairing\",",
-            "\"capture\":\"detached\",",
-            "\"engine\":\"backing_off\",",
-            "\"verification\":\"functional_failed\",\"active_generation\":{",
-            "\"generation\":19,",
-            "\"capture_path_selection\":{\"request\":\"auto\",",
-            "\"selected\":\"xtables_tproxy\",",
-            "\"reason\":\"automatic_highest_ranked_qualified\",",
-            "\"candidates\":[{\"path\":\"nftables_tproxy\",",
-            "\"state\":\"unimplemented\",\"qualification_state\":\"unqualified\",",
-            "\"first_kernel_gap\":null},",
-            "{\"path\":\"xtables_tproxy\",\"state\":\"qualified\",",
-            "\"qualification_state\":\"qualified\",\"first_kernel_gap\":null},",
-            "{\"path\":\"managed_tun\",\"state\":\"unimplemented\",",
-            "\"qualification_state\":\"unqualified\",\"first_kernel_gap\":null}],",
-            "\"evidence_digest\":",
-            "\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"}},",
-            "\"latest_capture_path_decision\":{\"outcome\":\"selected\",",
-            "\"selection\":{\"request\":\"auto\",",
-            "\"selected\":\"xtables_tproxy\",",
-            "\"reason\":\"automatic_highest_ranked_qualified\",",
-            "\"candidates\":[{\"path\":\"nftables_tproxy\",",
-            "\"state\":\"unimplemented\",\"qualification_state\":\"unqualified\",",
-            "\"first_kernel_gap\":null},",
-            "{\"path\":\"xtables_tproxy\",\"state\":\"qualified\",",
-            "\"qualification_state\":\"qualified\",\"first_kernel_gap\":null},",
-            "{\"path\":\"managed_tun\",\"state\":\"unimplemented\",",
-            "\"qualification_state\":\"unqualified\",\"first_kernel_gap\":null}],",
-            "\"evidence_digest\":",
-            "\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"}},",
-            "\"last_error\":{\"operation\":\"maintain proxy engine\",",
-            "\"message\":\"owned child exited unexpectedly\",",
-            "\"recovery\":\"retry after bounded backoff\"}}}\n"
-        )
+    let expected = concat!(
+        "{\"daemon\":\"running\",",
+        "\"native_admission\":{\"state\":\"admitted\"},",
+        "\"capability_profile\":{",
+        "\"schema_version\":3,\"revision\":1,",
+        "\"boot_identity\":{\"status\":\"verified\",",
+        "\"value\":\"01234567-89ab-cdef-0123-456789abcdef\"},",
+        "\"device_identity\":{\"status\":\"unavailable\"},",
+        "\"kernel\":{\"release\":{\"status\":\"verified\",",
+        "\"value\":\"5.10.198-android12-9-gki\"},",
+        "\"version\":{\"status\":\"verified\",\"value\":\"5.10.198\"},",
+        "\"minimum\":\"5.10.0\",\"gate\":{\"status\":\"allowed\"}},",
+        "\"selinux\":{\"status\":\"verified\",\"value\":\"enforcing\"}},",
+        "\"control\":{\"revision\":18,\"administrative_state\":\"stopped\",",
+        "\"configuration_dirty\":true,\"in_flight\":null,",
+        "\"last_completed\":null},",
+        "\"runtime\":{\"revision\":7,\"phase\":\"repairing\",",
+        "\"capture\":\"detached\",",
+        "\"engine\":\"backing_off\",",
+        "\"verification\":\"functional_failed\",\"active_generation\":{",
+        "\"generation\":19,",
+        "\"capture_path_selection\":{\"request\":\"auto\",",
+        "\"selected\":\"xtables_tproxy\",",
+        "\"reason\":\"automatic_highest_ranked_qualified\",",
+        "\"candidates\":[{\"path\":\"nftables_tproxy\",",
+        "\"state\":\"unimplemented\",\"qualification_state\":\"unqualified\",",
+        "\"first_kernel_gap\":null},",
+        "{\"path\":\"xtables_tproxy\",\"state\":\"qualified\",",
+        "\"qualification_state\":\"qualified\",\"first_kernel_gap\":null},",
+        "{\"path\":\"managed_tun\",\"state\":\"unimplemented\",",
+        "\"qualification_state\":\"unqualified\",\"first_kernel_gap\":null}],",
+        "\"evidence_digest\":",
+        "\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"}},",
+        "\"latest_capture_path_decision\":{\"outcome\":\"selected\",",
+        "\"selection\":{\"request\":\"auto\",",
+        "\"selected\":\"xtables_tproxy\",",
+        "\"reason\":\"automatic_highest_ranked_qualified\",",
+        "\"candidates\":[{\"path\":\"nftables_tproxy\",",
+        "\"state\":\"unimplemented\",\"qualification_state\":\"unqualified\",",
+        "\"first_kernel_gap\":null},",
+        "{\"path\":\"xtables_tproxy\",\"state\":\"qualified\",",
+        "\"qualification_state\":\"qualified\",\"first_kernel_gap\":null},",
+        "{\"path\":\"managed_tun\",\"state\":\"unimplemented\",",
+        "\"qualification_state\":\"unqualified\",\"first_kernel_gap\":null}],",
+        "\"evidence_digest\":",
+        "\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"}},",
+        "\"last_error\":{\"operation\":\"maintain proxy engine\",",
+        "\"message\":\"owned child exited unexpectedly\",",
+        "\"recovery\":\"retry after bounded backoff\"}}}\n"
     );
+    let actual_document: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("JSON status output");
+    let expected_document: serde_json::Value =
+        serde_json::from_str(expected).expect("fixture JSON status output");
+    #[cfg(flux_android_qualification)]
+    {
+        let mut actual_document = actual_document;
+        assert_eq!(
+            actual_document["qualification_selector_mismatches"],
+            serde_json::json!(["device_identity"])
+        );
+        actual_document
+            .as_object_mut()
+            .expect("status document object")
+            .remove("qualification_selector_mismatches");
+        assert_eq!(actual_document, expected_document);
+    }
+    #[cfg(not(flux_android_qualification))]
+    assert_eq!(actual_document, expected_document);
     assert_eq!(
         source.calls(),
         0,

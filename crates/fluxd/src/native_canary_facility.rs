@@ -776,6 +776,53 @@ fn persist_facility_journal(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn persist_test_native_canary_facility_journal(
+    path: &Path,
+    owner_boot: &BootIdentity,
+    owner_namespace: NetworkNamespaceIdentity,
+    daemon_veth_name: &[u8],
+) -> Result<(), NativeCanaryFacilityError> {
+    let mut journal = test_facility_journal(owner_boot, owner_namespace);
+    journal.daemon_veth_name = daemon_veth_name.to_vec();
+    persist_facility_journal(path, &journal)
+}
+
+#[cfg(test)]
+fn test_facility_journal(
+    boot: &BootIdentity,
+    namespace: NetworkNamespaceIdentity,
+) -> NativeCanaryFacilityJournalRecord {
+    NativeCanaryFacilityJournalRecord {
+        schema_version: FACILITY_JOURNAL_SCHEMA_VERSION,
+        boot_identity: boot.as_str().to_owned(),
+        daemon_network_namespace_device: namespace.device(),
+        daemon_network_namespace_inode: namespace.inode(),
+        reviewed_policy_digest: [0x41; 32],
+        reviewed_policy_revision: 1,
+        daemon_veth_name: b"fxjcan0".to_vec(),
+        peer_veth_name: b"fxjcanp".to_vec(),
+        daemon_ipv4: [9, 254, 254, 252],
+        peer_ipv4: [9, 254, 254, 253],
+        daemon_ipv6: None,
+        peer_ipv6: None,
+        tcp_echo_port: 61_001,
+        udp_echo_port: 61_002,
+        dns_port: 61_003,
+        engine_uid: 20_002,
+        proxy_rule_priority: 4_000_000_000,
+        peer_rule_priority: 4_000_000_001,
+        proxy_capture_table: 4_000_000_002,
+        peer_table: 4_000_000_003,
+        peer_return_table: 254,
+        rule_protocol: 186,
+        route_protocol: 186,
+        route_metric: 1_031,
+        proxy_mark_value: 0x0200_0000,
+        proxy_mark_mask: 0x0300_0000,
+    }
+}
+
 pub(crate) fn recover_native_boot_canary_facility(
     journal_path: &Path,
     current_boot: &BootIdentity,
@@ -805,6 +852,19 @@ pub(crate) fn recover_native_boot_canary_facility(
         NativeCanaryFacilityError::platform("retire native canary facility journal", error)
     })?;
     Ok(())
+}
+
+pub(crate) fn native_boot_canary_facility_recovery_required(
+    journal_path: &Path,
+) -> Result<bool, NativeCanaryFacilityError> {
+    record_io::read(journal_path, FACILITY_JOURNAL_MAX_BYTES)
+        .map(|record| record.is_some())
+        .map_err(|error| {
+            NativeCanaryFacilityError::platform(
+                "inspect native canary facility recovery journal",
+                error,
+            )
+        })
 }
 
 fn validate_facility_journal(
@@ -3550,40 +3610,6 @@ mod tests {
             .publish_complete([], addresses)
             .expect("publish test address inventory")
             .clone()
-    }
-
-    fn test_facility_journal(
-        boot: &BootIdentity,
-        namespace: NetworkNamespaceIdentity,
-    ) -> NativeCanaryFacilityJournalRecord {
-        NativeCanaryFacilityJournalRecord {
-            schema_version: FACILITY_JOURNAL_SCHEMA_VERSION,
-            boot_identity: boot.as_str().to_owned(),
-            daemon_network_namespace_device: namespace.device(),
-            daemon_network_namespace_inode: namespace.inode(),
-            reviewed_policy_digest: [0x41; 32],
-            reviewed_policy_revision: 1,
-            daemon_veth_name: b"fxjcan0".to_vec(),
-            peer_veth_name: b"fxjcanp".to_vec(),
-            daemon_ipv4: [9, 254, 254, 252],
-            peer_ipv4: [9, 254, 254, 253],
-            daemon_ipv6: None,
-            peer_ipv6: None,
-            tcp_echo_port: 61_001,
-            udp_echo_port: 61_002,
-            dns_port: 61_003,
-            engine_uid: 20_002,
-            proxy_rule_priority: 4_000_000_000,
-            peer_rule_priority: 4_000_000_001,
-            proxy_capture_table: 4_000_000_002,
-            peer_table: 4_000_000_003,
-            peer_return_table: 254,
-            rule_protocol: 186,
-            route_protocol: 186,
-            route_metric: 1_031,
-            proxy_mark_value: 0x0200_0000,
-            proxy_mark_mask: 0x0300_0000,
-        }
     }
 
     fn attributes(bytes: &[u8]) -> Vec<(u16, &[u8])> {

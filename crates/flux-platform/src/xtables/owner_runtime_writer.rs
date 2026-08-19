@@ -203,15 +203,6 @@ impl NativeXtablesAndroidRuntime {
             .map_err(|source| {
                 NativeXtablesAndroidRuntimeError::new("configure recovery xtables restore", source)
             })?;
-        let tools = XtablesToolSetProcessAdapter::discover_standard(
-            &config.tool_root,
-            config.require_ipv6,
-            process,
-        )
-        .map_err(|source| {
-            NativeXtablesAndroidRuntimeError::new("discover recovery xtables tools", source)
-        })?;
-        let tool_digest = *tools.identity().digest().as_bytes();
         let durable = NativeXtablesDurableStore::new(&config.durable_root);
         let resolver =
             DurableNativeXtablesTargetResolver::open(durable.clone()).map_err(|source| {
@@ -232,6 +223,15 @@ impl NativeXtablesAndroidRuntime {
             }
             return Ok(None);
         };
+        let tools = XtablesToolSetProcessAdapter::discover_standard(
+            &config.tool_root,
+            config.require_ipv6,
+            process,
+        )
+        .map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("discover recovery xtables tools", source)
+        })?;
+        let tool_digest = *tools.identity().digest().as_bytes();
         let journal_identity = recovery_journal_identity(
             &durable,
             &current_boot_identity,
@@ -259,6 +259,37 @@ impl NativeXtablesAndroidRuntime {
         Ok(Some(NativeXtablesCaptureConverger::from_runtime_writer(
             writer,
         )))
+    }
+
+    /// Reports whether durable ownership material requires an identity-bound recovery pass.
+    ///
+    /// This inspection opens no process adapter and grants no mutation authority. Callers use it
+    /// to distinguish a safely empty runtime from residue that must not be ignored when the current
+    /// boot or namespace identity is unavailable.
+    pub fn recovery_required(
+        config: &NativeXtablesAndroidRuntimeConfig,
+    ) -> Result<bool, NativeXtablesAndroidRuntimeError> {
+        let durable = NativeXtablesDurableStore::new(&config.durable_root);
+        let resolver =
+            DurableNativeXtablesTargetResolver::open(durable.clone()).map_err(|source| {
+                NativeXtablesAndroidRuntimeError::new(
+                    "inspect native recovery target archive",
+                    source,
+                )
+            })?;
+        if resolver
+            .recovery_routing_audit()
+            .map_err(|source| {
+                NativeXtablesAndroidRuntimeError::new("inspect native recovery routing", source)
+            })?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let observed = durable.observe_read_only().map_err(|source| {
+            NativeXtablesAndroidRuntimeError::new("inspect native recovery state", source)
+        })?;
+        Ok(requires_archived_recovery_target(&observed))
     }
 
     #[must_use]
@@ -1824,11 +1855,122 @@ impl Error for NativeXtablesRuntimeWriterError {
 #[cfg(test)]
 mod admission_tests {
     use std::fs;
+    use std::num::{NonZeroU16, NonZeroU32};
 
-    use flux_core::{RpdbFamilyPlacement, RulePriority, RuleTableId};
+    use flux_core::{
+        AddressHostFamilySelection, CaptureApplicationMode, CaptureApplicationPolicy,
+        CaptureBypassPolicy, CaptureGroupId, CaptureInterfacePolicy, CaptureInterfaceSelector,
+        CaptureIpPrefix, CaptureProgramRequest, CaptureProtocolSet, CaptureTrafficScope,
+        CaptureUserId, EngineCredentials, FwmarkCandidate, GenerationId, InterfaceIndex,
+        NetworkAddressFamily, RouteProtocol, RouteTableId, RpdbFamilyPlacement, RulePriority,
+        RuleProtocol, RuleTableId, compile_capture_program,
+    };
     use tempfile::TempDir;
 
+    use crate::netlink::policy_routing::ManagedPolicyRoutingIdentity;
+    use crate::xtables::{
+        XtablesCaptureLoweringRequest, XtablesCaptureNamespace, XtablesLocalOutputRoutingSpec,
+        XtablesLocalOutputRoutingTarget, XtablesRestoreFamily, XtablesTproxyTarget,
+        lower_xtables_capture,
+    };
+
     use super::*;
+
+    const RECOVERY_TOOL_DIGEST: [u8; 32] = [0x44; 32];
+    const RECOVERY_MARK_MASK: u32 = 0x0060_0000;
+    const RECOVERY_PROXY_MARK: u32 = 0x0020_0000;
+    const RECOVERY_BYPASS_MARK: u32 = 0x0040_0000;
+
+    fn archived_recovery_target() -> NativeXtablesAdmittedTarget {
+        let artifacts = lower_recovery_artifacts();
+        let routing = [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6]
+            .into_iter()
+            .map(|family| {
+                let requirements = artifacts
+                    .pair(match family {
+                        NetworkAddressFamily::Ipv4 => XtablesRestoreFamily::Ipv4,
+                        NetworkAddressFamily::Ipv6 => XtablesRestoreFamily::Ipv6,
+                    })
+                    .and_then(|pair| pair.local_output())
+                    .expect("dual-stack recovery fixture has local-OUTPUT routing");
+                ManagedPolicyRoutingIdentity::bind(
+                    requirements.routing(),
+                    InterfaceIndex::new(1).expect("fixture loopback index"),
+                )
+                .expect("fixture routing identity")
+            })
+            .collect::<Vec<_>>();
+        let routing_audit = NativePolicyRoutingAudit::new(
+            routing
+                .clone()
+                .try_into()
+                .expect("dual-stack recovery audit identities"),
+        )
+        .expect("fixture routing audit");
+        NativeXtablesAdmittedTarget::admit_for_test(
+            artifacts,
+            routing,
+            routing_audit,
+            RECOVERY_TOOL_DIGEST,
+        )
+        .expect("valid archived recovery target")
+    }
+
+    fn lower_recovery_artifacts() -> XtablesCaptureArtifactSet {
+        let families = AddressHostFamilySelection::DualStack;
+        let scope = CaptureTrafficScope::new(families, true, false).expect("fixture scope");
+        let program = compile_capture_program(CaptureProgramRequest::new(
+            scope,
+            EngineCredentials::new(
+                CaptureUserId::new(1_000).expect("fixture uid"),
+                CaptureGroupId::new(1_000).expect("fixture gid"),
+            ),
+            CaptureBypassPolicy::new(std::iter::empty::<CaptureIpPrefix>())
+                .expect("fixture bypass policy"),
+            None,
+            CaptureInterfacePolicy::new(
+                std::iter::empty::<CaptureInterfaceSelector>(),
+                std::iter::empty::<CaptureInterfaceSelector>(),
+                std::iter::empty::<CaptureInterfaceSelector>(),
+            )
+            .expect("fixture interface policy"),
+            CaptureApplicationPolicy::new(
+                CaptureApplicationMode::All,
+                std::iter::empty::<CaptureUserId>(),
+            )
+            .expect("fixture application policy"),
+            CaptureProtocolSet::TCP_AND_UDP,
+        ))
+        .expect("fixture capture program");
+        let routing_target = || {
+            XtablesLocalOutputRoutingTarget::new(
+                RulePriority::from_raw(30_999),
+                RouteTableId::from_raw(20_253),
+                NonZeroU32::new(1_024).expect("fixture route metric"),
+                RouteProtocol::from_raw(4),
+                RuleProtocol::from_raw(99),
+            )
+            .expect("fixture routing target")
+        };
+        let routing =
+            XtablesLocalOutputRoutingSpec::new(Some(routing_target()), Some(routing_target()))
+                .expect("fixture routing spec");
+        let request = XtablesCaptureLoweringRequest::new(
+            program.program(),
+            XtablesCaptureNamespace::new(GenerationId::new(7).expect("fixture generation")),
+            XtablesTproxyTarget::new(
+                NonZeroU16::new(1_536).expect("fixture proxy port"),
+                FwmarkCandidate::new(
+                    RECOVERY_MARK_MASK,
+                    RECOVERY_PROXY_MARK,
+                    RECOVERY_BYPASS_MARK,
+                )
+                .expect("fixture mark candidate"),
+            ),
+        )
+        .with_local_output_routing(routing);
+        lower_xtables_capture(request).expect("fixture xtables artifacts")
+    }
 
     #[test]
     fn canonical_routing_target_pins_platform_owned_identity_constants() {
@@ -1857,5 +1999,83 @@ mod admission_tests {
         let observed = store.observe_read_only().expect("observe durable root");
 
         assert!(requires_archived_recovery_target(&observed));
+    }
+
+    #[test]
+    fn empty_recovery_state_does_not_require_native_tools() {
+        let directory = TempDir::new().expect("temporary recovery fixture");
+        let recovery = NativeXtablesAndroidRuntime::compose_recovery(
+            NativeXtablesAndroidRuntimeConfig::new(
+                directory.path().join("missing-tools"),
+                directory.path().join("missing-durable-root"),
+                true,
+                2,
+                Duration::from_secs(5),
+            ),
+            BootIdentity::parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                .expect("fixture boot identity"),
+            NetworkNamespaceIdentity::new(9, 10).expect("fixture network namespace"),
+        )
+        .expect("empty durable state needs no process adapter");
+
+        assert!(recovery.is_none());
+    }
+
+    #[test]
+    fn durable_residue_requires_identity_bound_recovery_without_opening_tools() {
+        let directory = TempDir::new().expect("temporary recovery fixture");
+        let durable_root = directory.path().join("durable");
+        fs::create_dir(&durable_root).expect("create durable root");
+        let store = NativeXtablesDurableStore::new(&durable_root);
+        fs::write(store.attempt_path(), b"opaque attempt residue").expect("write attempt residue");
+        let config = NativeXtablesAndroidRuntimeConfig::new(
+            directory.path().join("missing-tools"),
+            durable_root,
+            true,
+            2,
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            NativeXtablesAndroidRuntime::recovery_required(&config)
+                .expect("read-only recovery inspection")
+        );
+    }
+
+    #[test]
+    fn archived_residue_with_missing_android_tools_fails_recovery_closed() {
+        let directory = TempDir::new().expect("temporary recovery fixture");
+        let durable_root = directory.path().join("durable");
+        fs::create_dir(&durable_root).expect("create durable root");
+        let store = NativeXtablesDurableStore::new(&durable_root);
+        let resolver =
+            DurableNativeXtablesTargetResolver::open(store).expect("open target archive");
+        resolver
+            .stage(archived_recovery_target())
+            .expect("persist exact target archive");
+        let config = NativeXtablesAndroidRuntimeConfig::new(
+            directory.path().join("system/bin"),
+            durable_root,
+            true,
+            2,
+            Duration::from_secs(5),
+        );
+
+        let error = match NativeXtablesAndroidRuntime::compose_recovery(
+            config,
+            BootIdentity::parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                .expect("fixture boot identity"),
+            NetworkNamespaceIdentity::new(9, 10).expect("fixture network namespace"),
+        ) {
+            Ok(_) => panic!("durable residue cannot skip missing Android tools"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("discover recovery xtables tools"),
+            "unexpected recovery error: {error}"
+        );
     }
 }

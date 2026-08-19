@@ -264,6 +264,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             require_no_arguments(&arguments)?;
             test_parser_fuzz_smoke()
         }
+        "test-qualification-cfg" => {
+            require_no_arguments(&arguments)?;
+            test_qualification_cfg()
+        }
         sing_box_producer::COMMAND => sing_box_producer::run(&arguments),
         android_canary::COMMAND => android_canary::run(android_canary::parse_options(&arguments)?),
         android_production_canary::COMMAND => {
@@ -288,11 +292,13 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             cargo(["fmt", "--all", "--", "--check"], &[])?;
             cargo(["check", "--workspace", "--all-targets"], &[])?;
             cargo(["test", "--workspace"], &[])?;
+            test_qualification_cfg()?;
             cargo(
                 [
                     "clippy",
                     "--workspace",
                     "--all-targets",
+                    "--all-features",
                     "--",
                     "-D",
                     "warnings",
@@ -419,6 +425,31 @@ fn test_parser_fuzz_smoke() -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+fn test_qualification_cfg() -> Result<(), String> {
+    let mut rustflags = env::var_os("RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        rustflags.push(" ");
+    }
+    rustflags.push("--cfg flux_android_qualification");
+    let envs = [("RUSTFLAGS", rustflags.as_os_str())];
+
+    cargo_scrubbed_with_env(["check", "-p", "flux-core", "--all-targets"], &envs)?;
+    cargo_scrubbed_with_env(["check", "-p", "fluxd", "--all-targets"], &envs)?;
+    cargo_scrubbed_with_env(["test", "-p", "flux-core", "--all-targets"], &envs)?;
+    cargo_scrubbed_with_env(["test", "-p", "fluxd", "--all-targets"], &envs)?;
+    cargo_scrubbed_with_env(
+        [
+            "test",
+            "-p",
+            "xtask",
+            "--bin",
+            "android-qualification-fwmark-cohort",
+            "--all-targets",
+        ],
+        &envs,
+    )
 }
 
 fn test_linux_canary(test_name: &str) -> Result<(), String> {
@@ -2598,6 +2629,7 @@ fn help_text() -> String {
            test-functional-canary-linux-output-preflight  Preflight distinct local-OUTPUT credentials (no traffic)\n\
            test-native-composition-linux  Run the single-owner native lifecycle and recovery checkpoint\n\
            test-parser-fuzz-smoke  Run bounded deterministic parser no-panic smoke tests\n\
+           test-qualification-cfg  Compile and test the qualification-only Rust surface\n\
            build-sing-box-producer  Validate, patch, test, and reproducibly build pinned Sing-Box; requires --source DIR --go-sdk FILE --target linux-amd64|android-arm64 --output FILE\n\
            {android_canary_command}  Cross-build and run the exact checkpoint on one explicit rooted ARM64 or x86_64 Android serial; --producer FILE adds the manifest-bound ARM64 report attempt\n\
            {android_production_canary_command}  Run the exact non-shipping production-canary path on one explicit rooted ARM64 serial; requires --producer FILE --run-manifest FILE and --subscription-file FILE|--subscription-stdin\n\

@@ -16,6 +16,7 @@ use flux_platform::{
 };
 
 use crate::daemon::DaemonOptions;
+use crate::native_canary_facility::recover_native_boot_canary_facility;
 use crate::runtime_layout::{RuntimeLayout, RuntimeLayoutError};
 
 pub const OFFLINE_CLEANUP_BUSY_EXIT: i32 = 75;
@@ -192,6 +193,12 @@ where
     pub(crate) const fn new(convergence: C) -> Self {
         Self { convergence }
     }
+
+    #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
+    #[must_use]
+    pub(crate) fn into_convergence(self) -> C {
+        self.convergence
+    }
 }
 
 impl<C> OfflineRecovery for NativeOfflineRecovery<C>
@@ -361,7 +368,14 @@ fn run_native_offline_cleanup(
         })?
         .network_namespace();
     let config = options.native_xtables_runtime_config(layout);
+    let facility_journal_path = layout.run_path().join("canary-facility.owner");
     let recovery = while_holding_daemon_lease(&options.daemon_lease_path, || {
+        recover_native_boot_canary_facility(
+            &facility_journal_path,
+            &boot_identity,
+            network_namespace,
+        )
+        .map_err(|source| NativeOfflineBootstrapError::FacilityRecovery(Box::new(source)))?;
         let convergence =
             NativeXtablesAndroidRuntime::compose_recovery(config, boot_identity, network_namespace)
                 .map_err(|source| NativeOfflineBootstrapError::Composition(Box::new(source)))?;
@@ -384,6 +398,7 @@ fn run_native_offline_cleanup(
 enum NativeOfflineBootstrapError {
     MissingBootIdentity { observation: ObservationKind },
     MissingDeviceIdentity { observation: ObservationKind },
+    FacilityRecovery(Box<dyn Error + Send + Sync>),
     Composition(Box<dyn Error + Send + Sync>),
     Recovery(NativeOfflineRecoveryError),
 }
@@ -399,6 +414,9 @@ impl fmt::Display for NativeOfflineBootstrapError {
                 formatter,
                 "native offline cleanup requires a verified device identity, found {observation:?}"
             ),
+            Self::FacilityRecovery(source) => {
+                write!(formatter, "recover native canary facility: {source}")
+            }
             Self::Composition(source) => write!(formatter, "compose native recovery: {source}"),
             Self::Recovery(source) => source.fmt(formatter),
         }
@@ -408,7 +426,7 @@ impl fmt::Display for NativeOfflineBootstrapError {
 impl Error for NativeOfflineBootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Composition(source) => Some(source.as_ref()),
+            Self::FacilityRecovery(source) | Self::Composition(source) => Some(source.as_ref()),
             Self::Recovery(source) => Some(source),
             Self::MissingBootIdentity { .. } | Self::MissingDeviceIdentity { .. } => None,
         }
@@ -744,9 +762,72 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::{Arc, Mutex};
 
+    use flux_core::{BootIdentity, NetworkNamespaceIdentity};
+    use flux_testkit::CapabilityProfileFixture;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::native_canary_facility::persist_test_native_canary_facility_journal;
+
+    #[test]
+    fn native_cleanup_retires_an_exact_absent_facility_journal() {
+        let fixture = Fixture::new();
+        let layout = RuntimeLayout::bootstrap(&fixture.options.runtime_root)
+            .expect("bootstrap native cleanup layout");
+        let profile = CapabilityProfileFixture::device_qualified();
+        let boot = profile
+            .boot_identity()
+            .verified()
+            .expect("fixture boot identity");
+        let namespace = profile
+            .device_identity()
+            .verified()
+            .expect("fixture device identity")
+            .network_namespace();
+        let journal = layout.run_path().join("canary-facility.owner");
+        persist_test_native_canary_facility_journal(&journal, boot, namespace, b"fxjcan0")
+            .expect("persist exact-absent facility journal");
+
+        let report = run_native_offline_cleanup(&fixture.options, &layout, &profile)
+            .expect("native cleanup proves exact facility absence");
+
+        assert_eq!(report.disposition(), OfflineCleanupDisposition::Complete);
+        assert!(
+            !journal.exists(),
+            "proven-absent facility journal is retired"
+        );
+    }
+
+    #[test]
+    fn native_cleanup_retains_an_uncertain_foreign_facility_journal() {
+        let fixture = Fixture::new();
+        let layout = RuntimeLayout::bootstrap(&fixture.options.runtime_root)
+            .expect("bootstrap native cleanup layout");
+        let profile = CapabilityProfileFixture::device_qualified();
+        let journal = layout.run_path().join("canary-facility.owner");
+        let foreign_boot = BootIdentity::parse("11223344-5566-4788-99aa-bbccddeeff00")
+            .expect("foreign boot identity");
+        let foreign_namespace =
+            NetworkNamespaceIdentity::new(81, 82).expect("foreign network namespace");
+        persist_test_native_canary_facility_journal(
+            &journal,
+            &foreign_boot,
+            foreign_namespace,
+            b"lo",
+        )
+        .expect("persist uncertain foreign facility journal");
+
+        let error = run_native_offline_cleanup(&fixture.options, &layout, &profile)
+            .expect_err("live foreign interface prevents an absence proof");
+
+        assert_eq!(error.kind(), OfflineCleanupErrorKind::Recovery);
+        assert!(
+            journal.exists(),
+            "uncertain cleanup authority remains durable"
+        );
+        DaemonLease::acquire(&fixture.options.daemon_lease_path)
+            .expect("failed facility recovery releases the daemon lease");
+    }
 
     #[test]
     fn daemon_and_offline_cleanup_are_mutually_exclusive() {

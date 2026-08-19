@@ -17,14 +17,14 @@ use std::time::{Duration, SystemTime};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::fs::MetadataExt;
 
-use flux_core::{
-    AdministrativeState, CapabilityProfileSource, ConfigError, ConfigurationChangeClient,
-    ConfigurationChangeReport, ControlClient, ControlError, ControlObservation,
-    ControlObservationIngress, ControlSnapshot, ControlSnapshotSource, FluxConfig, OperationReport,
-    Reason, RuntimeControl, RuntimeDispatcher, RuntimeIntent,
-};
 #[cfg(all(test, feature = "native-composition-test", target_os = "linux"))]
-use flux_core::{CapabilityProfile, FwmarkCandidate};
+use flux_core::FwmarkCandidate;
+use flux_core::{
+    AdministrativeState, CapabilityProfile, CapabilityProfileSource, ConfigError,
+    ConfigurationChangeClient, ConfigurationChangeReport, ControlClient, ControlError,
+    ControlObservation, ControlObservationIngress, ControlSnapshot, ControlSnapshotSource,
+    FluxConfig, OperationReport, Reason, RuntimeControl, RuntimeDispatcher, RuntimeIntent,
+};
 use flux_platform::{
     CapabilityProfilePaths, DaemonReactor, FileObservationBatch, FileObservationPaths,
     NativeCaptureTargetIdentity, NativeXtablesAndroidRuntime, NativeXtablesAndroidRuntimeConfig,
@@ -45,7 +45,7 @@ use crate::native_admission::{
 };
 use crate::native_canary_facility::{
     NativeCanaryRuntimeAuthorities, create_native_boot_canary_facility,
-    recover_native_boot_canary_facility,
+    native_boot_canary_facility_recovery_required, recover_native_boot_canary_facility,
 };
 #[cfg(any(test, flux_android_qualification))]
 use crate::native_generation_source::SystemAndroidGenerationPlanningFailureClass;
@@ -236,6 +236,7 @@ where
             .map_err(ControlSocketError::Reactor)
             .map_err(DaemonError::Socket)?;
         let profile = Arc::new(profile_source.collect_capability_profile());
+        platform.recover_before_admission(&profile, &options, &runtime_layout)?;
         let pending_admission = match NativeAdmissionCandidate::evaluate(&profile) {
             Err(reason) => PendingNativeAdmission::Rejected(reason),
             Ok(candidate) => {
@@ -259,20 +260,6 @@ where
             _ => None,
         };
         let facility_journal_path = runtime_layout.run_path().join("canary-facility.owner");
-        let pending_admission = match pending_admission {
-            PendingNativeAdmission::Configured(configured) => {
-                recover_native_boot_canary_facility(
-                    &facility_journal_path,
-                    configured.boot_identity(),
-                    configured.network_namespace(),
-                )
-                .map_err(|source| {
-                    DaemonError::native("recover native boot canary facility", source)
-                })?;
-                PendingNativeAdmission::Configured(configured)
-            }
-            other => other,
-        };
         let (pending_admission, boot_canary_facility) = match pending_admission {
             PendingNativeAdmission::Configured(configured)
                 if configured.requires_functional_canary() =>
@@ -398,7 +385,6 @@ where
                             network_inventory_refresh.ok_or(DaemonError::Invariant(
                                 "admitted native runtime omitted its inventory refresh authority",
                             ))?;
-                        platform.recover(&admitted, &options, &runtime_layout)?;
                         let platform = platform.compose(&admitted, &options, &runtime_layout)?;
                         (
                             NativeAdmissionState::Admitted,
@@ -494,9 +480,9 @@ trait NativeDaemonPlatform {
     type Planning: NativeGenerationPlanningSource;
     type Admission: NativeGenerationTargetAdmission<Target = NativeXtablesCaptureTarget>;
 
-    fn recover(
+    fn recover_before_admission(
         &mut self,
-        admitted: &AdmittedNativeRuntime,
+        profile: &CapabilityProfile,
         options: &DaemonOptions,
         runtime_layout: &RuntimeLayout,
     ) -> Result<(), DaemonError>;
@@ -545,37 +531,93 @@ impl DaemonComposition {
     }
 }
 
-fn recover_native_startup(
-    admitted: &AdmittedNativeRuntime,
+/// Recover durable native state before evaluating the next product configuration. A rejected or
+/// malformed admission must not prevent cleanup of capture state left by a prior daemon process.
+/// Missing capability identities remain an admission failure boundary; without a verified owner
+/// domain it is safer to avoid guessing which durable state may be reclaimed.
+fn recover_native_startup_before_admission(
+    profile: &CapabilityProfile,
     options: &DaemonOptions,
     runtime_layout: &RuntimeLayout,
 ) -> Result<(), DaemonError> {
+    let facility_journal_path = runtime_layout.run_path().join("canary-facility.owner");
     let platform_config = options.native_xtables_runtime_config(runtime_layout);
+    let boot_identity = profile.boot_identity().verified().cloned();
+    let device_identity = profile.device_identity().verified();
+    let (Some(boot_identity), Some(device_identity)) = (boot_identity, device_identity) else {
+        let facility_recovery_required = native_boot_canary_facility_recovery_required(
+            &facility_journal_path,
+        )
+        .map_err(|source| DaemonError::native("inspect native boot canary recovery", source))?;
+        let capture_recovery_required =
+            NativeXtablesAndroidRuntime::recovery_required(&platform_config).map_err(|source| {
+                DaemonError::native("inspect pre-admission native recovery", source)
+            })?;
+        if facility_recovery_required || capture_recovery_required {
+            return Err(DaemonError::native(
+                "recover durable native state without verified identity",
+                MissingNativeRecoveryIdentity {
+                    boot_identity: profile.boot_identity().kind(),
+                    device_identity: profile.device_identity().kind(),
+                    facility_recovery_required,
+                    capture_recovery_required,
+                },
+            ));
+        }
+        return Ok(());
+    };
+    let network_namespace = device_identity.network_namespace();
+    recover_native_boot_canary_facility(&facility_journal_path, &boot_identity, network_namespace)
+        .map_err(|source| DaemonError::native("recover native boot canary facility", source))?;
+
     if let Some(convergence) = NativeXtablesAndroidRuntime::compose_recovery(
         platform_config,
-        admitted.boot_identity.clone(),
-        admitted.network_namespace,
+        boot_identity,
+        network_namespace,
     )
-    .map_err(|source| DaemonError::native("compose native startup recovery", source))?
+    .map_err(|source| DaemonError::native("compose pre-admission native recovery", source))?
     {
         NativeOfflineRecovery::new(convergence)
             .recover_stopped()
-            .map_err(|source| DaemonError::native("recover native startup state", source))?;
+            .map_err(|source| DaemonError::native("recover pre-admission native state", source))?;
     }
     Ok(())
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MissingNativeRecoveryIdentity {
+    boot_identity: flux_core::ObservationKind,
+    device_identity: flux_core::ObservationKind,
+    facility_recovery_required: bool,
+    capture_recovery_required: bool,
+}
+
+impl fmt::Display for MissingNativeRecoveryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "durable native recovery is pending but its owner domain is unavailable (boot={:?}, device={:?}, facility_pending={}, capture_pending={})",
+            self.boot_identity,
+            self.device_identity,
+            self.facility_recovery_required,
+            self.capture_recovery_required,
+        )
+    }
+}
+
+impl Error for MissingNativeRecoveryIdentity {}
 
 impl NativeDaemonPlatform for AndroidNativeDaemonPlatform {
     type Planning = SystemAndroidGenerationPlanningSource;
     type Admission = PlatformNativeGenerationTargetAdmission;
 
-    fn recover(
+    fn recover_before_admission(
         &mut self,
-        admitted: &AdmittedNativeRuntime,
+        profile: &CapabilityProfile,
         options: &DaemonOptions,
         runtime_layout: &RuntimeLayout,
     ) -> Result<(), DaemonError> {
-        recover_native_startup(admitted, options, runtime_layout)
+        recover_native_startup_before_admission(profile, options, runtime_layout)
     }
 
     fn compose(
@@ -586,6 +628,10 @@ impl NativeDaemonPlatform for AndroidNativeDaemonPlatform {
     ) -> Result<NativeDaemonPlatformParts<Self::Planning, Self::Admission>, DaemonError> {
         let planning =
             SystemAndroidGenerationPlanningSource::for_current_daemon(runtime_layout.run_path());
+        let mut planning = planning;
+        if let Some(candidate) = admitted.reviewed_mark_candidate {
+            planning = planning.with_reviewed_mark_candidate(candidate);
+        }
         let mut planning = match admitted.reviewed_canary_facility_planning.as_ref() {
             Some((policy, selection)) => planning.with_reviewed_canary_facility(
                 policy.clone(),
@@ -713,17 +759,13 @@ impl NativeDaemonPlatform for LinuxNativeCompositionDaemonPlatform {
     type Planning = LinuxNativeCompositionPlanningSource;
     type Admission = PlatformNativeLinuxCompositionTestAdmission;
 
-    fn recover(
+    fn recover_before_admission(
         &mut self,
-        admitted: &AdmittedNativeRuntime,
+        _profile: &CapabilityProfile,
         _options: &DaemonOptions,
         _runtime_layout: &RuntimeLayout,
     ) -> Result<(), DaemonError> {
-        let (_admission, convergence) = self.platform_parts(admitted)?;
-        NativeOfflineRecovery::new(convergence)
-            .recover_stopped()
-            .map(|_| ())
-            .map_err(|source| DaemonError::native("recover Linux test startup state", source))
+        Ok(())
     }
 
     fn compose(
@@ -733,6 +775,11 @@ impl NativeDaemonPlatform for LinuxNativeCompositionDaemonPlatform {
         _runtime_layout: &RuntimeLayout,
     ) -> Result<NativeDaemonPlatformParts<Self::Planning, Self::Admission>, DaemonError> {
         let (admission, convergence) = self.platform_parts(admitted)?;
+        let mut recovery = NativeOfflineRecovery::new(convergence);
+        recovery
+            .recover_stopped()
+            .map_err(|source| DaemonError::native("recover Linux test startup state", source))?;
+        let convergence = recovery.into_convergence();
         let planning = LinuxNativeCompositionPlanningSource::new(
             self.capability_profile.clone(),
             admitted.network_namespace,

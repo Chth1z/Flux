@@ -185,6 +185,7 @@ const SYSTEM_ANDROID_PRIVATE_TABLE: u32 = 20_253;
 /// Production Android planning adapter backed by the complete system census coordinator.
 pub(crate) struct SystemAndroidGenerationPlanningSource {
     census: SystemAndroidFwmarkCensusSource,
+    reviewed_mark_candidate: Option<FwmarkCandidate>,
     reviewed_canary_facility: Option<(
         ReviewedCanaryFacilityPolicy,
         ReviewedCanaryFacilitySelection,
@@ -198,9 +199,18 @@ impl SystemAndroidGenerationPlanningSource {
     pub(crate) fn for_current_daemon(durable_root: impl AsRef<Path>) -> Self {
         Self {
             census: SystemAndroidFwmarkCensusSource::for_current_daemon(durable_root),
+            reviewed_mark_candidate: None,
             reviewed_canary_facility: None,
             initial: None,
         }
+    }
+
+    /// Binds an independently reviewed mark candidate even when no functional-canary facility is
+    /// available. Mark authority and canary-facility authority are separate admission decisions.
+    #[must_use]
+    pub(crate) fn with_reviewed_mark_candidate(mut self, candidate: FwmarkCandidate) -> Self {
+        self.reviewed_mark_candidate = Some(candidate);
+        self
     }
 
     #[must_use]
@@ -210,6 +220,7 @@ impl SystemAndroidGenerationPlanningSource {
         selection: ReviewedCanaryFacilitySelection,
         candidate: FwmarkCandidate,
     ) -> Self {
+        self.reviewed_mark_candidate = Some(candidate);
         self.reviewed_canary_facility = Some((policy, selection, candidate));
         self
     }
@@ -242,6 +253,10 @@ impl SystemAndroidGenerationPlanningSource {
         desired_state: &FluxConfig,
         inventory: Arc<NetworkInventory>,
     ) -> Result<GenerationPlanningAuthority, SystemAndroidGenerationPlanningError> {
+        // The census and placement pipeline can perform bounded external observations. Age the
+        // resulting Capture Path evidence from the beginning of that transaction so time spent
+        // collecting facts never extends the five-minute safety lease.
+        let planning_started_at = Instant::now();
         if !desired_state
             .capture()
             .scope()
@@ -256,17 +271,19 @@ impl SystemAndroidGenerationPlanningSource {
         {
             return Err(SystemAndroidGenerationPlanningError::ForwardedIngressUnsupported);
         }
-        let candidate = self.reviewed_canary_facility.as_ref().map_or_else(
-            || {
-                FwmarkCandidate::new(
-                    SYSTEM_ANDROID_CANDIDATE_MASK,
-                    SYSTEM_ANDROID_PROXY_VALUE,
-                    SYSTEM_ANDROID_BYPASS_VALUE,
-                )
-                .expect("compiled Android mark candidate is structurally valid")
-            },
-            |(_, _, candidate)| *candidate,
-        );
+        let candidate = self.reviewed_mark_candidate.unwrap_or_else(|| {
+            self.reviewed_canary_facility.as_ref().map_or_else(
+                || {
+                    FwmarkCandidate::new(
+                        SYSTEM_ANDROID_CANDIDATE_MASK,
+                        SYSTEM_ANDROID_PROXY_VALUE,
+                        SYSTEM_ANDROID_BYPASS_VALUE,
+                    )
+                    .expect("compiled Android mark candidate is structurally valid")
+                },
+                |(_, _, candidate)| *candidate,
+            )
+        });
         let topology = AndroidTproxyTopologyScopeRequest::new(
             AndroidTproxyRoutingShape::PreMarkAddressHostSet,
             [
@@ -375,7 +392,7 @@ impl SystemAndroidGenerationPlanningSource {
                     )
                 })?,
         };
-        GenerationPlanningAuthority::android(evidence, Instant::now(), Some(placement))
+        GenerationPlanningAuthority::android(evidence, planning_started_at, Some(placement))
             .map_err(SystemAndroidGenerationPlanningError::CapturePathEvidence)
     }
 }

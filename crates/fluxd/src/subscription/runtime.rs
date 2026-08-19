@@ -737,6 +737,7 @@ enum RefreshTrigger {
 }
 
 enum RefreshWorkerRequest {
+    Shutdown,
     Refresh {
         trigger: RefreshTrigger,
         completion:
@@ -929,6 +930,7 @@ impl SubscriptionRefreshClient {
         let _worker = thread::spawn(move || {
             while let Ok(request) = requests.recv() {
                 match request {
+                    RefreshWorkerRequest::Shutdown => break,
                     RefreshWorkerRequest::Refresh { completion, .. } => {
                         if let Some(completion) = completion {
                             let _ = completion.send(refresh());
@@ -1191,6 +1193,9 @@ impl SubscriptionRefreshRuntime {
 impl Drop for SubscriptionRefreshRuntime {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
+        // The worker blocks on the request channel while optional subscription refresh is idle.
+        // Wake it explicitly so dropping a disabled runtime never relies on a periodic poll.
+        let _ = self.client.request.try_send(RefreshWorkerRequest::Shutdown);
         while let Ok(completion) = self.completion.try_recv() {
             completion.respond(SubscriptionRefreshDecision::Reject(
                 SubscriptionRefreshError::activation(
@@ -1232,13 +1237,16 @@ fn refresh_worker_loop(
     stopping: &AtomicBool,
     acknowledgement_timeout: Duration,
 ) {
-    while !stopping.load(Ordering::Acquire) {
-        let request = match request_rx.recv_timeout(WORKER_POLL_INTERVAL) {
+    loop {
+        let request = match request_rx.recv() {
             Ok(request) => request,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvError) => break,
         };
+        if stopping.load(Ordering::Acquire) && !matches!(&request, RefreshWorkerRequest::Shutdown) {
+            break;
+        }
         let (trigger, completion) = match request {
+            RefreshWorkerRequest::Shutdown => break,
             RefreshWorkerRequest::Refresh {
                 trigger,
                 completion,

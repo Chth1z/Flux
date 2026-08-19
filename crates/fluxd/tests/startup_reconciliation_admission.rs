@@ -16,13 +16,17 @@ use flux_core::{
 };
 use flux_testkit::{CapabilityProfileFixture, StaticCapabilityProfileSource};
 use fluxd::{
-    DaemonOptions, NativeAdmissionRejection, NativeAdmissionState, SocketControlClient, run_daemon,
+    DaemonError, DaemonOptions, NativeAdmissionRejection, NativeAdmissionState,
+    SocketControlClient, run_daemon,
 };
 use tempfile::tempdir;
 
 const PACKAGED_CONFIG: &str = include_str!("../../../conf/flux.toml");
 const UNSUPPORTED_HELPER_ROOT: &str = "FLUXD_TEST_UNSUPPORTED_HELPER_ROOT";
 const SAFETY_REJECTION_HELPER_ROOT: &str = "FLUXD_TEST_SAFETY_REJECTION_HELPER_ROOT";
+const INVALID_CONFIG_RECOVERY_HELPER_ROOT: &str = "FLUXD_TEST_INVALID_CONFIG_RECOVERY_HELPER_ROOT";
+const MISSING_IDENTITY_RECOVERY_HELPER_ROOT: &str =
+    "FLUXD_TEST_MISSING_IDENTITY_RECOVERY_HELPER_ROOT";
 
 #[test]
 fn packaged_default_config_matches_the_strict_product_schema() {
@@ -102,8 +106,12 @@ fn configured_safety_rejection_remains_online_and_read_only_until_sigterm() {
     let directory = tempdir().expect("temporary directory");
     let root = directory.path().join("flux");
     let socket_path = root.join("run/fluxd.sock");
+    let facility_journal = root.join("run/canary-facility.owner");
+    fs::create_dir_all(root.join("run")).expect("create run directory");
     fs::create_dir_all(root.join("conf")).expect("create config directory");
     fs::write(root.join("conf/flux.toml"), PACKAGED_CONFIG).expect("write packaged configuration");
+    fs::write(&facility_journal, exact_absent_facility_journal())
+        .expect("write prior facility journal");
 
     let mut child = KillOnDrop(
         daemon_helper_command(
@@ -118,6 +126,10 @@ fn configured_safety_rejection_remains_online_and_read_only_until_sigterm() {
     wait_for_socket(child.child_mut(), &socket_path);
     let client = SocketControlClient::new(&socket_path);
     let snapshot = client.status().expect("rejected daemon remains queryable");
+    assert!(
+        !facility_journal.exists(),
+        "read-only admission follows exact prior-state recovery"
+    );
     assert_eq!(
         snapshot.native_admission,
         NativeAdmissionState::Rejected(NativeAdmissionRejection::AndroidVpnPolicyUnavailable)
@@ -145,6 +157,58 @@ fn configured_safety_rejection_remains_online_and_read_only_until_sigterm() {
 }
 
 #[test]
+fn malformed_configuration_cannot_skip_prior_facility_recovery() {
+    let directory = tempdir().expect("temporary directory");
+    let root = directory.path().join("flux");
+    let run = root.join("run");
+    let conf = root.join("conf");
+    let journal = run.join("canary-facility.owner");
+    fs::create_dir_all(&run).expect("create run directory");
+    fs::create_dir_all(&conf).expect("create config directory");
+    fs::write(conf.join("flux.toml"), "this is not valid TOML = [\n")
+        .expect("write malformed configuration");
+    fs::write(&journal, exact_absent_facility_journal()).expect("write prior facility journal");
+
+    let status = daemon_helper_command(
+        "malformed_configuration_recovery_daemon_helper",
+        INVALID_CONFIG_RECOVERY_HELPER_ROOT,
+        &root,
+    )
+    .status()
+    .expect("run malformed-config recovery helper");
+
+    assert!(status.success(), "recovery helper failed: {status}");
+    assert!(
+        !journal.exists(),
+        "pre-admission recovery must retire proven-absent prior state"
+    );
+}
+
+#[test]
+fn unverifiable_owner_identity_cannot_hide_durable_recovery_residue() {
+    let directory = tempdir().expect("temporary directory");
+    let root = directory.path().join("flux");
+    let run = root.join("run");
+    let journal = run.join("canary-facility.owner");
+    fs::create_dir_all(&run).expect("create run directory");
+    fs::write(&journal, exact_absent_facility_journal()).expect("write prior facility journal");
+
+    let status = daemon_helper_command(
+        "missing_identity_recovery_daemon_helper",
+        MISSING_IDENTITY_RECOVERY_HELPER_ROOT,
+        &root,
+    )
+    .status()
+    .expect("run missing-identity recovery helper");
+
+    assert!(status.success(), "recovery helper failed: {status}");
+    assert!(
+        journal.exists(),
+        "unverified identity must retain durable recovery authority"
+    );
+}
+
+#[test]
 fn unsupported_kernel_daemon_helper() {
     let Some(root) = env::var_os(UNSUPPORTED_HELPER_ROOT).map(PathBuf::from) else {
         return;
@@ -164,6 +228,77 @@ fn configured_safety_rejection_daemon_helper() {
         StaticCapabilityProfileSource::new(CapabilityProfileFixture::device_qualified());
     run_daemon(&profile_source, daemon_options(&root))
         .expect("safety-rejected daemon runs until SIGTERM");
+}
+
+#[test]
+fn malformed_configuration_recovery_daemon_helper() {
+    let Some(root) = env::var_os(INVALID_CONFIG_RECOVERY_HELPER_ROOT).map(PathBuf::from) else {
+        return;
+    };
+    let journal = root.join("run/canary-facility.owner");
+    let profile_source =
+        StaticCapabilityProfileSource::new(CapabilityProfileFixture::device_qualified());
+
+    let error = run_daemon(&profile_source, daemon_options(&root))
+        .expect_err("malformed configuration rejects startup after recovery");
+
+    assert!(matches!(error, DaemonError::FluxConfig(_)));
+    assert!(
+        !journal.exists(),
+        "facility recovery precedes config parsing"
+    );
+}
+
+#[test]
+fn missing_identity_recovery_daemon_helper() {
+    let Some(root) = env::var_os(MISSING_IDENTITY_RECOVERY_HELPER_ROOT).map(PathBuf::from) else {
+        return;
+    };
+    let profile_source =
+        StaticCapabilityProfileSource::new(CapabilityProfileFixture::unsupported_kernel());
+
+    let error = run_daemon(&profile_source, daemon_options(&root))
+        .expect_err("durable residue without an owner identity fails startup");
+
+    assert!(matches!(
+        error,
+        DaemonError::NativeStartup {
+            operation: "recover durable native state without verified identity",
+            ..
+        }
+    ));
+}
+
+fn exact_absent_facility_journal() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "boot_identity": "01234567-89ab-cdef-0123-456789abcdef",
+        "daemon_network_namespace_device": 10,
+        "daemon_network_namespace_inode": 20,
+        "reviewed_policy_digest": vec![0x41_u8; 32],
+        "reviewed_policy_revision": 1,
+        "daemon_veth_name": b"fxjcan0".to_vec(),
+        "peer_veth_name": b"fxjcanp".to_vec(),
+        "daemon_ipv4": [9, 254, 254, 252],
+        "peer_ipv4": [9, 254, 254, 253],
+        "daemon_ipv6": null,
+        "peer_ipv6": null,
+        "tcp_echo_port": 61_001,
+        "udp_echo_port": 61_002,
+        "dns_port": 61_003,
+        "engine_uid": 20_002,
+        "proxy_rule_priority": 4_000_000_000_u32,
+        "peer_rule_priority": 4_000_000_001_u32,
+        "proxy_capture_table": 4_000_000_002_u32,
+        "peer_table": 4_000_000_003_u32,
+        "peer_return_table": 254,
+        "rule_protocol": 186,
+        "route_protocol": 186,
+        "route_metric": 1_031,
+        "proxy_mark_value": 0x0200_0000,
+        "proxy_mark_mask": 0x0300_0000,
+    }))
+    .expect("serialize facility journal fixture")
 }
 
 fn daemon_options(root: &Path) -> DaemonOptions {

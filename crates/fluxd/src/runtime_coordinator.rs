@@ -51,6 +51,11 @@ use crate::{
     RuntimeVerificationState,
 };
 
+// Native ownership readback invokes bounded xtables and routing observers. Keep it independent of
+// the 50–250 ms engine-maintenance tick while still detecting drift well inside the five-minute
+// Capture Path evidence lease.
+const LIVE_CAPTURE_VERIFICATION_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublishedRuntimeState {
     Running { generation: GenerationId },
@@ -817,6 +822,13 @@ pub(crate) trait RuntimeWriter: Send + 'static {
     fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
     fn capture_stop(&mut self) -> Result<(), Self::Error>;
     fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error>;
+    /// Optionally perform a fresh, bounded readback while a Generation remains published.
+    /// Non-native writers may leave this unsupported; native writers must not rely on a cached
+    /// convergence identity for this check.
+    fn verify_live_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+        let _ = generation;
+        Ok(())
+    }
     fn observe_active_canary_generation(
         &mut self,
         _generation: &PreparedGeneration,
@@ -1421,6 +1433,8 @@ pub(crate) struct RuntimeCoordinator<W, E = EngineSupervisor> {
     functional_canary: RuntimeFunctionalCanary,
     ownership: RuntimeOwnership,
     maintenance_interval: Duration,
+    live_capture_verification_interval: Duration,
+    last_live_capture_verification: Option<(GenerationId, Instant)>,
     address_reconciler: Option<AddressReconciler>,
     address_reconciliation_pending: bool,
     capture_path_refresh: CapturePathRefreshState,
@@ -1459,6 +1473,8 @@ where
             functional_canary,
             ownership: RuntimeOwnership::Stopped,
             maintenance_interval,
+            live_capture_verification_interval: LIVE_CAPTURE_VERIFICATION_INTERVAL,
+            last_live_capture_verification: None,
             address_reconciler: None,
             address_reconciliation_pending: false,
             capture_path_refresh: CapturePathRefreshState::Current,
@@ -1499,6 +1515,12 @@ where
         clock: impl CapturePathEvidenceClock + 'static,
     ) -> Self {
         self.capture_path_evidence_clock = Box::new(clock);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_live_capture_verification_interval(mut self, interval: Duration) -> Self {
+        self.live_capture_verification_interval = interval;
         self
     }
 
@@ -2028,6 +2050,25 @@ where
             Ok(report) => report,
             Err(source) => {
                 self.mark_functional_gate_pending(&generation);
+                if capture == CaptureObservation::Published {
+                    if let Err(detach_source) = self.writer.capture_stop() {
+                        self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+                        return Err(runtime_writer_error(
+                            "detach capture after uncertain engine liveness",
+                            detach_source,
+                            "retain the engine ownership and retry capture detachment before reconciliation",
+                        ));
+                    }
+                    self.ownership = RuntimeOwnership::Engine {
+                        generation,
+                        capture: CaptureObservation::Detached,
+                    };
+                    return Err(ControlError::runtime(
+                        "maintain proxy engine",
+                        source,
+                        "capture was detached because engine liveness was uncertain; repair before restoring it",
+                    ));
+                }
                 self.ownership = RuntimeOwnership::Engine {
                     generation,
                     capture,
@@ -2110,6 +2151,31 @@ where
             report,
             EngineReport::Started { .. } | EngineReport::NoChange { .. }
         );
+        let live_capture_verification_due = capture == CaptureObservation::Published
+            && engine_ready
+            && self.live_capture_verification_due(generation_id);
+        if live_capture_verification_due
+            && let Err(source) = self.writer.verify_live_capture(&generation)
+        {
+            self.mark_functional_gate_failed(&generation);
+            if let Err(detach_source) = self.writer.capture_stop() {
+                self.ownership = RuntimeOwnership::CaptureRepairPending { generation };
+                return Err(runtime_writer_error(
+                    "detach capture after live ownership drift",
+                    detach_source,
+                    "retain the engine and retry capture detachment before any publication",
+                ));
+            }
+            self.ownership = RuntimeOwnership::Engine {
+                generation,
+                capture: CaptureObservation::Detached,
+            };
+            return Err(runtime_writer_error(
+                "verify live capture ownership",
+                source,
+                "capture was detached; repair native ownership before restoring it",
+            ));
+        }
         let pending_running_publication = matches!(
             self.pending_publication,
             Some(PublishedRuntimeState::Running { generation }) if generation == generation_id
@@ -2207,6 +2273,25 @@ where
             );
         }
         Ok(())
+    }
+
+    fn live_capture_verification_due(&mut self, generation: GenerationId) -> bool {
+        let now = Instant::now();
+        match self.last_live_capture_verification {
+            Some((active_generation, last_verification)) if active_generation == generation => {
+                if now.saturating_duration_since(last_verification)
+                    < self.live_capture_verification_interval
+                {
+                    return false;
+                }
+                self.last_live_capture_verification = Some((generation, now));
+                true
+            }
+            _ => {
+                self.last_live_capture_verification = Some((generation, now));
+                false
+            }
+        }
     }
 
     fn request_address_reconciliation(&mut self) {
@@ -5893,7 +5978,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_runtime_maintenance_blocks_address_replacement_until_runtime_recovers() {
+    fn uncertain_engine_liveness_detaches_capture_before_address_replacement() {
         let fixture = EngineFixture::new();
         let (_directory, desired_state_path) = desired_state_fixture();
         let (source, reconciler) = AddressReconciler::replay(desired_state_path);
@@ -5944,7 +6029,10 @@ mod tests {
 
         assert_eq!(
             *events.lock().expect("events lock"),
-            [Event::EngineRunning(CaptureObservation::Published)]
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CaptureStopped,
+            ]
         );
         assert!(
             coordinator
@@ -5961,7 +6049,12 @@ mod tests {
         assert_eq!(
             *events.lock().expect("events lock"),
             [
-                Event::EngineRunning(CaptureObservation::Published),
+                Event::EngineRunning(CaptureObservation::Detached),
+                Event::CaptureStarted,
+                Event::CaptureVerified,
+                Event::Published(PublishedRuntimeState::Running {
+                    generation: generation(1),
+                }),
                 Event::AddressSuccessorPrepared,
             ]
         );
@@ -7890,6 +7983,188 @@ mod tests {
     }
 
     #[test]
+    fn live_capture_readback_waits_for_its_bounded_cadence() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = LiveCaptureVerifyingWriter {
+            inner: ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([fixture.spec.clone()]),
+                next_generation_id: 1,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            calls: Arc::clone(&calls),
+            failures_remaining: 0,
+        };
+        let engine = ScriptedEngine {
+            events,
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_live_capture_verification_interval(Duration::from_secs(60));
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("start converges");
+        coordinator.maintain();
+        coordinator.maintain();
+
+        assert!(
+            calls
+                .lock()
+                .expect("live capture verification calls lock")
+                .is_empty(),
+            "maintenance before the cadence must not invoke native readback"
+        );
+
+        coordinator.live_capture_verification_interval = Duration::ZERO;
+        coordinator.maintain();
+
+        assert_eq!(
+            *calls.lock().expect("live capture verification calls lock"),
+            [generation(1)]
+        );
+        assert!(matches!(
+            coordinator.ownership,
+            RuntimeOwnership::Engine {
+                capture: CaptureObservation::Published,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_live_capture_readback_detaches_capture_and_retains_the_engine() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = LiveCaptureVerifyingWriter {
+            inner: ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([fixture.spec.clone()]),
+                next_generation_id: 1,
+                capture_start_failure: false,
+                capture_stop_failures: 0,
+                verify_failure: false,
+            },
+            calls: Arc::clone(&calls),
+            failures_remaining: 1,
+        };
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_live_capture_verification_interval(Duration::ZERO);
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("start converges");
+        coordinator.maintain();
+        events.lock().expect("events lock").clear();
+        coordinator.maintain();
+
+        assert_eq!(
+            *calls.lock().expect("live capture verification calls lock"),
+            [generation(1)]
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CaptureStopped,
+            ]
+        );
+        assert!(matches!(
+            &coordinator.ownership,
+            RuntimeOwnership::Engine {
+                generation: owned,
+                capture: CaptureObservation::Detached,
+            } if owned.id() == generation(1)
+        ));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.capture, RuntimeCaptureState::Detached);
+        assert_eq!(snapshot.phase, RuntimePhase::Failed);
+        assert!(snapshot.last_error.is_some());
+    }
+
+    #[test]
+    fn failed_live_capture_detachment_enters_capture_repair_pending() {
+        let fixture = EngineFixture::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let writer = LiveCaptureVerifyingWriter {
+            inner: ScriptedWriter {
+                events: Arc::clone(&events),
+                prepared: VecDeque::from([fixture.spec.clone()]),
+                next_generation_id: 1,
+                capture_start_failure: false,
+                capture_stop_failures: 1,
+                verify_failure: false,
+            },
+            calls: Arc::clone(&calls),
+            failures_remaining: 1,
+        };
+        let engine = ScriptedEngine {
+            events: Arc::clone(&events),
+            reports: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut coordinator = RuntimeCoordinator::with_structural_dependencies(
+            writer,
+            engine,
+            Duration::from_millis(100),
+        )
+        .with_live_capture_verification_interval(Duration::ZERO);
+        let runtime = coordinator.runtime_snapshot_source();
+
+        coordinator
+            .execute(&RuntimeIntent::Running {
+                reason: Reason::Boot,
+            })
+            .expect("start converges");
+        coordinator.maintain();
+        events.lock().expect("events lock").clear();
+        coordinator.maintain();
+
+        assert_eq!(
+            *calls.lock().expect("live capture verification calls lock"),
+            [generation(1)]
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            [
+                Event::EngineRunning(CaptureObservation::Published),
+                Event::CaptureStopped,
+            ]
+        );
+        assert!(matches!(
+            &coordinator.ownership,
+            RuntimeOwnership::CaptureRepairPending { generation: owned }
+                if owned.id() == generation(1)
+        ));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.capture, RuntimeCaptureState::Published);
+        assert_eq!(snapshot.phase, RuntimePhase::Degraded);
+        assert!(snapshot.last_error.is_some());
+    }
+
+    #[test]
     fn maintenance_retries_running_publication_without_tearing_down_the_data_path() {
         let fixture = EngineFixture::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -9659,6 +9934,12 @@ mod tests {
         calls: usize,
     }
 
+    struct LiveCaptureVerifyingWriter {
+        inner: ScriptedWriter,
+        calls: Arc<Mutex<Vec<GenerationId>>>,
+        failures_remaining: usize,
+    }
+
     struct CandidateActivationFailingWriter {
         inner: ScriptedWriter,
         capture_start_calls: usize,
@@ -9844,6 +10125,56 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {
+            self.inner.resync_addresses()
+        }
+    }
+
+    impl RuntimeWriter for LiveCaptureVerifyingWriter {
+        type Error = io::Error;
+
+        fn prepare(&mut self, reason: Reason) -> Result<PreparedGeneration, Self::Error> {
+            self.inner.prepare(reason)
+        }
+
+        fn reject_prepared(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.reject_prepared(generation)
+        }
+
+        fn capture_start(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.capture_start(generation)
+        }
+
+        fn capture_stop(&mut self) -> Result<(), Self::Error> {
+            self.inner.capture_stop()
+        }
+
+        fn verify_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+            self.inner.verify_capture(generation)
+        }
+
+        fn verify_live_capture(
+            &mut self,
+            generation: &PreparedGeneration,
+        ) -> Result<(), Self::Error> {
+            self.calls
+                .lock()
+                .expect("live capture verification calls lock")
+                .push(generation.id());
+            if self.failures_remaining > 0 {
+                self.failures_remaining -= 1;
+                Err(io::Error::other(
+                    "injected live capture verification failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn publish(&mut self, phase: PublishedRuntimeState) -> Result<(), Self::Error> {
+            self.inner.publish(phase)
         }
 
         fn resync_addresses(&mut self) -> Result<AddressResyncDisposition, Self::Error> {

@@ -65,6 +65,28 @@ impl NativeCoordinatorGenerationIdentity for NativeCaptureTargetIdentity {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum LiveCaptureReadbackFailure<E> {
+    Observation(E),
+    Missing,
+    TargetMismatch,
+}
+
+fn verify_live_capture_readback<I, E>(
+    expected: I,
+    observation: Result<Option<I>, E>,
+) -> Result<(), LiveCaptureReadbackFailure<E>>
+where
+    I: Eq,
+{
+    match observation {
+        Err(source) => Err(LiveCaptureReadbackFailure::Observation(source)),
+        Ok(Some(observed)) if observed == expected => Ok(()),
+        Ok(Some(_)) => Err(LiveCaptureReadbackFailure::TargetMismatch),
+        Ok(None) => Err(LiveCaptureReadbackFailure::Missing),
+    }
+}
+
 pub(crate) struct PreparedNativeGeneration<T> {
     runtime: PreparedGeneration,
     target: T,
@@ -1070,6 +1092,47 @@ where
             Err(NativeCoordinatorWriterError::Invariant(
                 "native structural verification has no matching successful convergence report",
             ))
+        }
+    }
+
+    fn verify_live_capture(&mut self, generation: &PreparedGeneration) -> Result<(), Self::Error> {
+        let expected = C::target_identity(&self.retained(generation.id())?.target);
+        if self.converged_identity != Some(expected) {
+            return Err(NativeCoordinatorWriterError::Invariant(
+                "native structural verification has no matching successful convergence report",
+            ));
+        }
+
+        let Some(expected_native) = expected.native_capture_target_identity() else {
+            // Synthetic non-native convergence implementations used by host tests do not expose
+            // a platform ownership readback. Production native identities always do.
+            return Ok(());
+        };
+        let observation = self
+            .convergence
+            .observe_active_ownership()
+            .map(|observation| observation.map(|observation| observation.target()));
+        match verify_live_capture_readback(expected_native, observation) {
+            Ok(()) => Ok(()),
+            Err(LiveCaptureReadbackFailure::Observation(source)) => {
+                self.recovery_required = true;
+                Err(NativeCoordinatorWriterError::convergence(
+                    "observe live native ownership during structural verification",
+                    source,
+                ))
+            }
+            Err(LiveCaptureReadbackFailure::TargetMismatch) => {
+                self.recovery_required = true;
+                Err(NativeCoordinatorWriterError::Invariant(
+                    "live native ownership differs from the published Generation",
+                ))
+            }
+            Err(LiveCaptureReadbackFailure::Missing) => {
+                self.recovery_required = true;
+                Err(NativeCoordinatorWriterError::Invariant(
+                    "live native ownership readback is absent for a published Generation",
+                ))
+            }
         }
     }
 
@@ -2183,6 +2246,40 @@ mod tests {
             Duration::from_millis(100),
             RuntimeFunctionalCanary::StructuralVerificationOnly,
         )
+    }
+
+    #[test]
+    fn live_capture_readback_accepts_an_exact_target() {
+        assert_eq!(
+            verify_live_capture_readback::<u64, &str>(17, Ok(Some(17))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn live_capture_readback_rejects_a_missing_target() {
+        assert_eq!(
+            verify_live_capture_readback::<u64, &str>(17, Ok(None)),
+            Err(LiveCaptureReadbackFailure::Missing)
+        );
+    }
+
+    #[test]
+    fn live_capture_readback_rejects_a_substituted_target() {
+        assert_eq!(
+            verify_live_capture_readback::<u64, &str>(17, Ok(Some(18))),
+            Err(LiveCaptureReadbackFailure::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn live_capture_readback_preserves_an_observation_error() {
+        assert_eq!(
+            verify_live_capture_readback::<u64, &str>(17, Err("injected readback failure")),
+            Err(LiveCaptureReadbackFailure::Observation(
+                "injected readback failure"
+            ))
+        );
     }
 
     #[test]

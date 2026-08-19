@@ -6,8 +6,8 @@ use std::num::NonZeroU16;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -722,4 +722,34 @@ fn multiple_busy_observations_coalesce_into_one_follow_up_refresh() {
     runtime.schedule_observed_refresh();
     assert_eq!(refreshes.load(Ordering::SeqCst), 2);
     assert!(runtime.poll().is_none());
+}
+
+#[test]
+fn idle_worker_uses_explicit_shutdown_instead_of_periodic_polling() {
+    let (operation, refreshes) = CountingOperation::new([]);
+    let (request_tx, request_rx) = mpsc::sync_channel(1);
+    let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+    let busy = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker_busy = Arc::clone(&busy);
+    let worker_stopping = Arc::clone(&stopping);
+    let handle = thread::spawn(move || {
+        refresh_worker_loop(
+            RefreshWorkerState {
+                operation: Box::new(operation),
+                pending_bootstrap: None,
+            },
+            request_rx,
+            completion_tx,
+            &worker_busy,
+            &worker_stopping,
+            TEST_TIMEOUT,
+        );
+    });
+
+    request_tx
+        .send(RefreshWorkerRequest::Shutdown)
+        .expect("idle worker accepts explicit shutdown");
+    handle.join().expect("idle worker shuts down cleanly");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
 }
